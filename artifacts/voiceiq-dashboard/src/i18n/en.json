@@ -1,0 +1,1210 @@
+{
+  "nav": {
+    "commandCenter": "Command Center",
+    "callsLeads": "Calls & Leads",
+    "contacts": "Contacts",
+    "appointments": "Appointments",
+    "sms": "SMS & Campaigns",
+    "analytics": "Analytics",
+    "benchmarks": "Benchmarks",
+    "government": "Government",
+    "settings": "Settings",
+    "newBusiness": "New Business",
+    "logout": "Logout",
+    "startSetup": "Start Setup",
+    "privacy": "Privacy",
+    "terms": "Terms",
+    "myBusiness": "My Business",
+    "demoLibrary": "Demo Library",
+    "auditLogs": "Audit Logs"
+  },
+  "dashboard": {
+    "title": "Command Center",
+    "subtitle": "Real-time overview of your AI receptionist",
+    "refresh": "Refresh",
+    "callsToday": "Calls Today",
+    "leadsMonth": "Leads This Month",
+    "appointmentsMonth": "Appointments This Month",
+    "actionItems": "Open Action Items",
+    "recentCalls": "Recent Calls",
+    "noCalls": "No calls yet",
+    "noCallsSubtitle": "Calls will appear here as they come in",
+    "needsAttention": "Needs Attention",
+    "allCaughtUp": "All caught up!",
+    "noPendingItems": "No pending action items",
+    "roiMessage": "Neverr has handled {{count}} calls this month, saving you approximately {{amount}} vs a human receptionist",
+    "neverrScore": "Your Neverr Score",
+    "basedOn30Days": "Based on last 30 days",
+    "answerRate": "Answer Rate",
+    "leadCapture": "Lead Capture",
+    "bookingRate": "Booking Rate",
+    "followUpRate": "Follow-Up Rate",
+    "customerSentiment": "Customer Sentiment",
+    "callsCount": "{{count}} calls",
+    "caller": "Caller",
+    "phone": "Phone",
+    "duration": "Duration",
+    "outcome": "Outcome",
+    "scoreLabel": "Score",
+    "time": "Time",
+    "actions": "Actions",
+    "callBack": "Call Back",
+    "sendSms": "Send SMS",
+    "viewDetails": "View Details",
+    "bookAppt": "Book Appt",
+    "urgent": "Urgent",
+    "unknown": "Unknown",
+    "unknownCaller": "Unknown Caller",
+    "noNumber": "No number",
+    "noNumberAvailable": "No number available",
+    "notCaptured": "Not captured",
+    "normal": "Normal",
+    "intent": "Intent",
+    "urgency": "Urgency",
+    "aiSummary": "AI Summary",
+    "actionRequired": "Action Required",
+    "followUpWithCaller": "Follow up with this caller",
+    "transcript": "Transcript",
+    "lead": "Lead",
+    "missed": "Missed",
+    "hotLead": "Hot Lead",
+    "booked": "Booked",
+    "warmLead": "Warm Lead",
+    "followUp": "Follow Up",
+    "resolved": "Resolved",
+    "cold": "Cold",
+    "inbound": "inbound",
+    "live": "Live",
+    "active": "Active",
+    "connected": "Connected",
+    "lastCall": "Last call",
+    "justNow": "just now",
+    "mAgo": "{{count}}m ago",
+    "hAgo": "{{count}}h ago",
+    "dAgo": "{{count}}d ago",
+    "quickTemplates": "Quick Templates",
+    "message": "Message",
+    "typePlaceholder": "Type your message...",
+    "to": "To",
+    "sent": "Sent!",
+    "sending": "Sending...",
+    "smsTemplates": {
+      "thanks": "Thanks for calling! How can we help further?",
+      "confirmed": "Your appointment is confirmed.",
+      "missedCall": "We missed your call — how can we help?"
+    },
+    "scoreInsights": {
+      "excellent": "Excellent! Your AI receptionist is performing at peak level.",
+      "good": "Good performance. Focus on capturing more leads to improve.",
+      "fair": "Room to improve. Check your missed calls and follow-ups.",
+      "poor": "Needs attention. Review your call handling settings."
+    }
+  },
+  "calls": {
+    "title": "Calls & Leads",
+    "export": "Export CSV",
+    "search": "Search by name or phone...",
+    "all": "All",
+    "completed": "Completed",
+    "missed": "Missed",
+    "initiated": "Initiated",
+    "caller": "Caller",
+    "phone": "Phone",
+    "score": "Score",
+    "status": "Status",
+    "outcome": "Outcome",
+    "duration": "Duration",
+    "time": "Time",
+    "noCallsFound": "No calls found",
+    "leadScores": "Lead Scores",
+    "hot": "Hot",
+    "warm": "Warm",
+    "cold": "Cold"
+  },
+  "settings": {
+    "title": "Settings",
+    "subtitle": "Configure your AI receptionist and business preferences",
+    "aiAgent": "AI Agent",
+    "businessInfo": "Business Info",
+    "notifications": "Notifications",
+    "dangerZone": "Danger Zone",
+    "agentName": "Agent Name",
+    "greetingMessage": "Greeting Message",
+    "businessHours": "Business Hours",
+    "industry": "Industry",
+    "timezone": "Timezone",
+    "spanishSupport": "Spanish Language Support",
+    "frenchSupport": "French Language Support",
+    "save": "Save",
+    "saving": "Saving...",
+    "saved": "Saved!",
+    "languages": "Languages",
+    "enabled": "enabled"
+  },
+  "common": {
+    "loading": "Loading...",
+    "error": "Something went wrong",
+    "retry": "Try again",
+    "cancel": "Cancel",
+    "save": "Save",
+    "delete": "Delete",
+    "edit": "Edit",
+    "close": "Close",
+    "back": "Back",
+    "next": "Next",
+    "submit": "Submit",
+    "confirm": "Confirm",
+    "yes": "Yes",
+    "no": "No",
+    "proPlan": "Pro Plan"
+  },
+  "marketing": {
+    "nav": {
+      "home": "Home",
+      "features": "Features",
+      "industries": "Industries",
+      "pricing": "Pricing",
+      "enterprise": "Enterprise",
+      "login": "Login",
+      "getStarted": "Get started",
+      "viewAllIndustries": "View all 17 industries →",
+      "openMenu": "Open menu",
+      "phoneLabel": "(978) 9NEVERR"
+    },
+    "footer": {
+      "earlyAccessHeading": "Join the early access list",
+      "earlyAccessSubhead": "Product updates, launch invites, early-access pricing.",
+      "emailPlaceholder": "Email for product updates",
+      "joinButton": "Join",
+      "thanksMessage": "✓ Thanks! You're on the list.",
+      "validEmail": "Valid email required",
+      "submitFailed": "Failed",
+      "productHeading": "Product",
+      "tryDemo": "Try a demo",
+      "industries": "Industries",
+      "pricing": "Pricing",
+      "roi": "ROI calculator",
+      "companyHeading": "Company",
+      "enterprise": "Enterprise",
+      "contactSales": "Contact sales",
+      "emailUs": "Email us",
+      "partners": "Partners",
+      "accountHeading": "Account",
+      "signIn": "Sign in",
+      "getStartedFree": "Get started free",
+      "legalHeading": "Legal",
+      "privacy": "Privacy",
+      "terms": "Terms",
+      "copyright": "© {{year}} Neverr AI · Never miss a call. Never miss a client. Never miss another dollar.",
+      "availableIn": "Available in: 🇺🇸 United States · 🇨🇦 Canada"
+    },
+    "landing": {
+      "hero": {
+        "eyebrow": "Live in US & Canada · 193+ industry playbooks · More regions soon",
+        "headlineLine1": "Never miss a call.",
+        "headlineLine2Prefix": "Never sound ",
+        "headlineLine2Highlight": "generic",
+        "headlineLine2Suffix": ".",
+        "punchline": "Every missed call is money walking out the door.",
+        "subhead": "Neverr is the AI receptionist that catches them and turns them into bookings — trained for your industry and integrated with your software.",
+        "ctaPrimary": "Try live demo",
+        "ctaSecondary": "Start free trial",
+        "ctaNote": "7-day free trial · cancel anytime",
+        "incomingPrefix": "incoming",
+        "liveLabel": "live · 00:42",
+        "listenLink": "listen to call →",
+        "handoffLabel": "Handoff"
+      },
+      "heroIndustries": {
+        "plumbing": {
+          "label": "Plumbing",
+          "bookedLabel": "BOOKED",
+          "bookedSubtitle": "Tech dispatched · ETA 38 min · $0 booking fee",
+          "msg1": "Hey — I've got water coming up through the kitchen floor. Are you guys 24-hour?",
+          "msg2": "Yes — we dispatch 24/7. I'll get a tech to you tonight. Have you shut the main valve under the sink?",
+          "msg3": "Just did. Water slowed down a lot.",
+          "handoff": "Synced to ServiceTitan + texted owner"
+        },
+        "dental": {
+          "label": "Dental",
+          "bookedLabel": "BOOKED",
+          "bookedSubtitle": "Cleaning + exam · Wed 2:30pm · Insurance verified",
+          "msg1": "I haven't been in a few years and my tooth started hurting last night.",
+          "msg2": "Sorry to hear that. Let me get you in for an exam — do you have insurance, and which side is the pain?",
+          "msg3": "Delta Dental. Bottom right, sharp when I drink anything cold.",
+          "handoff": "Logged in Dentrix + emergency flag set"
+        },
+        "legal": {
+          "label": "Legal",
+          "bookedLabel": "INTAKE",
+          "bookedSubtitle": "Consult booked · Friday 10am · No fee until won",
+          "msg1": "I was rear-ended yesterday. The other driver's insurance keeps calling me.",
+          "msg2": "Don't give them a recorded statement until we talk. Are you injured? I can get you in with an attorney this week.",
+          "msg3": "Neck and back are bad. Going to urgent care today.",
+          "handoff": "Synced to Clio + paralegal alerted"
+        },
+        "hvac": {
+          "label": "HVAC",
+          "bookedLabel": "BOOKED",
+          "bookedSubtitle": "Diagnostic visit · Tomorrow 9am · $89 service call",
+          "msg1": "AC stopped working last night. The thermostat says it's cooling but no air comes out.",
+          "msg2": "Sounds like the blower or capacitor. We can have someone there tomorrow morning. Is the unit indoors or outside?",
+          "msg3": "Outside, in the side yard. It's still buzzing but no fan.",
+          "handoff": "Job created + parts truck pre-loaded"
+        }
+      },
+      "brandPromise": {
+        "line1": "Never miss a call.",
+        "line2": "Never miss a client.",
+        "line3": "Neverr.",
+        "footer": "Never miss another dollar."
+      },
+      "trustStrip": {
+        "leading": "193+ SPECIALTIES",
+        "languagesLink": "32 LANGUAGES",
+        "trailing": "24/7 ALWAYS"
+      },
+      "features": {
+        "eyebrow": "// WHAT MAKES NEVERR DIFFERENT",
+        "headline": "A receptionist that actually knows your business.",
+        "subhead": "Generic voice AI gets things almost right. Neverr is calibrated per-industry — so the first call sounds like the hundredth.",
+        "items": [
+          {
+            "title": "Industry-calibrated",
+            "desc": "Not \"an AI receptionist.\" A plumber's receptionist. A dentist's. A personal injury firm's. 193+ playbooks tuned to the questions callers actually ask in your industry."
+          },
+          {
+            "title": "Never misses a call",
+            "desc": "24/7, every ring answered in under two seconds. Overflow, after-hours, lunch break — Neverr is on. Callbacks scheduled when a human is needed."
+          },
+          {
+            "title": "Live demo, no signup",
+            "desc": "Pick your industry, hit dial, and have a real conversation with the agent that would answer your phones — before you ever enter a credit card."
+          }
+        ]
+      },
+      "showcase": {
+        "eyebrow": "// 193+ PLAYBOOKS",
+        "headline": "Calibrated for the call your customer is about to make.",
+        "subheadPrefix": "Built for ",
+        "subheadStrong1": "193+ specialties",
+        "subheadMiddle": ". Spotlighted today with ",
+        "subheadStrong2Suffix": " deep playbooks",
+        "subheadEnd": " — full proof transcripts, integrations, and retention flows. More spotlighted every month.",
+        "spotlightedLabel": "Spotlighted",
+        "spotlightedCount": "{{count}} industries with deep, hand-built playbooks",
+        "seeAll": "See all {{count}} spotlighted",
+        "featured": [
+          {
+            "name": "Plumbers",
+            "stat": "74%",
+            "statLabel": "of plumbing calls go unanswered",
+            "pitch": "Triage emergencies, dispatch the right tech, sync to your FSM."
+          },
+          {
+            "name": "Dental",
+            "stat": "$100K+",
+            "statLabel": "lost annually to missed calls",
+            "pitch": "PMS-aware booking, insurance triage, BAA signed at signup."
+          },
+          {
+            "name": "Law Firms",
+            "stat": "21x",
+            "statLabel": "more likely to qualify if first to respond",
+            "pitch": "Practice-area intake, conflict checks, sub-second response."
+          },
+          {
+            "name": "Med Spas",
+            "stat": "$3K-$15K",
+            "statLabel": "value of a single missed consultation",
+            "pitch": "Treatment-specific intake, deposit collection, BAA signed."
+          }
+        ],
+        "catalog": {
+          "label": "Full Catalog",
+          "moreSuffix": "+ 176 more industries supported",
+          "headline": "Don't see your industry spotlighted? We probably built for it anyway.",
+          "subheadPrefix": "Beyond the ",
+          "subheadMiddle": " deep playbooks, Neverr supports 193+ specialties across home services, healthcare, professional services, hospitality, retail, and more. Same flat-rate pricing, same sub-second answer, configured for your vertical.",
+          "tags": [
+            "Roofing",
+            "Electricians",
+            "Chiropractors",
+            "Insurance",
+            "Property Mgmt",
+            "Locksmiths",
+            "Catering",
+            "Tutoring",
+            "Optometry",
+            "+167 more"
+          ],
+          "depthBreadth": "DEPTH + BREADTH",
+          "depthBreadthSubtitle": "spotlighted growing every month",
+          "deepLabel": "DEEP",
+          "playbooksLabel": "PLAYBOOKS",
+          "catalogLabel": "CATALOG",
+          "footerPrompt": "Don't see yours?",
+          "footerLink": "Tell us what you do",
+          "footerSuffix": "— most industries already have a configured playbook.",
+          "browseCatalog": "Browse the full catalog"
+        }
+      },
+      "howItWorks": {
+        "eyebrow": "// HOW IT WORKS",
+        "headline": "Live in the time it takes to make coffee.",
+        "steps": [
+          {
+            "time": "~ 60 SECONDS",
+            "title": "Sign up",
+            "desc": "Email and a phone number. No procurement, no implementation team. Card optional during trial."
+          },
+          {
+            "time": "~ 4 MINUTES",
+            "title": "Tell us about your business",
+            "desc": "Pick your industry — we pre-load the playbook. Add hours, pricing, scheduling tool. Neverr writes the rest."
+          },
+          {
+            "time": "LIVE",
+            "title": "Your AI handles calls",
+            "desc": "Forward your number — or get a fresh one. Every call answered, transcribed, routed, and synced to your CRM."
+          }
+        ]
+      },
+      "sampleCalls": {
+        "eyebrow": "// IN THE FIELD",
+        "headline": "Calls answered. Jobs booked. Owners sleeping.",
+        "subhead": "Real examples of how Neverr handles the calls your team can't always pick up.",
+        "callerLabel": "Caller",
+        "neverrLabel": "Neverr",
+        "items": [
+          {
+            "industry": "Plumbing · Emergency intake",
+            "caller": "\"My water heater is leaking everywhere — what do I do right now?\"",
+            "response": "Step-by-step: shut off the cold water inlet (handle on top), then the gas/breaker. I'm dispatching a tech for emergency rate. ETA in your area is 35 minutes. Stay out of standing water near the unit."
+          },
+          {
+            "industry": "Dental · After-hours booking",
+            "caller": "\"It's 9pm and my front tooth chipped. Can someone see me tomorrow?\"",
+            "response": "We have a 7am emergency slot tomorrow with our on-call dentist. I'm holding it for you. Bring the chip if you can find it — sometimes we can re-bond. Need your insurance to verify coverage tonight?"
+          },
+          {
+            "industry": "Legal · Personal injury triage",
+            "caller": "\"Insurance is asking me to sign something. Should I?\"",
+            "response": "Don't sign anything yet. That release usually waives your right to future treatment claims. I'm booking you with a senior attorney this Friday at 10am — no fee unless we win. What's the best email for the file?"
+          }
+        ]
+      },
+      "concierge": {
+        "eyebrow": "// HUMAN-LED ONBOARDING",
+        "headline": "You're not setting this up alone.",
+        "subhead": "Real humans get you live, calibrate your agent for your industry, and stay with you through your first 30 days. We're not a self-serve tool that disappears after signup.",
+        "blocks": [
+          {
+            "title": "Real humans onboard you",
+            "desc": "A real person walks you through setup, integrations, and your first live week. Not a chatbot, not a help center — an actual human who has onboarded businesses like yours."
+          },
+          {
+            "title": "Industry expertise from day one",
+            "desc": "Whoever onboards you has done it before. They've onboarded plumbers, dentists, law firms, dealerships, and 20+ other industries — they know your software, your workflows, and the calls you can't miss."
+          },
+          {
+            "title": "We're with you for the first 30 days",
+            "desc": "Whatever your plan, a real human is reachable during your first month — the channels and response times scale with your tier. After that, you're trained up and self-sufficient, and support is still one click away."
+          }
+        ],
+        "founderNote": "For our first 100 customers, I personally check in on your first week. — Abdul, Founder."
+      },
+      "pricingTeaser": {
+        "eyebrow": "// PRICING",
+        "headline": "One missed call usually pays for the month.",
+        "subheadPrefix": "Plans start at ",
+        "subheadStrong": "$149/mo",
+        "subheadEnd": ". Most teams pick Professional. No annual lock-in. Cancel anytime from inside the dashboard.",
+        "seeAllPlans": "See all plans",
+        "popularBadge": "Most Popular",
+        "tierLabel": "Professional",
+        "perMonth": "/mo",
+        "tierMeta": "+ $499 setup · 2,500 minutes · 2,000 SMS",
+        "tierFeatures": [
+          "Industry playbook (193+)",
+          "All 32 languages",
+          "Automated follow-up sequences",
+          "Webhook + Zapier",
+          "Email + chat support 24hr"
+        ],
+        "ctaButton": "Start free trial →",
+        "trial": "7-day free trial"
+      },
+      "finalCta": {
+        "slogan1": "Never miss a call.",
+        "slogan2": "Never miss a client.",
+        "slogan3": "Neverr.",
+        "timeMark": "// 30 SECONDS",
+        "headline": "Try your AI receptionist before you finish this page.",
+        "note": "Now accepting first 100 businesses · 7-day free trial",
+        "ctaPrimary": "Try live demo",
+        "ctaSecondary": "Start free trial",
+        "ctaNote": "7-day free trial · cancel anytime"
+      }
+    },
+    "pricing": {
+      "title": "Pricing",
+      "subtitle": "For businesses with 1–4 locations",
+      "noSalesCall": "Get started today — no sales call required",
+      "monthly": "Monthly",
+      "annual": "Annual",
+      "monthFree": "1 month free",
+      "popularBadge": "Most Popular",
+      "perMonth": "/mo",
+      "perYear": "{{annual}}/yr · Save {{savings}}",
+      "setupSuffix": "+ {{setup}} setup",
+      "getStarted": "Get Started",
+      "loading": "Loading…",
+      "guarantees": {
+        "moneyBack": "🛡️ 30-day money-back guarantee",
+        "noContracts": "📞 No contracts on monthly plans",
+        "goLive": "⚡ Go live in 48 hours",
+        "languages": "🌐 English + Spanish on every plan"
+      },
+      "firstWeek": {
+        "title": "Your first week with Neverr.",
+        "subtitle": "Every plan includes human help during onboarding. Higher tiers get more hand-holding — here's what that actually looks like.",
+        "allPlans": "All plans",
+        "professionalPlus": "Professional+",
+        "enterpriseBusiness": "Enterprise & Business",
+        "footer": "Essential and Starter are self-serve with human email support. Professional, Growth, Business, and Enterprise tiers include live human onboarding. Founder-led oversight is included on Business and Enterprise tiers.",
+        "stages": [
+          {
+            "stage": "Hour 1",
+            "label": "Welcome",
+            "all": "Welcome email with a setup video walkthrough.",
+            "pro": "Plus a welcome call from your onboarding lead.",
+            "ent": "Plus an intro to your dedicated CSM."
+          },
+          {
+            "stage": "Day 1–2",
+            "label": "Setup",
+            "all": "Self-serve setup wizard. Email support throughout — response time per your plan SLA.",
+            "pro": "Live 30–60 minute setup call. Onboarding lead assigned to your account.",
+            "ent": "Custom setup spanning your team and integrations. Founder oversight on accounts that warrant it."
+          },
+          {
+            "stage": "Day 3–7",
+            "label": "Going live",
+            "all": "Email and chat support during your first live week.",
+            "pro": "Onboarding lead listens to your first calls and tunes the agent with you.",
+            "ent": "Weekly check-ins, custom tuning, and direct founder access for larger accounts."
+          },
+          {
+            "stage": "Day 8–30",
+            "label": "Self-sufficient, support a click away",
+            "all": "Email, chat, and scheduled call available.",
+            "pro": "Dedicated onboarding lead remains available through your first 30 days.",
+            "ent": "Ongoing dedicated CSM relationship beyond onboarding."
+          }
+        ]
+      },
+      "franchise": {
+        "eyebrow": "Franchise & Multi-Location",
+        "title": "For franchise networks and multi-location brands",
+        "subtitle": "5 to 20+ locations under one platform",
+        "contactSales": "Contact Sales",
+        "contactPricing": "Contact for pricing"
+      },
+      "volume": {
+        "eyebrow": "High Volume & Government",
+        "title": "For organizations handling 10,000+ calls per month",
+        "subtitle": "DMV offices · Hospitals · Airlines · Utilities · Government agencies · Universities",
+        "tag": "10,000+ calls/month at a single entity",
+        "contactSales": "Contact Sales"
+      },
+      "overage": {
+        "title": "Overage Rates",
+        "plan": "Plan",
+        "includedMinutes": "Included Minutes",
+        "minuteOverage": "Minute Overage",
+        "includedSms": "Included SMS",
+        "smsOverage": "SMS Overage"
+      },
+      "errors": {
+        "checkoutFailed": "Unable to start checkout. Please try again or contact support.",
+        "network": "Network error. Please check your connection and try again."
+      },
+      "plans": {
+        "essential": {
+          "name": "Essential",
+          "features": [
+            "AI receptionist 24/7",
+            "Industry playbook (193+)",
+            "1 phone number",
+            "Forwarding from your existing line",
+            "Basic call summaries",
+            "Webhook (Pro+)",
+            "Calendar integration"
+          ],
+          "notIncluded": [
+            "Advanced analytics",
+            "Multiple agents"
+          ]
+        },
+        "starter": {
+          "name": "Starter",
+          "features": [
+            "Everything in Essential",
+            "Custom greetings",
+            "Email summaries after each call",
+            "SMS confirmations to callers",
+            "Booking link in calendar",
+            "Spam filter",
+            "After-hours overflow"
+          ],
+          "notIncluded": [
+            "CRM sync",
+            "Multi-agent routing"
+          ]
+        },
+        "professional": {
+          "name": "Professional",
+          "features": [
+            "Everything in Starter",
+            "CRM sync (HubSpot, Salesforce, Clio, Dentrix...)",
+            "Custom voice + persona",
+            "Automated follow-up sequences",
+            "Webhook + Zapier",
+            "All 32 languages",
+            "Email + chat support 24hr"
+          ],
+          "notIncluded": [
+            "Dedicated success manager"
+          ]
+        },
+        "growth": {
+          "name": "Growth",
+          "features": [
+            "Everything in Professional",
+            "2 locations included",
+            "Multi-agent routing",
+            "Advanced call analytics",
+            "Custom integrations via API",
+            "Priority support 8hr"
+          ],
+          "notIncluded": [
+            "White-glove onboarding"
+          ]
+        },
+        "business": {
+          "name": "Business",
+          "features": [
+            "Everything in Growth",
+            "3 locations included",
+            "White-glove onboarding",
+            "Custom voice training",
+            "Advanced compliance (HIPAA-ready)",
+            "Priority support 4hr",
+            "Dedicated success manager"
+          ],
+          "notIncluded": []
+        },
+        "enterprise": {
+          "name": "Enterprise",
+          "features": [
+            "Everything in Business",
+            "4 locations included",
+            "SSO (SAML, Okta, Azure AD)",
+            "Custom SLA + DPA + BAA",
+            "Dedicated 1hr SLA support",
+            "On-call founder access",
+            "Quarterly business reviews"
+          ],
+          "notIncluded": []
+        }
+      },
+      "franchisePlans": {
+        "starter": {
+          "name": "Franchise Starter",
+          "features": [
+            "5–10 locations",
+            "Centralized brand voice",
+            "Per-location reporting",
+            "Multi-location routing",
+            "Dedicated onboarding",
+            "Quarterly business reviews"
+          ]
+        },
+        "pro": {
+          "name": "Franchise Pro",
+          "features": [
+            "11–20 locations",
+            "All Franchise Starter features",
+            "Custom voice per region",
+            "Advanced analytics dashboard",
+            "Priority SLA support",
+            "Dedicated account team"
+          ]
+        },
+        "enterprise": {
+          "name": "Franchise Enterprise",
+          "features": [
+            "21+ locations",
+            "Unlimited usage",
+            "Custom integration team",
+            "Dedicated infrastructure",
+            "Custom SLA + executive sponsorship",
+            "On-site training available"
+          ]
+        }
+      },
+      "volumeTiers": {
+        "starter": {
+          "name": "Volume Starter"
+        },
+        "pro": {
+          "name": "Volume Pro"
+        },
+        "enterprise": {
+          "name": "Volume Enterprise"
+        }
+      },
+      "customPrice": "Custom",
+      "ctaBookCall": "Book a call"
+    },
+    "enterprise": {
+      "hero": {
+        "eyebrow": "// FOR FRANCHISES, MULTI-LOCATION OPERATORS, GOVERNMENT, AND HEALTHCARE NETWORKS",
+        "headline": "Built for the call your customer is about to make — at the scale your operation actually runs.",
+        "subhead": "Neverr's enterprise tier handles 50+ locations under one customer, with the security controls, compliance posture, and contract flexibility your procurement team expects.",
+        "ctaPrimary": "Book a 30-min enterprise call",
+        "ctaSecondary": "See SMB pricing"
+      },
+      "trustStrip": {
+        "locations": "50+ LOCATIONS",
+        "saml": "SAML SSO",
+        "ipAllow": "IP ALLOWLISTING",
+        "audit": "AUDIT LOGS",
+        "retention": "CONFIGURABLE RETENTION",
+        "soc2": "SOC 2 IN PROGRESS",
+        "baa": "BAAs AVAILABLE",
+        "contracts": "CUSTOM CONTRACTS"
+      },
+      "featuresHeading": "What enterprise customers get that SMB plans don't",
+      "features": [
+        {
+          "title": "Multi-location at scale",
+          "body": "Tested at 50+ business locations under one customer. Centralized billing, per-location voice agents, role-based access for your operations team."
+        },
+        {
+          "title": "Single sign-on (SAML 2.0)",
+          "body": "SAML SSO via WorkOS — works with Okta, Azure AD, Auth0, Google Workspace, OneLogin. Email-domain auto-routing for your team. JIT provisioning so onboarding takes seconds."
+        },
+        {
+          "title": "IP allowlisting",
+          "body": "Restrict dashboard access to your office, VPN, or specific IP ranges. CIDR notation supported. Configured per-tenant, enforced at the edge."
+        },
+        {
+          "title": "Audit logs",
+          "body": "Every config change, login, agent edit, billing event — logged with actor, IP, user-agent, timestamp. Exportable. Cross-tenant access denied by default."
+        },
+        {
+          "title": "Configurable data retention",
+          "body": "Set retention windows per data type — call recordings, transcripts, conversation history. Automated retention cron runs every 6 hours, executes scheduled deletions, audits the result."
+        },
+        {
+          "title": "Custom contracts",
+          "body": "Custom MSA, DPA, BAA available. We'll redline. Your legal team gets the terms they need."
+        }
+      ],
+      "complianceHeading": "Security & compliance",
+      "complianceLiveLabel": "What's live today",
+      "complianceLive": [
+        "TLS 1.3 in transit (HSTS enforced)",
+        "AES-256 at rest (Supabase + Twilio + ElevenLabs all certified)",
+        "Multi-factor auth (TOTP) for all dashboard accounts",
+        "SAML 2.0 enterprise SSO via WorkOS",
+        "IP allowlisting (CIDR-supported)",
+        "Audit logs with cross-tenant access controls",
+        "Configurable data retention with automated execution",
+        "PII handling controls (configurable per-business)"
+      ],
+      "complianceRoadmapLabel": "On the path",
+      "complianceRoadmap": [
+        "SOC 2 Type 1 — audit underway, targeting Q4 2026",
+        "ISO 27001 — planned 2027",
+        "HIPAA — BAAs available today; formal HIPAA Type 1 attestation planned 2027"
+      ],
+      "complianceFooter": "For healthcare customers: BAA available on request. Our agent pipeline is designed to minimize PHI handling — calls escalate to staff per your protocol rather than storing protected health information server-side.",
+      "rolloutHeading": "How enterprise rollouts work with us",
+      "rolloutSteps": [
+        {
+          "title": "Discovery call (30 min)",
+          "body": "We learn your operation — locations, call volume, vertical, integration needs, compliance requirements. You learn whether Neverr is a fit."
+        },
+        {
+          "title": "Custom scoping & contract",
+          "body": "We scope the rollout — agent prompts per location, integrations, SSO setup, retention policy. Legal redlines your MSA/DPA/BAA. Pricing is custom, scoped per deployment. Typical 30-min discovery call gets you a number within 48 hours."
+        },
+        {
+          "title": "Implementation",
+          "body": "We work directly with your team through setup. Real humans, not self-serve. SSO configured in your first session. Your call agent goes live within 7-14 days of contract signing."
+        }
+      ],
+      "rolloutStepLabel": "// STEP {{num}}",
+      "rolloutFooter": "Every enterprise customer gets a real human on our side from discovery through implementation.",
+      "industriesHeading": "Built for the verticals where call coverage actually matters",
+      "industries": [
+        {
+          "title": "Healthcare networks",
+          "body": "DSOs, multi-location dental, urgent care chains, mental & behavioral health groups. HIPAA-conscious pipeline, BAA available."
+        },
+        {
+          "title": "Government & municipal",
+          "body": "Permits, 311, utilities, public health. Inclusive language for diverse callers, audit logs for FOIA, no-PII handling defaults."
+        },
+        {
+          "title": "Franchises (5–200 locations)",
+          "body": "Restaurant, fitness, beauty, service-based. Per-location agent customization, centralized billing, franchisor-level reporting."
+        },
+        {
+          "title": "Legal services",
+          "body": "Multi-office practices, intake call qualification, conflict-checking integration hooks, attorney-client privilege framing."
+        },
+        {
+          "title": "Field services at scale",
+          "body": "HVAC, plumbing, electrical, pest — multi-location operators with after-hours overflow needs."
+        },
+        {
+          "title": "Professional services",
+          "body": "Multi-office consulting firms, accounting practices, real estate brokerages. Sophisticated routing, calendar integrations, ICP-aware qualification."
+        }
+      ],
+      "integrationsHeading": "Built to integrate with your stack",
+      "integrationsHeadings": {
+        "identity": "Identity",
+        "telephony": "Telephony",
+        "crm": "CRM & calendar"
+      },
+      "integrationsFooter": "Custom integrations on the enterprise tier. If your stack isn't on this list, we'll scope it.",
+      "faqHeading": "Procurement questions, answered",
+      "faqs": [
+        {
+          "q": "Can we run a security review before signing?",
+          "a": "Yes. We'll provide a security questionnaire response, our SOC 2 readiness documentation (audit underway), our subprocessor list (Supabase, Twilio, ElevenLabs, Stripe, Resend, WorkOS), and answer any custom questionnaire your team needs."
+        },
+        {
+          "q": "Do you sign custom MSAs?",
+          "a": "Yes. Our standard MSA is a starting point; we expect to redline."
+        },
+        {
+          "q": "What's your data residency?",
+          "a": "Primary data lives in Supabase (US-East). Voice calls route through Twilio US data centers. Voice synthesis through ElevenLabs (US). For EU residency requirements, talk to us — we can scope EU data placement on the enterprise tier."
+        },
+        {
+          "q": "Can you sign a BAA for healthcare?",
+          "a": "Yes. We have a BAA template and will redline as needed for your use case."
+        },
+        {
+          "q": "How does pricing work for 50+ locations?",
+          "a": "Custom. Typical enterprise contracts price by location count + call volume. Discovery call gets you a real number within 48 hours."
+        },
+        {
+          "q": "What happens to our data if we churn?",
+          "a": "Standard 30-day data export window. We can negotiate longer retention or faster deletion in your contract. Configurable retention also lets you set deletion windows during active service."
+        },
+        {
+          "q": "Can we self-host?",
+          "a": "Not currently. Cloud-only. Roadmap: dedicated single-tenant deployments for customers requiring it (talk to us about needs and timeline)."
+        }
+      ],
+      "finalCta": {
+        "headline": "Ready to talk?",
+        "subhead": "Enterprise pricing is custom. Discovery call gets you a number within 48 hours.",
+        "ctaPrimary": "Book a 30-min discovery call",
+        "ctaSecondary": "Email enterprise@neverr.ai",
+        "footer": "Already a customer and looking to upgrade? Login → Settings → Billing, or email us."
+      }
+    },
+    "features": {
+      "hero": {
+        "eyebrow": "// FEATURES",
+        "headline": "Everything Neverr does, in one page.",
+        "subhead": "A receptionist that actually knows your business — calibrated per industry, on every call, every hour. The deep dive on what's inside the product.",
+        "ctaPrimary": "Start your 7-day free trial",
+        "ctaSecondary": "Or try a live demo"
+      },
+      "items": [
+        {
+          "tag": "// PER-INDUSTRY CALIBRATION",
+          "title": "Industry-calibrated, not generic",
+          "paragraphs": [
+            "Most voice AI is sold as one universal assistant. Neverr is the opposite — every deployment loads a playbook tuned to a specific industry. A plumber's receptionist sounds like a plumber's receptionist. A personal-injury firm's intake sounds like an intake specialist who has done it a thousand times. A dental front desk knows the difference between a hygiene cleaning and an emergency.",
+            "We've built 193+ of these playbooks. Each one ships with the questions callers actually ask in that vertical, the qualifying flow that turns a call into a booking, and the disclaimers and transfer rules that make the conversation safe to hand off to a human."
+          ],
+          "bullets": [
+            "193+ industry playbooks, from HVAC and dental to legal intake and government services",
+            "Pre-loaded qualifying questions, transfer rules, and disclaimers for each vertical",
+            "Custom AI prompts on Starter and above for any business that needs to deviate from the template",
+            "First call sounds like the hundredth — no months of training, no script-tuning sprints"
+          ]
+        },
+        {
+          "tag": "// 24/7 ANSWERING",
+          "title": "Never misses a call",
+          "paragraphs": [
+            "Every ring answered in under two seconds, every hour of every day. Overflow when your team is on the phone, after-hours when nobody's at the desk, the lunch hour, holidays, the weekend rush — Neverr is on. The result is a 100% answer rate against the 60-something-percent most teams hit on a good week.",
+            "When a real human is needed, Neverr knows. It books a callback into your calendar, fires the relevant CRM update, and sends the caller a confirmation SMS so the lead doesn't go cold while you finish what you're doing."
+          ],
+          "bullets": [
+            "Sub-two-second pickup, 24/7, no exceptions for holidays or weekends",
+            "Live transfer rules for VIPs, emergencies, and anything you mark as human-only",
+            "Automatic callback scheduling into Google Calendar or Outlook when a human is required",
+            "Post-call SMS confirmations and daily owner briefings so nothing falls through the cracks"
+          ]
+        },
+        {
+          "tag": "// TRY BEFORE YOU BUY",
+          "title": "Live demo, no signup",
+          "paragraphs": [
+            "You can hear your own AI receptionist before you ever enter a credit card. Pick the industry that matches your business, hit dial, and have a real conversation with the agent that would answer your phones tomorrow. No mock data, no scripted demo — the same voice engine our paying customers use, calibrated to your vertical on the spot.",
+            "If you want a deeper look at what a configured account does day-to-day, the demo dashboards mint a real session against a sandbox tenant so you can click through calls, transcripts, lead scores, and briefings before deciding to start a trial."
+          ],
+          "bullets": [
+            "Call a working agent for any of 193+ specialties from the demo page",
+            "Walk through a fully populated dashboard — calls, transcripts, contacts, analytics — without signing up",
+            "32 languages available on the same engine, so you can hear it answer in the language your customers speak",
+            "When you're ready, a 7-day free trial starts with one click"
+          ]
+        }
+      ],
+      "finalCta": {
+        "headline": "Start your 7-day free trial",
+        "subhead": "Card optional during the trial. Live in the time it takes to make coffee.",
+        "ctaPrimary": "Get started free",
+        "ctaSecondary": "See pricing"
+      }
+    },
+    "industriesHub": {
+      "title": "Industries — Neverr",
+      "eyebrow": "193+ Specialties",
+      "headlinePart1": "Built for your industry. ",
+      "headlinePart2": "Specifically.",
+      "subheadPrefix": "Neverr is trained on the workflows, vocabulary, and triage logic of",
+      "subheadStrong1": "193+ specialties",
+      "subheadMiddle": ". Today we're spotlighting ",
+      "subheadStrong2Suffix": " with deep, hand-built playbooks",
+      "subheadEnd": " — full proof transcripts, integrations, and retention flows. More spotlighted every month.",
+      "ctaPrimary": "See spotlighted playbooks →",
+      "ctaSecondary": "Browse the full catalog",
+      "diagramSpotlighted": "SPOTLIGHTED",
+      "diagramSpotlightedSubtitle": "{{count}} deep playbooks",
+      "diagramFullBriefs": "FULL BRIEFS",
+      "diagramProofIntegrations": "proof · integrations",
+      "diagramRetention": "retention flows",
+      "diagramCatalog": "FULL CATALOG",
+      "diagramCatalogSubtitle": "193+ specialties",
+      "diagramFooter": "Depth + breadth — built for both",
+      "diagramFooterSub": "more industries spotlighted every month",
+      "spotlightedLabel": "Spotlighted",
+      "spotlightedTitle": "{{count}} industries with deep, hand-built playbooks.",
+      "spotlightedSubhead": "Each spotlighted industry has its own full brief — proof transcripts, industry-specific intake logic, integrations, retention flows, and pricing-aware response. More spotlighted every month.",
+      "featuredSection": "Featured",
+      "byCategorySection": "All spotlighted, by category",
+      "seePlaybook": "See playbook →",
+      "catalogLabel": "Full Catalog",
+      "catalogMore": "+ 176 more industries supported",
+      "catalogTitle": "Don't see your industry spotlighted? We probably built for it anyway.",
+      "catalogSubhead": "Beyond the {{count}} deep playbooks, Neverr supports 193+ specialties across home services, healthcare, professional services, hospitality, retail, transportation, and more. Same flat-rate pricing. Same sub-second answer. Configured for your vertical.",
+      "sampleHeading": "Sample of supported categories",
+      "sampleTags": [
+        "Roofing",
+        "Electricians",
+        "Landscaping",
+        "Pest Control",
+        "Cleaning Services",
+        "Chiropractors",
+        "Physical Therapy",
+        "Optometry",
+        "Hearing Aids",
+        "Insurance Agents",
+        "Property Management",
+        "Locksmiths",
+        "Towing",
+        "Funeral Homes",
+        "Tutoring",
+        "Wedding Vendors",
+        "Catering",
+        "Storage Facilities",
+        "Pool Service",
+        "Appliance Repair",
+        "Garage Door Repair",
+        "Moving Companies",
+        "Notary Services",
+        "Bail Bonds",
+        "+170 more"
+      ],
+      "tellUsTitle": "Don't see yours? Tell us what you do.",
+      "tellUsSubhead": "Most industries already have a configured playbook. The ones we haven't built yet, we add based on customer demand — often within days.",
+      "tellUsCta": "Tell us about your industry →"
+    },
+    "industryDetail": {
+      "forLabel": "For {{name}}",
+      "painHeading": "Generic AI doesn't know {{nameLower}}.",
+      "incomingCall": "📞 INCOMING CALL",
+      "afterTheCall": "✓ AFTER THE CALL",
+      "howItWorksHeading": "How it works.",
+      "whatItHandlesHeading": "What it handles.",
+      "beyondTheCallEyebrow": "Beyond the call",
+      "notFoundTitle": "Industry not found",
+      "notFoundSubtitle": "We don't have a page for \"{{slug}}\" yet. Browse all the industries Neverr supports:",
+      "notFoundCta": "View all industries →"
+    },
+    "megamenu": {
+      "trigger": "Industries",
+      "spotlightedToday": "Spotlighted Today",
+      "deepPlaybooks": "— {{count}} deep playbooks",
+      "seeAllSpotlighted": "See all spotlighted →",
+      "catalogPrefix": "Plus",
+      "catalogStrong": "193+ more",
+      "catalogSuffix": "in the catalog",
+      "browseCatalog": "Browse full catalog →"
+    },
+    "categories": {
+      "home-services": "Home Services",
+      "professional-services": "Professional Services",
+      "hospitality-lifestyle": "Hospitality & Lifestyle",
+      "auto-transport": "Auto & Transport",
+      "health-wellness": "Health & Wellness"
+    },
+    "thesis": "Specificity is the product.",
+    "industries": {},
+    "demoCall": {
+      "headline": "Book a 30-minute call with the Neverr team.",
+      "subhead": "We'll show you how Neverr handles calls for your industry, walk through your specific software setup, and answer any questions about pricing or onboarding.",
+      "trustSignal": "Most calls run 20-30 minutes. We'll never push a sale on the first call.",
+      "fallbackMessage": "Booking is temporarily unavailable. Please email enterprise@neverr.ai and we'll get back to you within one business day."
+    },
+    "contact": {
+      "hero": {
+        "headline": "Ready to see Neverr for your business?",
+        "subhead": "Book a 15-minute demo and we will configure a live AI receptionist for your exact industry — before the call ends."
+      },
+      "form": {
+        "fullNamePlaceholder": "Full name *",
+        "businessNamePlaceholder": "Business name",
+        "emailPlaceholder": "Email *",
+        "phonePlaceholder": "Phone",
+        "industryLabel": "Industry",
+        "callVolumeLabel": "Monthly call volume",
+        "messagePlaceholder": "Message (optional)",
+        "submitting": "Sending...",
+        "sendMessage": "Send message",
+        "bookMyDemo": "Book My Demo",
+        "errorGeneric": "Something went wrong. Please try again.",
+        "errorConnection": "Connection error. Please try again."
+      },
+      "industries": {
+        "homeServices": "Home Services",
+        "healthcare": "Healthcare",
+        "mentalHealth": "Mental Health",
+        "legal": "Legal",
+        "automotive": "Automotive",
+        "foodHospitality": "Food & Hospitality",
+        "hotelsLodging": "Hotels & Lodging",
+        "beautyWellness": "Beauty & Wellness",
+        "fitnessGyms": "Fitness & Gyms",
+        "bankingFinancial": "Banking & Financial",
+        "realEstate": "Real Estate",
+        "insurance": "Insurance",
+        "accountingTax": "Accounting & Tax",
+        "government": "Government",
+        "entertainment": "Entertainment",
+        "parksAmusement": "Parks & Amusement",
+        "movieTheaters": "Movie Theaters",
+        "educationTutoring": "Education & Tutoring",
+        "childcareDaycare": "Childcare & Daycare",
+        "petServices": "Pet Services",
+        "veterinary": "Veterinary",
+        "transportationAviation": "Transportation & Aviation",
+        "limoLuxury": "Limo & Luxury Transport",
+        "retailShopping": "Retail & Shopping",
+        "grocerySupermarkets": "Grocery & Supermarkets",
+        "utilities": "Utilities",
+        "funeralMemorial": "Funeral & Memorial",
+        "nonprofits": "Nonprofits & Associations",
+        "photographyCreative": "Photography & Creative",
+        "printingSignage": "Printing & Signage"
+      },
+      "callVolumes": {
+        "under100": "Under 100",
+        "range100to500": "100-500",
+        "range500to2000": "500-2000",
+        "over2000": "2000+"
+      },
+      "direct": {
+        "heading": "Or reach us directly:",
+        "callOrText": "Call or text",
+        "phone": "+1 (978) 9NEVERR",
+        "emailLabel": "Email",
+        "emailAddress": "hello@neverr.ai",
+        "tryDemoLabel": "Try the AI demo first",
+        "tryDemoCta": "Talk to a live agent (no signup) →"
+      },
+      "reassurance": {
+        "respondTime": "We respond within 2 hours",
+        "demoHours": "15-minute demos available Mon–Fri 9am–6pm ET"
+      }
+    },
+    "multilingual": {
+      "badge": "32 languages · 1 receptionist",
+      "hero": {
+        "line1": "Your customers don't all speak English.",
+        "line2": "Your receptionist shouldn't either."
+      },
+      "subhead": "Neverr handles calls in 32 languages with native-speaker fluency and cultural context — not just translation. Your AI knows the difference between Mexican Spanish, Colombian Spanish, and Castilian Spanish.",
+      "sampleCallLabel": "Sample call",
+      "callerLabel": "Caller",
+      "agentLabel": "Neverr",
+      "commonInLabel": "Common in",
+      "tryInLanguage": "Try in {{language}}",
+      "allLanguagesNote": "Plus 25 more: Italian, Japanese, Korean, Hindi, Polish, Russian, Dutch, Swedish, and 17 others.",
+      "whyMatters": {
+        "eyebrow": "// WHY IT MATTERS",
+        "headline": "Translation is not enough. Cultural fluency is the moat.",
+        "blocks": {
+          "native": {
+            "title": "Native phrasing",
+            "body": "A Mexican plumbing customer expects \"con mucho gusto,\" not direct translation. A Quebec customer wants Quebec French, not Parisian. Neverr knows the difference."
+          },
+          "codeSwitch": {
+            "title": "Code-switching ready",
+            "body": "US bilingual customers switch between languages mid-sentence. Generic AI panics; Neverr follows naturally — responds in whichever language the caller is most comfortable with."
+          },
+          "cultural": {
+            "title": "Cultural context",
+            "body": "Greeting style, formality level, conversation pacing — all calibrated per culture. An Egyptian Arabic conversation has different rhythms than Levantine Arabic."
+          }
+        }
+      },
+      "finalCta": {
+        "headline": "Try your AI receptionist in {{language}}.",
+        "subhead": "Pick your language, your industry, and have a real conversation.",
+        "button": "Start live demo"
+      },
+      "languages": {
+        "spanish": {
+          "name": "Spanish",
+          "marketDescription": "Largest US bilingual SMB market — your customers code-switch, your AI should too",
+          "exampleScenario": "Plumbing emergency call · US Hispanic customer",
+          "industries": [
+            "Plumbing",
+            "Auto repair",
+            "Restaurants",
+            "Construction"
+          ]
+        },
+        "french": {
+          "name": "French",
+          "marketDescription": "Canadian market plus bilingual US metros — Quebec French and standard French both supported",
+          "exampleScenario": "Dental appointment · Montreal patient",
+          "industries": [
+            "Dental",
+            "Healthcare",
+            "Legal",
+            "Real Estate"
+          ]
+        },
+        "portuguese": {
+          "name": "Portuguese",
+          "marketDescription": "Large Brazilian-American populations plus LATAM expansion potential",
+          "exampleScenario": "Beauty salon booking · Brazilian-American customer",
+          "industries": [
+            "Beauty & Wellness",
+            "Restaurants",
+            "Real Estate",
+            "Healthcare"
+          ]
+        },
+        "mandarin": {
+          "name": "Mandarin",
+          "marketDescription": "High-value commercial services with significant Chinese-speaking customer base",
+          "exampleScenario": "Law firm intake · Mandarin-speaking client",
+          "industries": [
+            "Legal",
+            "Healthcare",
+            "Financial Services",
+            "Real Estate"
+          ]
+        },
+        "arabic": {
+          "name": "Arabic",
+          "marketDescription": "Underserved by competitors — high-value Middle Eastern and North African business context",
+          "exampleScenario": "Medical practice · Arabic-speaking patient",
+          "industries": [
+            "Healthcare",
+            "Legal",
+            "Education",
+            "Real Estate"
+          ]
+        },
+        "german": {
+          "name": "German",
+          "marketDescription": "Strong B2B and professional services market — German precision expects formal, accurate communication",
+          "exampleScenario": "Auto repair appointment · German-speaking customer",
+          "industries": [
+            "Auto repair",
+            "Professional Services",
+            "Healthcare",
+            "Legal"
+          ]
+        }
+      }
+    },
+    "roi": {
+      "hero": {
+        "headline": "Calculate your ROI",
+        "subhead": "See exactly how much revenue Neverr recovers for your business"
+      },
+      "inputs": {
+        "monthlyCallVolume": "Monthly call volume",
+        "monthlyCallVolumeUnit": "calls",
+        "avgCustomerValue": "Average customer value",
+        "currentAnswerRate": "Current answer rate"
+      },
+      "neverrPitch": {
+        "bold": "Neverr answer rate: 100%",
+        "rest": " — every call answered instantly, 24/7"
+      },
+      "results": {
+        "youRecover": "You recover",
+        "perYear": "per year",
+        "roiSuffix": "return on investment",
+        "missedCallsMonthly": "Missed calls per month",
+        "revenueRecoveredMonthly": "Revenue recovered monthly",
+        "neverrCost": "Neverr cost",
+        "monthlySuffix": "/mo",
+        "netAnnualGain": "Net annual gain",
+        "cta": "Start recovering revenue →"
+      },
+      "disclaimer": "Based on 15% conversion rate of answered calls. Results vary by industry."
+    },
+    "industryCategory": {
+      "notFound": {
+        "title": "Category Not Found",
+        "backLink": "← Back to all industries"
+      },
+      "loadError": "Failed to load",
+      "loadErrorFallback": "Category not found",
+      "backToAll": "All industries",
+      "description_one": "{{count}} specialized AI receptionist in this category. Each one is calibrated with industry-specific pain points, value props, and call playbooks.",
+      "description_other": "{{count}} specialized AI receptionists in this category. Each one is calibrated with industry-specific pain points, value props, and call playbooks.",
+      "previewAgent": "Preview agent",
+      "modal": {
+        "closeAria": "Close",
+        "commonConcerns": "Common caller concerns",
+        "howItHelps": "How your AI helps",
+        "samplePlaybook": "Sample call playbook",
+        "scenarioPrefix": "Scenario:",
+        "triggerPrefix": "Trigger:",
+        "tryAgent": "Try this agent live (no signup)"
+      }
+    }
+  }
+}

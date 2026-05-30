@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pnpm run *)",
+      "PowerShell(pnpm run *)",
+      "PowerShell(Get-Command *)",
+      "PowerShell(npm root *)",
+      "PowerShell(corepack *)",
+      "PowerShell(corepack pnpm *)",
+      "PowerShell($ErrorActionPreference = \"Continue\"; Write-Host \"=== api-server typecheck ===\"; & \"artifacts\\\\api-server\\\\node_modules\\\\.bin\\\\tsc.cmd\" -p artifacts\\\\api-server\\\\tsconfig.json --noEmit 2>&1; Write-Host \"exit=$LASTEXITCODE\")",
+      "PowerShell($ErrorActionPreference = \"Continue\"; Write-Host \"=== api-server typecheck ===\"; & \".\\\\artifacts\\\\api-server\\\\node_modules\\\\.bin\\\\tsc.cmd\" -p .\\\\artifacts\\\\api-server\\\\tsconfig.json --noEmit 2>&1; Write-Host \"exit=$LASTEXITCODE\")",
+      "PowerShell($ErrorActionPreference = \"Continue\"; Write-Host \"=== api-server typecheck ===\"; & \".\\\\node_modules\\\\.bin\\\\tsc.CMD\" -p .\\\\artifacts\\\\api-server\\\\tsconfig.json --noEmit 2>&1; $apiExit = $LASTEXITCODE; Write-Host \"api-server exit=$apiExit\"; Write-Host \"\"; Write-Host \"=== dashboard typecheck ===\"; & \".\\\\node_modules\\\\.bin\\\\tsc.CMD\" -p .\\\\artifacts\\\\voiceiq-dashboard\\\\tsconfig.json --noEmit 2>&1; $dashExit = $LASTEXITCODE; Write-Host \"dashboard exit=$dashExit\")",
+      "PowerShell($ErrorActionPreference = \"Continue\"; $dashErrors = & \".\\\\node_modules\\\\.bin\\\\tsc.CMD\" -p .\\\\artifacts\\\\voiceiq-dashboard\\\\tsconfig.json --noEmit 2>&1 | Out-String -Stream | Select-String -Pattern \"SettingsPage\\\\.tsx\"; Write-Host \"=== SettingsPage.tsx errors ===\"; if \\($dashErrors\\) { $dashErrors | ForEach-Object { $_.Line } } else { Write-Host \"\\(none\\)\" })",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)"
+    ]
+  }
+}

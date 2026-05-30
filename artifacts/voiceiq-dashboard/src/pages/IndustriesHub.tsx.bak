@@ -1,0 +1,269 @@
+import { useEffect, useState } from "react";
+import { Link } from "wouter";
+import { ArrowRight, Search } from "lucide-react";
+import LandingNav from "../components/LandingNav";
+import LandingFooter from "../components/LandingFooter";
+
+const API = window.location.origin + "/api";
+
+const CATEGORY_EMOJI: Record<string, string> = {
+  "Automotive & Vehicle Services": "🚗",
+  "Aviation & Travel": "✈️",
+  "Beauty, Wellness & Personal Care": "💅",
+  "Consulting": "💼",
+  "Dental & Vision": "🦷",
+  "Education & Childcare": "📚",
+  "Entertainment & Events": "🎉",
+  "Financial Services": "💰",
+  "Fitness & Recreation": "💪",
+  "Food, Hospitality & Events": "🍽️",
+  "Government & Public Services": "🏛️",
+  "Healthcare & Medical": "⚕️",
+  "Home Services & Trades": "🔧",
+  "Hospitality & Lodging": "🏨",
+  "Insurance": "🛡️",
+  "Legal": "⚖️",
+  "Legal Services": "⚖️",
+  "Marketing, Media & Creative": "🎨",
+  "Mental & Behavioral Health": "🧠",
+  "Nonprofits, Faith & Community": "🤝",
+  "Pet Services": "🐾",
+  "Professional Services": "💼",
+  "Real Estate": "🏠",
+  "Religious & Community": "🙏",
+  "Retail & E-commerce": "🛍️",
+  "Senior Care & Home Health": "👴",
+  "Specialty Services": "✨",
+  "Technology & Professional Services": "💻",
+  "Technology & Software": "💻",
+  "Transportation & Logistics": "🚚",
+  "Veterinary": "🐕",
+  "Veterinary & Pet Care": "🐾",
+};
+
+export function getCategoryEmoji(name: string): string {
+  return CATEGORY_EMOJI[name] || "🏢";
+}
+
+/**
+ * Sprint 5 Pattern 3 — per-category proof lines that combine
+ *   (a) industry-specific TERMINOLOGY the agent knows, plus
+ *   (b) a distinct CALL-FLOW behavior the agent does differently.
+ *
+ * Surfaced on each /industries card to counter the "feels generic"
+ * failure mode and make calibration concrete. One line per
+ * canonical_category as returned by /api/industries/categories.
+ *
+ * Unknown keys fall through to `null` and the card renders without a
+ * proof line (non-fatal — degrades to the pre-Pattern-3 layout).
+ *
+ * INITIAL DRAFT — pending Abdul's review Friday morning. Lines tagged
+ * with [TBD] are best-attempt drafts where Abdul should sanity-check
+ * the specifics against actual industry knowledge before launch.
+ */
+const CATEGORY_PROOF_LINES: Record<string, string> = {
+  "Automotive & Vehicle Services":
+    "Speaks VIN, RO numbers, and warranty windows. Quotes accurate dropoff times before booking — knows what's in the bay and what's waiting parts.",
+  "Aviation & Travel":
+    "Knows N-numbers, slot availability, and weather minimums. Confirms pilot certifications and currency before booking instruction or charter time — never assumes a current medical.",
+  "Beauty, Wellness & Personal Care":
+    "Speaks service menus, stylist preferences, and walk-in vs appointment. Books touch-ups against the right operator — never sends a balayage client to a barber chair.",
+  "Consulting":
+    "Pre-qualifies prospects on scope, timeline, and budget signals — never books discovery calls without enough context to make them productive.",
+  "Dental & Vision":
+    "Knows recall intervals, treatment plan stages, and emergency vs routine. Books cleanings against the right hygienist's column — never against the doctor's chair.",
+  "Education & Childcare":
+    "Knows enrollment windows, age cutoffs, and licensing ratios. Routes parents to the right campus or program before requesting a tour.",
+  "Financial Services":
+    "Speaks balances, holds, and Reg-CC funds-availability rules. Never quotes rates or account details over the phone — escalates to a verified channel.",
+  "Fitness & Recreation":
+    "Knows class schedules, drop-in vs membership, and waiver requirements. Books trial sessions in the moment — captures the waiver while the prospect is still on the line.",
+  "Food, Hospitality & Events":
+    "Knows party-of, dietary tags, and corkage. Books deuces and tops accurately — never overbooks the chef's expo window or the host's floor plan.",
+  "Government & Public Services":
+    "Knows form numbers, eligibility rules, and which department handles what. Routes callers directly to the right line \u2014 never tells them \u201Ctry the website.\u201D",
+  "Healthcare & Medical":
+    "HIPAA-conscious by design — minimizes PHI on the line, escalates to staff per your protocol. Never books without insurance verification and a reason-for-visit on file.",
+  "Home Services & Trades":
+    "Speaks dispatch, ETA, and emergency keywords. Pages the on-call tech the moment a burst pipe or no-heat call comes in — doesn't hold the customer through pleasantries.",
+  "Insurance":
+    "Knows policy numbers, claim status, and effective vs renewal dates. Captures the info underwriters actually need \u2014 not what a website form collects.",
+  "Legal Services":
+    "Pre-screens by case type, runs conflict-check signals, and surfaces urgent matters first — partner hours only on cases worth taking.",
+  "Mental & Behavioral Health":
+    "Knows intake forms, sliding-scale fees, and crisis escalation paths. Routes urgent calls to a clinician immediately \u2014 never holds someone in distress.",
+  "Nonprofits, Faith & Community":
+    "Knows donor intent, event RSVPs, and program eligibility. Captures gift designations and follow-up preferences in the moment — never makes a major donor repeat their pledge level twice.",
+  "Real Estate":
+    "Knows MLS numbers, pre-approval status, and showing windows. Pre-qualifies buyers on price range and financing before scheduling agent time.",
+  "Retail & E-commerce":
+    "Knows order numbers, return windows, and stock-status by store. Resolves WISMO calls without a transfer — and offers in-store pickup when the SKU's three miles away.",
+  "Senior Care & Home Health":
+    "Knows level-of-care assessments, Medicare vs private pay, and family decision-maker dynamics. Captures the context tour coordinators actually need.",
+  "Technology & Professional Services":
+    "Speaks SOWs, retainers, and project scope. Captures engagement context conversationally — without sending callers to an intake form.",
+  "Transportation & Logistics":
+    "Knows BOL numbers, dispatch windows, and driver check-in protocols. Books pickups against your live capacity — never strands a driver at a closed dock or overcommits a trailer.",
+  "Veterinary & Pet Care":
+    "Knows species, weight, and last-visit dates. Triages emergency vs routine before booking \u2014 your DVM's time stays protected.",
+};
+
+export function getCategoryProofLine(name: string): string | null {
+  return CATEGORY_PROOF_LINES[name] || null;
+}
+
+type Category = {
+  name: string;
+  slug: string;
+  industry_count: number;
+  sample_industries: string[];
+};
+
+export default function IndustriesHub() {
+  const [categories, setCategories] = useState<Category[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [filter, setFilter] = useState("");
+  const [totalIndustries, setTotalIndustries] = useState(0);
+
+  useEffect(() => {
+    fetch(`${API}/industries/categories`)
+      .then((r) => r.json())
+      .then((d) => {
+        if (d.success) {
+          setCategories(d.categories || []);
+          setTotalIndustries(d.total_industries || 0);
+        }
+      })
+      .catch(() => {})
+      .finally(() => setLoading(false));
+  }, []);
+
+  const filteredCategories = filter.trim()
+    ? categories.filter(
+        (c) =>
+          c.name.toLowerCase().includes(filter.toLowerCase()) ||
+          c.sample_industries.some((s) => s.toLowerCase().includes(filter.toLowerCase())),
+      )
+    : categories;
+
+  return (
+    <div className="min-h-screen bg-gradient-to-b from-slate-50 to-white">
+      <LandingNav />
+      <div className="max-w-7xl mx-auto px-6 py-16">
+        <div className="text-center mb-12">
+          {/* Sprint 5 Pattern 3 — reframe the badge from a breadth claim
+              ("194+ Industries") that reads as "supports everyone =
+              generic", to a depth claim ("one calibration per industry")
+              that reframes the same number as evidence of distinct
+              calibrations. Anti-flash guard preserved. */}
+          {totalIndustries > 0 && (
+            <div className="inline-flex items-center gap-2 px-4 py-1.5 bg-blue-50 text-blue-700 rounded-full text-sm font-medium mb-6">
+              One calibration per industry — {totalIndustries} of them
+            </div>
+          )}
+          <h1 className="text-4xl md:text-5xl font-bold text-slate-900 mb-4">
+            Built for your industry — not generic.
+          </h1>
+          {/* Sprint 5 Pattern 3 — replace abstract "pain points / value
+              propositions / call playbooks" subhead with concrete
+              calibration-specific framing. Counters the "feels generic"
+              failure mode by naming exactly what gets calibrated. */}
+          <p className="text-lg text-slate-600 max-w-2xl mx-auto">
+            We don't ship one generic agent rebranded 22 ways. Every Neverr agent learns the
+            terminology, call patterns, and compliance rules of one specific industry. Pick
+            yours below to see what we already know about it.
+          </p>
+        </div>
+
+        <div className="max-w-md mx-auto mb-10">
+          <div className="relative">
+            <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
+            <input
+              type="text"
+              placeholder="Search industries or categories..."
+              className="w-full pl-10 pr-4 py-2.5 border border-slate-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+              value={filter}
+              onChange={(e) => setFilter(e.target.value)}
+            />
+          </div>
+        </div>
+
+        {loading ? (
+          <div className="flex justify-center py-16">
+            <div className="animate-spin w-8 h-8 border-[3px] border-blue-600 border-t-transparent rounded-full" />
+          </div>
+        ) : (
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+            {filteredCategories.map((category) => {
+              const proofLine = getCategoryProofLine(category.name);
+              return (
+                <Link
+                  key={category.slug}
+                  href={`/industries/${category.slug}`}
+                  className="group bg-white rounded-xl border border-slate-200 p-6 hover:border-blue-400 hover:shadow-lg transition-all"
+                >
+                  <div className="flex items-start justify-between mb-3">
+                    <h3 className="text-lg font-bold text-slate-900 group-hover:text-blue-600 transition-colors flex items-center gap-2">
+                      <span className="text-2xl flex-shrink-0" aria-hidden="true">
+                        {getCategoryEmoji(category.name)}
+                      </span>
+                      <span>{category.name}</span>
+                    </h3>
+                    <ArrowRight className="w-4 h-4 text-slate-400 group-hover:text-blue-600 group-hover:translate-x-1 transition-all flex-shrink-0 mt-1" />
+                  </div>
+                  {/* Sprint 5 Pattern 3 — per-category proof line:
+                      ONE phrase of vocabulary fluency + ONE phrase of
+                      distinct call-flow behavior. Slots directly under
+                      the H3 row so it reads as the primary card
+                      description. Falls back to the pre-Pattern-3
+                      layout if a category has no entry in
+                      CATEGORY_PROOF_LINES (non-fatal). */}
+                  {proofLine && (
+                    <p className="text-sm text-slate-700 leading-snug mb-3">
+                      {proofLine}
+                    </p>
+                  )}
+                  <p className="text-xs text-slate-500 mb-3">
+                    {category.industry_count}{" "}
+                    {category.industry_count === 1 ? "industry" : "industries"}
+                  </p>
+                  <div className="flex flex-wrap gap-1.5">
+                    {category.sample_industries.map((s) => (
+                      <span key={s} className="text-xs px-2 py-0.5 bg-slate-100 text-slate-600 rounded">
+                        {s}
+                      </span>
+                    ))}
+                    {category.industry_count > 4 && (
+                      <span className="text-xs px-2 py-0.5 text-slate-400">
+                        +{category.industry_count - 4} more
+                      </span>
+                    )}
+                  </div>
+                </Link>
+              );
+            })}
+          </div>
+        )}
+
+        {filteredCategories.length === 0 && !loading && (
+          <div className="text-center py-12 text-slate-400">No categories match "{filter}"</div>
+        )}
+
+        <div className="mt-16 bg-gradient-to-r from-blue-600 to-indigo-600 rounded-2xl p-8 text-center text-white">
+          <h2 className="text-2xl font-bold mb-2">Don't see your industry?</h2>
+          <p className="text-blue-100 mb-5">
+            We can calibrate an AI receptionist for any business. Try our generic template — most
+            prospects find it surprisingly accurate.
+          </p>
+          <Link
+            href="/try-your-agent"
+            className="inline-flex items-center gap-2 px-6 py-3 bg-white text-blue-700 rounded-lg font-semibold hover:bg-blue-50 transition-colors shadow-md"
+          >
+            Try a Live Demo →
+          </Link>
+        </div>
+      </div>
+      <LandingFooter />
+    </div>
+  );
+}

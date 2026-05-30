@@ -1,0 +1,96 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1" />
+    <title>Neverr — AI Receptionist</title>
+    <meta name="generator" content="Neverr" />
+    <meta name="description" content="Neverr answers every call instantly, 24/7 — books appointments, captures leads, and handles customers in 32 languages." />
+    <link rel="icon" type="image/png" href="/favicon.png" />
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <!--
+      CookieYes GDPR consent banner. Loaded once globally so consent state
+      (cookies set by the script) is consistent across the SPA — once a
+      visitor accepts/rejects on any public marketing page, that decision
+      persists everywhere.
+
+      Banner UI is suppressed on auth/dashboard routes via CSS rules in
+      src/index.css ("CookieYes — route-scoped UI suppression"), toggled
+      by src/components/CookieConsentManager.tsx using the same
+      HIDE_EXACT / HIDE_PREFIX pattern as ChatWidget. Suppressing the
+      banner UI (rather than gating script load) keeps the consent state
+      machine intact and avoids fighting CookieYes's globals lifecycle.
+    -->
+    <!--
+      First-paint anti-flash: the CookieYes script (loaded immediately
+      below) renders its banner DOM the moment it boots — BEFORE React
+      hydrates and CookieConsentManager has a chance to apply the
+      `cky-route-hidden` class. On a hard reload / deep link to
+      /signup, /dashboard, etc., that race produces a ~100ms flash of
+      the banner before our CSS hides it. This inline script primes
+      the class synchronously in <head> using the same HIDE_EXACT /
+      HIDE_PREFIX rules as src/components/CookieConsentManager.tsx
+      (kept in sync manually — they're both ~12 lines so divergence
+      risk is low). React's CookieConsentManager remains the source of
+      truth for navigation-time changes; this is purely an SSR-style
+      first-paint optimisation.
+    -->
+    <script>
+      (function () {
+        var path = window.location.pathname;
+        var HIDE_EXACT = { "/signup": 1, "/login": 1, "/contact": 1 };
+        var HIDE_PREFIX = [
+          "/dashboard", "/calls", "/contacts", "/appointments",
+          "/sms", "/analytics", "/benchmarks", "/admin", "/settings",
+          "/mfa-setup", "/mfa-verify"
+        ];
+        var hidden = !!HIDE_EXACT[path];
+        if (!hidden) {
+          for (var i = 0; i < HIDE_PREFIX.length; i++) {
+            var p = HIDE_PREFIX[i];
+            if (path === p || path.indexOf(p + "/") === 0) { hidden = true; break; }
+          }
+        }
+        if (hidden) document.documentElement.classList.add("cky-route-hidden");
+      })();
+    </script>
+    <!--
+      CookieYes loader. The CookieYes script is locked to the domain it
+      was registered for (it reads window.location.hostname and refuses
+      to render its banner anywhere else), so we maintain TWO accounts:
+        - production banner   → registered for neverr.ai
+        - dev preview banner  → registered for *.picard.replit.dev
+      This loader picks the right one based on the current hostname so
+      production keeps its real banner AND we can smoke-test the
+      consent flow on the Replit dev preview. Any other hostname (e.g.
+      a future staging domain) gets no script — fail-closed is fine
+      since the missing banner is visible-but-safe.
+    -->
+    <!-- Start cookieyes banner -->
+    <script>
+      (function () {
+        var host = window.location.hostname;
+        var src;
+        if (host === "neverr.ai" || host.endsWith(".neverr.ai")) {
+          src = "https://cdn-cookieyes.com/client_data/9268414a6295473f03a2038cf24cc7bd/script.js";
+        } else if (host.endsWith(".picard.replit.dev")) {
+          src = "https://cdn-cookieyes.com/client_data/83ba76e5b572b12f96598b0dd536128b/script.js";
+        }
+        if (src) {
+          var s = document.createElement("script");
+          s.id = "cookieyes";
+          s.type = "text/javascript";
+          s.src = src;
+          document.head.appendChild(s);
+        }
+      })();
+    </script>
+    <!-- End cookieyes banner -->
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

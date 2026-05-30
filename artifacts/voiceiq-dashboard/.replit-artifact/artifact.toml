@@ -1,0 +1,31 @@
+kind = "web"
+previewPath = "/"
+title = "Neverr Dashboard"
+version = "1.0.0"
+id = "artifacts/voiceiq-dashboard"
+router = "path"
+
+[[integratedSkills]]
+name = "react-vite"
+version = "1.0.0"
+
+[[services]]
+localPort = 25148
+name = "web"
+paths = ["/"]
+
+[services.development]
+run = "pnpm --filter @neverr/dashboard run dev"
+
+[services.env]
+PORT = "25148"
+BASE_PATH = "/"
+
+[services.production]
+build = ["pnpm", "--filter", "@neverr/dashboard", "run", "build"]
+publicDir = "artifacts/voiceiq-dashboard/dist/public"
+serve = "static"
+
+[[services.production.rewrites]]
+from = "/*"
+to = "/index.html"
