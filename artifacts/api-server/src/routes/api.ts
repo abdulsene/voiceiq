@@ -4213,13 +4213,71 @@ const memoryCache = new BoundedCache<any>();
 router.post("/twilio/voice", async (req: Request, res: Response) => {
   const body = req.body as any;
   const callerPhone = body.From || body.Caller || "";
+  const toNumber: string = (body.To || body.Called || "") as string;
+
+  // Sprint 2: route by the dialed number (To), not the caller (From).
+  // Each tenant has their own provisioned DID stored on
+  // business_configs.twilio_phone_number; we resolve the business by
+  // matching To against that column. The legacy fallback to
+  // process.env.TWILIO_PHONE_NUMBER preserves the shared support / demo
+  // flow that existed before per-tenant provisioning landed.
+  let resolvedBusinessId: string = "demo-business";
+  const supabaseForRouting = getSupabase();
+  if (supabaseForRouting && toNumber) {
+    try {
+      const { data } = await supabaseForRouting
+        .from("business_configs")
+        .select("business_id")
+        .eq("twilio_phone_number", toNumber)
+        .maybeSingle();
+      // Cast to escape supabase-js's never-typing when no schema is
+      // generated — matches the file's existing `any`-style usage
+      // elsewhere (e.g. the active_calls upsert callback below).
+      const biz = data as { business_id: string } | null;
+      if (biz?.business_id) {
+        resolvedBusinessId = biz.business_id;
+        console.log(
+          "[Twilio] Routed call to:",
+          resolvedBusinessId,
+          "via To:",
+          toNumber,
+        );
+      } else if (toNumber === process.env.TWILIO_PHONE_NUMBER) {
+        // Shared support / demo DID — keep the legacy "demo-business"
+        // routing for memory / personalization.
+        console.log(
+          "[Twilio] Shared support DID dialed:",
+          toNumber,
+          "— using demo-business",
+        );
+      } else {
+        // Unknown DID. Return clear TwiML rather than forwarding to
+        // ElevenLabs and getting an opaque error. Structured warn log
+        // so ops can spot misconfigured numbers (e.g. a DID that
+        // exists on Twilio but was never persisted to a row).
+        console.warn(`[VoiceWebhook] Unknown DID called: ${toNumber}`);
+        const twiml = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say voice="Polly.Joanna">This number is not configured for service. Please contact your service provider. Goodbye.</Say>
+  <Hangup/>
+</Response>`;
+        res.setHeader("Content-Type", "text/xml");
+        res.send(twiml);
+        return;
+      }
+    } catch (err: any) {
+      // Routing-lookup failure shouldn't kill the call — fall through
+      // to the legacy demo-business flow and let ElevenLabs decide.
+      console.error("[Twilio] Routing lookup failed:", err.message);
+    }
+  }
 
   console.log("[Twilio] Pre-call lookup for:", callerPhone);
 
   let memory: any = { isReturning: false };
   try {
     memory = await getCallerMemory({
-      businessId: "demo-business",
+      businessId: resolvedBusinessId,
       callerPhone,
     });
 

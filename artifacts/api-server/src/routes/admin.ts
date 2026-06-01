@@ -7103,4 +7103,232 @@ router.get(
   },
 );
 
+// ---------------------------------------------------------------------------
+// POST /api/admin/reconcile-twilio
+// ---------------------------------------------------------------------------
+// Manual trigger for the Twilio number reconciliation that otherwise
+// runs nightly via the cron in src/index.ts (Sprint 2 / Batch C —
+// audit risk #3, orphan / ghost DIDs).
+//
+// Accepts optional body:
+//   { dryRun?: boolean;             // default false — skip writes/releases/email
+//     autoRelease?: boolean;        // default true  — release orphans past threshold
+//     autoReleaseMinAgeHours?: number } // default 24    — minimum orphan age
+//
+// dryRun lets an admin preview "what would happen" before triggering a
+// live run that releases DIDs. The returned report shape is the same
+// either way.
+//
+// Auth: requireAuth + requireAdminRole (req.isAdmin). Mirrors every
+// other /admin endpoint in this file.
+router.post(
+  "/reconcile-twilio",
+  requireAuth,
+  requireAdminRole,
+  async (req: Request, res: Response) => {
+    const meta = extractRequestMeta(req);
+    try {
+      const body = (req.body || {}) as {
+        dryRun?: unknown;
+        autoRelease?: unknown;
+        autoReleaseMinAgeHours?: unknown;
+      };
+
+      const opts = {
+        dryRun: typeof body.dryRun === "boolean" ? body.dryRun : false,
+        autoRelease:
+          typeof body.autoRelease === "boolean" ? body.autoRelease : true,
+        autoReleaseMinAgeHours:
+          typeof body.autoReleaseMinAgeHours === "number" &&
+          body.autoReleaseMinAgeHours >= 0
+            ? body.autoReleaseMinAgeHours
+            : 24,
+      };
+
+      // Dynamic import to keep this admin route file lean of imports
+      // (most admin endpoints don't touch reconciliation).
+      const { runReconciliation } = await import(
+        "../lib/twilio-reconciliation.js"
+      );
+      const report = await runReconciliation(opts);
+
+      await auditLog({
+        userId: req.userId,
+        businessId: req.businessId,
+        action: opts.dryRun
+          ? "admin.reconcile_twilio.dry_run"
+          : "admin.reconcile_twilio.run",
+        resource: "twilio_provisioning",
+        success: true,
+        ipAddress: meta.ipAddress,
+        userAgent: meta.userAgent,
+        details: {
+          opts,
+          twilioNumbersCount: report.twilioNumbersCount,
+          dbNumbersCount: report.dbNumbersCount,
+          orphansCount: report.orphans.length,
+          ghostsCount: report.ghosts.length,
+          orphansAutoReleasedCount: report.orphansAutoReleasedCount,
+          stageErrorsCount: report.errors.length,
+        },
+      });
+
+      return res.json(report);
+    } catch (e: any) {
+      console.error("[AdminReconcileTwilio] Run failed:", e?.message ?? e);
+      await auditLog({
+        userId: req.userId,
+        businessId: req.businessId,
+        action: "admin.reconcile_twilio.run",
+        resource: "twilio_provisioning",
+        success: false,
+        ipAddress: meta.ipAddress,
+        userAgent: meta.userAgent,
+        details: { error: String(e?.message ?? e) },
+      });
+      return res.status(500).json({ error: "server_error" });
+    }
+  },
+);
+
+// ---------------------------------------------------------------------------
+// POST /api/admin/provision/:businessId
+// ---------------------------------------------------------------------------
+// Manual Twilio DID provisioning for an existing business — primarily for
+// pre-Sprint-2 businesses (e.g. EZ Rentals biz_1779288494109_z4z979) whose
+// row exists but never went through the auto-provision-on-signup path, and
+// for re-attempts after a soft-fail at signup.
+//
+// Body: { areaCode?: string } — optional 3-digit override. If omitted, the
+// area code is extracted from the business's existing phone_number (the
+// scraped landline). Falls back to "443" if both extraction and the body
+// override are absent / invalid.
+//
+// The underlying provisionTwilioNumberForBusiness is idempotent: if the
+// business already has a twilio_phone_number, the existing value is
+// returned without re-purchasing. See twilio-provisioning.ts JSDoc.
+router.post(
+  "/provision/:businessId",
+  requireAuth,
+  requireAdminRole,
+  async (req: Request, res: Response) => {
+    const meta = extractRequestMeta(req);
+    // Express's typing for this codebase widens `req.params.X` to
+    // string|string[]; the existing admin endpoints rely on positional
+    // params being strings at runtime. Explicit String() coerce so the
+    // value is type-safe to pass downstream.
+    const targetBusinessId = String(req.params.businessId);
+
+    try {
+      const supabase = getSupabase();
+      if (!supabase) {
+        return res.status(503).json({ error: "Database unavailable" });
+      }
+      if (!targetBusinessId || targetBusinessId === "undefined") {
+        return res.status(400).json({ error: "businessId path param required" });
+      }
+
+      // Look up the business to verify it exists and to grab phone_number
+      // for area-code extraction. Cheap defensive read.
+      const { data: biz, error: lookupErr } = await supabase
+        .from("business_configs")
+        .select("business_id, business_name, phone_number")
+        .eq("business_id", targetBusinessId)
+        .maybeSingle();
+
+      if (lookupErr) {
+        console.error("[AdminProvision] Lookup error:", lookupErr.message);
+        return res.status(500).json({ error: "server_error" });
+      }
+      if (!biz) {
+        return res.status(404).json({ error: "business_not_found" });
+      }
+
+      // Determine area code: explicit body override → extract from
+      // phone_number → '443' default. The body override is validated as
+      // a 3-digit string; anything else falls through to extraction.
+      const body = (req.body || {}) as { areaCode?: unknown };
+      const { extractAreaCodeFromPhoneNumber } = await import(
+        "../lib/phone-utils.js"
+      );
+      let areaCode: string;
+      if (typeof body.areaCode === "string" && /^\d{3}$/.test(body.areaCode)) {
+        areaCode = body.areaCode;
+      } else {
+        const extracted = extractAreaCodeFromPhoneNumber(biz.phone_number);
+        areaCode = extracted ?? "443";
+      }
+
+      const { provisionTwilioNumberForBusiness, TwilioProvisioningError } =
+        await import("../lib/twilio-provisioning.js");
+
+      try {
+        const result = await provisionTwilioNumberForBusiness(
+          targetBusinessId,
+          areaCode,
+        );
+        await auditLog({
+          userId: req.userId,
+          businessId: req.businessId,
+          action: "admin.provision.run",
+          resource: "twilio_provisioning",
+          success: true,
+          ipAddress: meta.ipAddress,
+          userAgent: meta.userAgent,
+          details: {
+            targetBusinessId,
+            requestedAreaCode: areaCode,
+            fulfilledAreaCode: result.areaCode,
+            phoneNumber: result.phoneNumber,
+            twilioSid: result.twilioSid,
+          },
+        });
+        return res.json({ success: true, ...result });
+      } catch (err) {
+        if (err instanceof TwilioProvisioningError) {
+          await auditLog({
+            userId: req.userId,
+            businessId: req.businessId,
+            action: "admin.provision.failed",
+            resource: "twilio_provisioning",
+            success: false,
+            ipAddress: meta.ipAddress,
+            userAgent: meta.userAgent,
+            details: {
+              targetBusinessId,
+              requestedAreaCode: areaCode,
+              subcode: err.subcode,
+              message: err.message,
+            },
+          });
+          return res.status(500).json({
+            success: false,
+            subcode: err.subcode,
+            message: err.message,
+          });
+        }
+        throw err;
+      }
+    } catch (e: any) {
+      console.error("[AdminProvision] Run failed:", e?.message ?? e);
+      await auditLog({
+        userId: req.userId,
+        businessId: req.businessId,
+        action: "admin.provision.failed",
+        resource: "twilio_provisioning",
+        success: false,
+        ipAddress: meta.ipAddress,
+        userAgent: meta.userAgent,
+        details: {
+          targetBusinessId,
+          error: String(e?.message ?? e),
+        },
+      });
+      return res
+        .status(500)
+        .json({ success: false, message: "server_error" });
+    }
+  },
+);
+
 export default router;

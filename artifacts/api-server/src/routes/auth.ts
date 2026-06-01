@@ -12,6 +12,11 @@ import { buildSystemPrompt, fetchIndustryTemplate, fetchObjectionHandlers } from
 import { scrapeWebsite, type ScrapedData } from "../scraping";
 import { issueAndSendVerification } from "../services/verification-email-service";
 import { getGreeting } from "../data/greetings";
+import {
+  provisionTwilioNumberForBusiness,
+  TwilioProvisioningError,
+} from "../lib/twilio-provisioning";
+import { extractAreaCodeFromPhoneNumber } from "../lib/phone-utils";
 
 // Sprint 2 STEP 4 / BUG-18 Part 5: per-user resend rate limit. Simple
 // in-memory map of userId -> last-sent epoch ms. Lost on process restart
@@ -449,11 +454,45 @@ router.post("/auth/complete-onboarding", requireAuth, async (req: Request, res: 
       details: { business_name, industry, agentCreated: agentResult.success },
     });
 
-    const neverrPhone = process.env.TWILIO_PHONE_NUMBER || "";
+    // Sprint 2: auto-provision a per-tenant Twilio DID for this
+    // business. Soft-fail on provisioning errors — the business_configs
+    // row already exists and onboarding has otherwise succeeded, so a
+    // Twilio-side failure should not roll back the whole signup. The
+    // dashboard's existing empty-state UI renders "being provisioned"
+    // copy when neverr_phone is null, and the admin endpoint can
+    // backfill the number later (POST /api/admin/provision/:businessId).
+    let provisionedPhone: string | null = null;
+    let provisioningStatus: string = "failed_no_inventory";
+    const areaCode = extractAreaCodeFromPhoneNumber(phone_number);
+    if (!areaCode) {
+      console.warn(
+        `[Onboarding] Could not extract area code from phone_number "${phone_number}" for ${businessId}; defaulting to 443`,
+      );
+    }
+    const requestedAreaCode = areaCode || "443";
+    try {
+      const result = await provisionTwilioNumberForBusiness(
+        businessId,
+        requestedAreaCode,
+      );
+      provisionedPhone = result.phoneNumber;
+      provisioningStatus = "provisioned";
+    } catch (err) {
+      if (err instanceof TwilioProvisioningError) {
+        console.error(
+          `[Onboarding] Provisioning failed for ${businessId}: ${err.subcode} - ${err.message}`,
+        );
+        provisioningStatus = `failed_${err.subcode}`;
+      } else {
+        // Non-provisioning errors (DB outage, etc.) bubble up to the
+        // outer try/catch and surface as 500 to the client.
+        throw err;
+      }
+    }
 
     if (phone_number) {
-      const welcomeBody = neverrPhone
-        ? `Welcome to Neverr! 🎉 Your AI receptionist is live. Forward your calls to ${neverrPhone} to activate it. — The Neverr Team`
+      const welcomeBody = provisionedPhone
+        ? `Welcome to Neverr! 🎉 Your AI receptionist is live. Forward your calls to ${provisionedPhone} to activate — The Neverr Team`
         : `Welcome to Neverr! Your account is being set up. We'll text you again with your forwarding number shortly. — The Neverr Team`;
       sendSMS(phone_number, welcomeBody).catch((err: any) =>
         console.error("[Onboarding] Welcome SMS failed:", err.message)
@@ -465,7 +504,8 @@ router.post("/auth/complete-onboarding", requireAuth, async (req: Request, res: 
       business_id: businessId,
       agent_id: agentResult.agentId || null,
       agent_created: agentResult.success,
-      neverr_phone: neverrPhone,
+      neverr_phone: provisionedPhone,
+      provisioning_status: provisioningStatus,
     });
   } catch (err: any) {
     console.error("[Onboarding] Error:", err.message);
