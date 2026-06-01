@@ -6,6 +6,10 @@
     "types": ["node"]
   },
   "include": ["src"],
+  "exclude": [
+    "src/tests/helpers",
+    "src/tests/**/*.test.ts"
+  ],
   "references": [
     {
       "path": "../../lib/db"

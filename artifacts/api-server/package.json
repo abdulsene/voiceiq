@@ -12,6 +12,8 @@
     "test:alex-kb": "tsx ./src/tests/alex-kb-smoke.ts",
     "test:config-endpoint": "tsx ./src/tests/config-endpoint-smoke.ts",
     "test:tts-rate-limit": "tsx ./src/tests/tts-rate-limit-smoke.ts",
+    "test:vitest": "vitest run",
+    "test:vitest:watch": "vitest",
     "preflight": "tsx scripts/preflight-check.ts"
   },
   "dependencies": {
@@ -35,6 +37,7 @@
     "ipaddr.js": "^2.3.0",
     "isomorphic-fetch": "^3.0.0",
     "jsonwebtoken": "^9.0.3",
+    "node-cron": "^3.0.3",
     "pg": "^8.20.0",
     "resend": "^6.10.0",
     "stripe": "^21.0.1",
@@ -49,8 +52,11 @@
     "@types/express": "^5.0.6",
     "@types/jsonwebtoken": "^9.0.10",
     "@types/node": "catalog:",
+    "@types/node-cron": "^3.0.11",
     "@types/pg": "^8.18.0",
+    "@vitest/coverage-v8": "^2.1.9",
     "esbuild": "^0.27.3",
-    "tsx": "catalog:"
+    "tsx": "catalog:",
+    "vitest": "^2.1.9"
   }
 }
