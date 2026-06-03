@@ -8672,6 +8672,11 @@ async function processBenchmarksCron() {
 }
 
 function scheduleBenchmarksCron() {
+  // setTimeout's max delay is 2^31 - 1 ms (~24.85 days).
+  // Anything larger silently reduces to 1ms, causing an infinite loop.
+  // We clamp and chain.
+  const MAX_TIMEOUT_MS = 2_147_483_647;
+
   function scheduleNext() {
     const now = new Date();
     const next1st = new Date(now.getFullYear(), now.getMonth() + 1, 1, 9, 0, 0, 0);
@@ -8679,11 +8684,18 @@ function scheduleBenchmarksCron() {
     const daysUntil = Math.round(msUntil / 86400000);
     console.log(`[Benchmarks] Next calculation in ${daysUntil} days`);
 
+    if (msUntil > MAX_TIMEOUT_MS) {
+      // Too far away for a single setTimeout. Re-evaluate in 24 days.
+      setTimeout(scheduleNext, MAX_TIMEOUT_MS);
+      return;
+    }
+
     setTimeout(async () => {
       await processBenchmarksCron();
       scheduleNext();
     }, msUntil);
   }
+
   scheduleNext();
 }
 scheduleBenchmarksCron();
