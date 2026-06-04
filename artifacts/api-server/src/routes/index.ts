@@ -15,6 +15,7 @@ import industryCategoriesRouter from "./industry-categories";
 import chatRouter from "./chat";
 import chatTtsRouter from "./chat-tts";
 import configRouter from "./config";
+import promptRouter from "./prompt";
 
 const router: IRouter = Router();
 
@@ -61,6 +62,10 @@ router.use(chatTtsRouter);
 // apiRouter for the same defensive ordering as the other small
 // public routes above. AUTH_BYPASS_PATTERNS in app.ts whitelists it.
 router.use(configRouter);
+// Sprint 3 Stage 4: prompt editing endpoints (/api/business/prompt*,
+// /api/admin/business/:id/prompt*). Mounted BEFORE the catch-all
+// apiRouter so /api/business/* paths are claimed by this router.
+router.use(promptRouter);
 router.use(apiRouter);
 
 export default router;

@@ -78,14 +78,27 @@ export function createSupabaseMock(): SupabaseMockHandle {
 
     constructor(private readonly table: string) {}
 
+    private opLocked = false;
+
+    /**
+     * SELECT can be called as a standalone op OR chained after
+     * insert/update/delete (Supabase pattern for "return the affected
+     * rows"). When chained after a write, we KEEP the original op so
+     * test response-routing matches the caller's intent (e.g.
+     * `.insert(x).select("id").maybeSingle()` looks up the
+     * `<table>:insert` response queue, not `<table>:select`).
+     */
     select(cols: string): this {
-      this.op = 'select';
       this.cols = cols;
+      if (!this.opLocked) {
+        this.op = 'select';
+      }
       return this;
     }
 
     update(values: unknown, options?: unknown): this {
       this.op = 'update';
+      this.opLocked = true;
       this.values = values;
       this.options = options;
       return this;
@@ -93,12 +106,14 @@ export function createSupabaseMock(): SupabaseMockHandle {
 
     insert(values: unknown): this {
       this.op = 'insert';
+      this.opLocked = true;
       this.values = values;
       return this;
     }
 
     delete(): this {
       this.op = 'delete';
+      this.opLocked = true;
       return this;
     }
 
@@ -114,6 +129,24 @@ export function createSupabaseMock(): SupabaseMockHandle {
 
     not(col: string, op: string, val: unknown): this {
       this.filters.push({ kind: 'not', args: [col, op, val] });
+      return this;
+    }
+
+    /** SELECT modifier — recorded for diagnostics, doesn't affect execution. */
+    order(col: string, opts?: unknown): this {
+      this.filters.push({ kind: 'order', args: [col, opts] });
+      return this;
+    }
+
+    /** SELECT modifier — recorded for diagnostics, doesn't affect execution. */
+    range(from: number, to: number): this {
+      this.filters.push({ kind: 'range', args: [from, to] });
+      return this;
+    }
+
+    /** SELECT modifier — recorded for diagnostics, doesn't affect execution. */
+    limit(n: number): this {
+      this.filters.push({ kind: 'limit', args: [n] });
       return this;
     }
 
