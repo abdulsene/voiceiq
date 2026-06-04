@@ -1,5 +1,5 @@
 import { Router, type Request, type Response } from "express";
-import { createClient } from "@supabase/supabase-js";
+import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import pg from "pg";
 import crypto from "crypto";
 import Anthropic from "@anthropic-ai/sdk";
@@ -76,6 +76,59 @@ function getSupabase() {
   if (!url || !key) return null;
   _supabase = createClient(url, key);
   return _supabase;
+}
+
+/**
+ * Resolve a business_configs row by agent_id (from an ElevenLabs
+ * post-call payload). Falls back to "demo-business" with a console.warn
+ * if the lookup fails, returns no match, or returns a malformed row
+ * (NULL / empty business_id) — preserves legacy routing for any
+ * orphaned ElevenLabs conversations whose agent we don't recognise.
+ * Never throws.
+ *
+ * @param source short tag for the log line ("Lead", "Webhook", "Sync")
+ *               so ops can spot which handler hit the fallback.
+ */
+async function resolveBusinessFromAgentId(
+  supabase: SupabaseClient | null,
+  agentId: string | null | undefined,
+  source: string,
+): Promise<string> {
+  if (!supabase) {
+    console.warn(`[${source}] Supabase not configured — falling back to demo-business`);
+    return "demo-business";
+  }
+  if (!agentId) {
+    console.warn(`[${source}] No agent_id in payload — falling back to demo-business`);
+    return "demo-business";
+  }
+  try {
+    const { data, error } = await supabase
+      .from("business_configs")
+      .select("business_id")
+      .eq("agent_id", agentId)
+      .maybeSingle();
+    if (error) {
+      console.error(
+        `[${source}] business_configs lookup error for agent_id=${agentId}: ${error.message} — falling back to demo-business`,
+      );
+      return "demo-business";
+    }
+    const row = data as { business_id?: string | null } | null;
+    const resolved = row?.business_id;
+    if (!resolved || resolved.length === 0) {
+      console.warn(
+        `[${source}] No usable business_configs row for agent_id=${agentId} (row=${JSON.stringify(data)}) — falling back to demo-business`,
+      );
+      return "demo-business";
+    }
+    return resolved;
+  } catch (err: any) {
+    console.error(
+      `[${source}] business_configs lookup exception for agent_id=${agentId}: ${err?.message ?? err} — falling back to demo-business`,
+    );
+    return "demo-business";
+  }
 }
 
 async function analyzeWithClaude(transcript: string, businessId: string) {
@@ -355,11 +408,18 @@ router.post("/lead", async (req: Request, res: Response) => {
     const transcriptTextRaw = Array.isArray(transcriptArr)
       ? transcriptArr.map((t: any) => (t.role === "agent" ? "AI" : "Caller") + ": " + (t.message || t.text || "")).join("\n")
       : "";
+
+    // Resolve which business this conversation belongs to via the
+    // ElevenLabs agent_id. Defensive multi-path read because the
+    // payload shape has shifted historically.
+    const agentId = convData.agent_id || body.agent_id || metadata.agent_id || null;
+    const businessId = await resolveBusinessFromAgentId(supabase, agentId, "Lead");
+
     // Pipe through PII redaction BEFORE the row is built. Operational
     // PII columns (caller_name / caller_number below) stay raw — only
     // the free-text transcript is redacted.
     const piiSummary = await redactCallTranscript(transcriptTextRaw, {
-      businessId: "demo-business",
+      businessId,
       source: "lead",
       conversationId,
     });
@@ -378,7 +438,7 @@ router.post("/lead", async (req: Request, res: Response) => {
     const { data: existing } = await supabase
       .from("calls")
       .select("id")
-      .eq("business_id", "demo-business")
+      .eq("business_id", businessId)
       .eq("caller_number", callerPhone || "")
       .gte("created_at", new Date(Date.now() - 5 * 60 * 1000).toISOString())
       .order("created_at", { ascending: false })
@@ -404,7 +464,7 @@ router.post("/lead", async (req: Request, res: Response) => {
         .from("calls")
         .insert([{
           call_sid: conversationId,
-          business_id: "demo-business",
+          business_id: businessId,
           caller_name: callerName,
           caller_number: callerPhone,
           caller_intent: reason,
@@ -425,11 +485,11 @@ router.post("/lead", async (req: Request, res: Response) => {
       console.log("[Lead] Post-call inserted:", saved?.id, error?.message);
     }
 
-    trackCallUsage("demo-business", duration);
+    trackCallUsage(businessId, duration);
 
     if (transcriptText && savedId) {
-      analyzeWithClaude(transcriptText, "demo-business")
-        .then((a) => { if (a && supabase) saveAnalysis(supabase, savedId!, a, "demo-business"); })
+      analyzeWithClaude(transcriptText, businessId)
+        .then((a) => { if (a && supabase) saveAnalysis(supabase, savedId!, a, businessId); })
         .catch((err) => console.error("[Lead] Claude error:", err));
     }
 
@@ -526,11 +586,21 @@ router.post("/webhook/elevenlabs", async (req: Request, res: Response) => {
     const callerPhone = data.metadata?.phone_number || "unknown";
     const direction = data.metadata?.call_direction || "inbound";
 
+    // Hoist supabase so it's available before redactCallTranscript (which
+    // takes businessId). The existing `if (supabase)` guard further down
+    // for the calls-row insert still applies against this hoisted handle.
+    const supabase = getSupabase();
+
+    // Resolve which business this conversation belongs to via the
+    // ElevenLabs agent_id. Defensive read of multiple paths.
+    const agentId = data.agent_id || payload.agent_id || data.metadata?.agent_id || null;
+    const businessId = await resolveBusinessFromAgentId(supabase, agentId, "Webhook");
+
     const transcriptTextRaw =
       data.transcript?.map((t: any) => (t.role === "agent" ? "AI" : "Caller") + ": " + t.message).join("\n") || "";
     // PII redaction (see import comment + pii-redact-transcript.ts header).
     const piiSummary = await redactCallTranscript(transcriptTextRaw, {
-      businessId: "demo-business",
+      businessId,
       source: "webhook",
       conversationId,
     });
@@ -552,7 +622,6 @@ router.post("/webhook/elevenlabs", async (req: Request, res: Response) => {
     );
     console.log("[Webhook] Transcript lines:", data.transcript?.length);
 
-    const supabase = getSupabase();
     let savedId: string | null = null;
 
     if (supabase) {
@@ -560,7 +629,7 @@ router.post("/webhook/elevenlabs", async (req: Request, res: Response) => {
         .from("calls")
         .insert({
           call_sid: conversationId,
-          business_id: "demo-business",
+          business_id: businessId,
           caller_number: callerPhone,
           duration_seconds: duration,
           transcript: transcriptText,
@@ -578,15 +647,15 @@ router.post("/webhook/elevenlabs", async (req: Request, res: Response) => {
         console.log("[Webhook] Call saved with id:", savedId);
       }
 
-      trackCallUsage("demo-business", duration || 0);
+      trackCallUsage(businessId, duration || 0);
     }
 
     if (transcriptText && savedId) {
       const id = savedId;
-      analyzeWithClaude(transcriptText, "demo-business")
+      analyzeWithClaude(transcriptText, businessId)
         .then((analysis) => {
           if (analysis && supabase) {
-            saveAnalysis(supabase, id, analysis, "demo-business");
+            saveAnalysis(supabase, id, analysis, businessId);
             console.log("[Webhook] Claude analysis saved for call:", id);
           }
         })
@@ -669,6 +738,11 @@ async function syncElevenLabsConversations() {
           "has_analysis=" + !!conversation.analysis,
         );
 
+        // Resolve which business this conversation belongs to via the
+        // ElevenLabs agent_id. Defensive multi-path read.
+        const agentId = conversation.agent_id || conv.agent_id || conversation.metadata?.agent_id || null;
+        const businessId = await resolveBusinessFromAgentId(supabase, agentId, "Sync");
+
         const transcriptTextRaw = (conversation.transcript || [])
           .map((t: any) => (t.role === "agent" ? "AI" : "Caller") + ": " + t.message)
           .join("\n");
@@ -676,7 +750,7 @@ async function syncElevenLabsConversations() {
         // ingestion path (every 2 minutes), so this is the primary
         // hot-path for the redaction layer.
         const piiSummary = await redactCallTranscript(transcriptTextRaw, {
-          businessId: "demo-business",
+          businessId,
           source: "sync",
           conversationId: conv.conversation_id,
         });
@@ -698,7 +772,7 @@ async function syncElevenLabsConversations() {
           .from("calls")
           .insert({
             call_sid: conv.conversation_id,
-            business_id: "demo-business",
+            business_id: businessId,
             caller_name: callerName,
             caller_number: callerPhone,
             caller_intent: reason,
@@ -717,12 +791,12 @@ async function syncElevenLabsConversations() {
         }
 
         console.log("[Sync] Saved conversation:", conv.conversation_id, "→", saved.id);
-        trackCallUsage("demo-business", duration || 0);
+        trackCallUsage(businessId, duration || 0);
 
         if (transcriptText && saved.id) {
-          const analysis = await analyzeWithClaude(transcriptText, "demo-business");
+          const analysis = await analyzeWithClaude(transcriptText, businessId);
           if (analysis) {
-            await saveAnalysis(supabase, saved.id, analysis, "demo-business");
+            await saveAnalysis(supabase, saved.id, analysis, businessId);
             console.log("[Sync] Claude analysis saved for:", saved.id);
           }
         }
