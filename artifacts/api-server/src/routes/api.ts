@@ -427,7 +427,19 @@ router.post("/lead", async (req: Request, res: Response) => {
 
     const dataResults = analysis.data_collection_results || {};
     const callerName = dataResults.caller_name?.value || metadata.caller_name || null;
-    const callerPhone = dataResults.caller_phone?.value || metadata.phone_number || null;
+    // callerPhone resolution: Claude's transcript-extracted value remains
+    // primary (it's the customer's *stated* callback number, which may
+    // differ from caller-ID in spoofed-caller scenarios). New fallbacks
+    // surface the ElevenLabs caller-ID metadata when transcript
+    // extraction returns null. The legacy `metadata.phone_number` path
+    // is kept at the end of the chain — it doesn't appear in current
+    // ElevenLabs payloads but stays as defense against future shape
+    // shifts back to a flat layout.
+    const callerPhone = dataResults.caller_phone?.value
+      || convData.metadata?.phone_call?.external_number
+      || convData.user_id
+      || metadata.phone_number
+      || null;
     const reason = dataResults.reason?.value || null;
     const duration = metadata.call_duration_secs || convData.call_duration_secs || 0;
     const startUnix = metadata.start_time_unix_secs;
@@ -582,8 +594,20 @@ router.post("/webhook/elevenlabs", async (req: Request, res: Response) => {
 
     const data = payload.data;
     const conversationId = data.conversation_id;
-    const duration = data.call_duration_secs;
-    const callerPhone = data.metadata?.phone_number || "unknown";
+    // Bug fix: duration lived at `data.call_duration_secs` historically
+    // but the current ElevenLabs payload nests it under `metadata`. The
+    // old path always evaluated to `undefined`, silently zeroing every
+    // webhook-imported call's usage tracking.
+    const duration = data.metadata?.call_duration_secs || 0;
+    // No Claude analysis in this synchronous handler, so the chain is
+    // metadata-only. `metadata.phone_call.external_number` is the
+    // canonical ElevenLabs caller-ID field; falls through to user_id
+    // (a top-level mirror), then to the legacy flat `phone_number`
+    // path as defense against shape shifts.
+    const callerPhone = data.metadata?.phone_call?.external_number
+      || data.user_id
+      || data.metadata?.phone_number
+      || "unknown";
     const direction = data.metadata?.call_direction || "inbound";
 
     // Hoist supabase so it's available before redactCallTranscript (which
@@ -760,7 +784,15 @@ async function syncElevenLabsConversations() {
 
         const dataResults = conversation.analysis?.data_collection_results || {};
         const callerName = dataResults.caller_name?.value || null;
-        const callerPhone = dataResults.caller_phone?.value || conversation.metadata?.phone_number || null;
+        // Same chain shape as Site 1 (/lead post-call branch): Claude's
+        // transcript-extracted value is primary; ElevenLabs metadata
+        // (phone_call.external_number, then user_id) is the fallback;
+        // legacy flat `phone_number` is the deepest fallback.
+        const callerPhone = dataResults.caller_phone?.value
+          || conversation.metadata?.phone_call?.external_number
+          || conversation.user_id
+          || conversation.metadata?.phone_number
+          || null;
         const reason = dataResults.reason?.value || null;
 
         const duration = conversation.metadata?.call_duration_secs || 0;
