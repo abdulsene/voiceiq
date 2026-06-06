@@ -12,6 +12,7 @@ import Benchmarks from "./pages/Benchmarks";
 import AdminAuditLogs from "./pages/AdminAuditLogs";
 import Government from "./pages/Government";
 import SettingsPage from "./pages/SettingsPage";
+import AiSettingsPage from "./pages/AiSettingsPage";
 import Privacy from "./pages/Privacy";
 import Terms from "./pages/Terms";
 import Signup from "./pages/Signup";
@@ -610,6 +611,8 @@ function DashboardLayout() {
               <Route path="/benchmarks" component={Benchmarks} />
               <Route path="/admin/audit-logs" component={AdminAuditLogs} />
               <Route path="/settings" component={SettingsPage} />
+              {/* Sprint 3 Stage 5 / Phase 3: AI receptionist voice picker. */}
+              <Route path="/settings/ai" component={AiSettingsPage} />
               <Route>
                 <div className="flex items-center justify-center h-64">
                   <p className="text-gray-500">Page not found</p>

@@ -1,6 +1,10 @@
 const API_BASE = "/api";
 
-function getAuthHeaders(): Record<string, string> {
+// Exported so non-JSON consumers (e.g. AiSettingsPage's audio-blob
+// preview fetch) can build the same Authorization + X-Active-Business
+// headers without re-implementing the localStorage lookup. fetchApi
+// below still wraps this transparently for JSON callers.
+export function getAuthHeaders(): Record<string, string> {
   const headers: Record<string, string> = {};
   const token = localStorage.getItem("neverr_token");
   if (token) headers.Authorization = `Bearer ${token}`;
