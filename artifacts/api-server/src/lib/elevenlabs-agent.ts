@@ -468,3 +468,294 @@ export async function updateAgentPrompt(
     verifiedAt: new Date(),
   };
 }
+
+// ───────────────────────────────────────────────────────────────────────
+// Voice helpers (Sprint 3 Stage 5 Session 1 / Phase 2)
+//
+// Symmetric to updateAgentPrompt / fetchAgentPrompt above. Same
+// retry policy (one retry after 2s on 429/5xx), same timeout
+// (DEFAULT_TIMEOUT_MS), same verify-after-write semantics, same
+// structured-return contract.
+
+export interface UpdateVoiceSuccess {
+  ok: true;
+  agentId: string;
+  voiceId: string;
+  verifiedAt: Date;
+}
+
+export interface UpdateVoiceFailure {
+  ok: false;
+  agentId: string;
+  voiceId: string;
+  error: string;
+  httpStatus: number | null;
+  stage: "patch" | "verify";
+}
+
+export type UpdateVoiceResult = UpdateVoiceSuccess | UpdateVoiceFailure;
+
+export interface FetchVoiceSuccess {
+  ok: true;
+  voiceId: string | null;
+  agentName: string;
+}
+
+export interface FetchVoiceFailure {
+  ok: false;
+  error: string;
+  httpStatus: number | null;
+}
+
+export type FetchVoiceResult = FetchVoiceSuccess | FetchVoiceFailure;
+
+function buildVoicePatchBody(voiceId: string): unknown {
+  return {
+    conversation_config: {
+      tts: { voice_id: voiceId },
+    },
+  };
+}
+
+function extractVoiceFromAgent(agentJson: unknown): string | null {
+  const root = agentJson as
+    | { conversation_config?: { tts?: { voice_id?: unknown } } }
+    | null
+    | undefined;
+  const v = root?.conversation_config?.tts?.voice_id;
+  return typeof v === "string" ? v : null;
+}
+
+/**
+ * GET an agent and read conversation_config.tts.voice_id. Returns
+ * `{ ok: true, voiceId, agentName }` on success. `voiceId` is `null`
+ * when the agent exists but has no tts.voice_id configured.
+ *
+ * Never throws; validation / network / 401 / 404 / other failures all
+ * flow back through `{ ok: false, error, httpStatus }`.
+ */
+export async function fetchAgentVoice(
+  agentId: string,
+): Promise<FetchVoiceResult> {
+  try {
+    validateAgentId(agentId);
+  } catch (err) {
+    return {
+      ok: false,
+      error: err instanceof ElevenLabsAgentError ? err.message : String(err),
+      httpStatus: null,
+    };
+  }
+
+  const url = `${ELEVENLABS_API_BASE}/${agentId}`;
+  let response: Response;
+  try {
+    response = await fetchWithTimeout(
+      url,
+      { headers: { "xi-api-key": getApiKey() } },
+      DEFAULT_TIMEOUT_MS,
+    );
+  } catch (err) {
+    const isAbort = (err as { name?: string })?.name === "AbortError";
+    return {
+      ok: false,
+      error: isAbort
+        ? `Request timed out after ${DEFAULT_TIMEOUT_MS}ms`
+        : `Network error: ${err instanceof Error ? err.message : String(err)}`,
+      httpStatus: null,
+    };
+  }
+
+  if (response.status === 401) {
+    return {
+      ok: false,
+      error: "ELEVENLABS_API_KEY is invalid or revoked (401)",
+      httpStatus: 401,
+    };
+  }
+  if (response.status === 404) {
+    return {
+      ok: false,
+      error: `Agent not found: ${agentId}`,
+      httpStatus: 404,
+    };
+  }
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    return {
+      ok: false,
+      error: `HTTP ${response.status}: ${text.slice(0, 300)}`,
+      httpStatus: response.status,
+    };
+  }
+
+  let json: unknown;
+  try {
+    json = await response.json();
+  } catch (err) {
+    return {
+      ok: false,
+      error: `Invalid JSON response: ${err instanceof Error ? err.message : String(err)}`,
+      httpStatus: response.status,
+    };
+  }
+
+  const voiceId = extractVoiceFromAgent(json);
+  const agentName =
+    typeof (json as { name?: unknown })?.name === "string"
+      ? ((json as { name: string }).name)
+      : "";
+
+  return { ok: true, voiceId, agentName };
+}
+
+/**
+ * PATCH the agent's tts.voice_id, then GET the agent and verify
+ * the persisted value matches what we sent.
+ *
+ * Retry policy: ONE retry after 2s for 429 + 5xx responses. Other
+ * statuses (401, 404, other 4xx, 2xx-with-mismatch) are returned
+ * without retry.
+ *
+ * Never throws; all failure modes flow back through
+ * `{ ok: false, error, httpStatus, stage }`.
+ */
+export async function updateAgentVoice(
+  agentId: string,
+  voiceId: string,
+): Promise<UpdateVoiceResult> {
+  try {
+    validateAgentId(agentId);
+    if (typeof voiceId !== "string" || voiceId.length === 0) {
+      throw new ElevenLabsAgentError(
+        "validation",
+        `Invalid voiceId: must be a non-empty string`,
+      );
+    }
+  } catch (err) {
+    return {
+      ok: false,
+      agentId,
+      voiceId,
+      error: err instanceof ElevenLabsAgentError ? err.message : String(err),
+      httpStatus: null,
+      stage: "patch",
+    };
+  }
+
+  const url = `${ELEVENLABS_API_BASE}/${agentId}`;
+  const body = JSON.stringify(buildVoicePatchBody(voiceId));
+
+  // PATCH with one retry on 429 / 5xx.
+  let response: Response;
+  let attempt = 0;
+  for (;;) {
+    try {
+      response = await fetchWithTimeout(
+        url,
+        {
+          method: "PATCH",
+          headers: {
+            "Content-Type": "application/json",
+            "xi-api-key": getApiKey(),
+          },
+          body,
+        },
+        DEFAULT_TIMEOUT_MS,
+      );
+    } catch (err) {
+      const isAbort = (err as { name?: string })?.name === "AbortError";
+      return {
+        ok: false,
+        agentId,
+        voiceId,
+        error: isAbort
+          ? `PATCH request timed out after ${DEFAULT_TIMEOUT_MS}ms`
+          : `Network error: ${err instanceof Error ? err.message : String(err)}`,
+        httpStatus: null,
+        stage: "patch",
+      };
+    }
+
+    if (response.status === 401) {
+      return {
+        ok: false,
+        agentId,
+        voiceId,
+        error: "ELEVENLABS_API_KEY is invalid or revoked (401)",
+        httpStatus: 401,
+        stage: "patch",
+      };
+    }
+    if (response.status === 404) {
+      return {
+        ok: false,
+        agentId,
+        voiceId,
+        error: `Agent not found: ${agentId}`,
+        httpStatus: 404,
+        stage: "patch",
+      };
+    }
+
+    if (response.status === 429 || response.status >= 500) {
+      if (attempt < 1) {
+        attempt++;
+        await sleep(RETRY_DELAY_MS);
+        continue;
+      }
+      const text = await response.text().catch(() => "");
+      return {
+        ok: false,
+        agentId,
+        voiceId,
+        error: `PATCH failed after retry: HTTP ${response.status}: ${text.slice(0, 300)}`,
+        httpStatus: response.status,
+        stage: "patch",
+      };
+    }
+    break;
+  }
+
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    return {
+      ok: false,
+      agentId,
+      voiceId,
+      error: `PATCH failed: HTTP ${response.status}: ${text.slice(0, 300)}`,
+      httpStatus: response.status,
+      stage: "patch",
+    };
+  }
+
+  // Verify-after-write.
+  const verify = await fetchAgentVoice(agentId);
+  if (!verify.ok) {
+    return {
+      ok: false,
+      agentId,
+      voiceId,
+      error: `Verify-after-write failed: ${verify.error}`,
+      httpStatus: verify.httpStatus,
+      stage: "verify",
+    };
+  }
+  if (verify.voiceId !== voiceId) {
+    return {
+      ok: false,
+      agentId,
+      voiceId,
+      error: `Verify mismatch: sent ${voiceId}, ElevenLabs returned ${verify.voiceId ?? "null"}`,
+      httpStatus: null,
+      stage: "verify",
+    };
+  }
+
+  return {
+    ok: true,
+    agentId,
+    voiceId,
+    verifiedAt: new Date(),
+  };
+}

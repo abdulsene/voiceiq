@@ -16,6 +16,7 @@ import chatRouter from "./chat";
 import chatTtsRouter from "./chat-tts";
 import configRouter from "./config";
 import promptRouter from "./prompt";
+import voicesRouter from "./voices";
 
 const router: IRouter = Router();
 
@@ -66,6 +67,11 @@ router.use(configRouter);
 // /api/admin/business/:id/prompt*). Mounted BEFORE the catch-all
 // apiRouter so /api/business/* paths are claimed by this router.
 router.use(promptRouter);
+// Sprint 3 Stage 5 Session 1 / Phase 2: voice picker endpoints
+// (/api/voices/catalog, /api/voices/preview, /api/business/voice).
+// Mounted BEFORE the catch-all apiRouter so /api/voices/* and the
+// /api/business/voice path are claimed here.
+router.use(voicesRouter);
 router.use(apiRouter);
 
 export default router;
