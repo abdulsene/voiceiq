@@ -117,6 +117,14 @@ export default function AiSettingsPage() {
   const [toast, setToast] = useState<{ text: string; kind: "ok" | "err" } | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const blobUrlRef = useRef<string | null>(null);
+  // Holds the voice the user is confirming, independent of React state, so
+  // the AlertDialogAction's onClick reads a stable value even if the dialog's
+  // close-on-click logic has already begun unmounting/resetting state.
+  const pendingVoiceRef = useRef<CatalogVoice | null>(null);
+  // Set true right before we yank an audio element down (pause + src="").
+  // Clearing the src fires HTMLAudioElement.onerror with an empty-src error,
+  // which would otherwise toast "Couldn't play preview audio" on every Pause.
+  const isManualStopRef = useRef(false);
 
   // Mount: fetch catalog + current voice state in parallel.
   useEffect(() => {
@@ -151,6 +159,7 @@ export default function AiSettingsPage() {
 
   function stopAudio(): void {
     if (audioRef.current) {
+      isManualStopRef.current = true;
       audioRef.current.pause();
       audioRef.current.src = "";
       audioRef.current = null;
@@ -198,6 +207,13 @@ export default function AiSettingsPage() {
         stopAudio();
       };
       audio.onerror = () => {
+        // stopAudio() sets src="" to release the blob, which fires onerror
+        // with MEDIA_ELEMENT_ERROR. Treat that as user-initiated and skip
+        // the toast; the flag self-resets on next use.
+        if (isManualStopRef.current) {
+          isManualStopRef.current = false;
+          return;
+        }
         showToast("Couldn't play preview audio.", "err");
         stopAudio();
       };
@@ -213,7 +229,10 @@ export default function AiSettingsPage() {
   async function handleConfirmSwitch(voice: CatalogVoice): Promise<void> {
     stopAudio();
     setSelectingVoiceId(voice.voice_id);
-    setConfirmVoice(null);
+    // Don't setConfirmVoice(null) here — Radix's AlertDialogAction closes
+    // the dialog itself, which fires onOpenChange(false) below. Racing both
+    // paths previously left React rendering an inconsistent dialog state and
+    // swallowed this onClick on subsequent opens.
     try {
       const res = await fetch("/api/business/voice", {
         method: "PATCH",
@@ -481,8 +500,11 @@ export default function AiSettingsPage() {
                       </Button>
                       <Button
                         size="sm"
-                        onClick={() => setConfirmVoice(voice)}
-                        disabled={isSelecting || isPreviewing === false ? false : false}
+                        onClick={() => {
+                          pendingVoiceRef.current = voice;
+                          setConfirmVoice(voice);
+                        }}
+                        disabled={isSelecting}
                       >
                         {isSelecting ? (
                           "Switching..."
@@ -511,7 +533,10 @@ export default function AiSettingsPage() {
       <AlertDialog
         open={!!confirmVoice}
         onOpenChange={(open) => {
-          if (!open) setConfirmVoice(null);
+          if (!open) {
+            setConfirmVoice(null);
+            pendingVoiceRef.current = null;
+          }
         }}
       >
         <AlertDialogContent>
@@ -528,7 +553,11 @@ export default function AiSettingsPage() {
             <AlertDialogCancel>Cancel</AlertDialogCancel>
             <AlertDialogAction
               onClick={() => {
-                if (confirmVoice) void handleConfirmSwitch(confirmVoice);
+                // Read from ref, not the confirmVoice closure: by the time
+                // the click is delivered Radix may already be tearing down
+                // the dialog and confirmVoice can be stale-null.
+                const voice = pendingVoiceRef.current ?? confirmVoice;
+                if (voice) void handleConfirmSwitch(voice);
               }}
             >
               Yes, switch
