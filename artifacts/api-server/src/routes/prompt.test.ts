@@ -628,3 +628,113 @@ describe("GET /api/admin/business/:businessId/prompt/audit", () => {
     });
   });
 });
+
+describe("GET /api/business/prompt/audit (customer)", () => {
+  test("returns 401 without auth", async () => {
+    const res = await callJson(
+      server.baseUrl,
+      "GET",
+      "/api/business/prompt/audit",
+    );
+    expect(res.status).toBe(401);
+    expect(res.body.error).toBe("auth_required_for_test");
+  });
+
+  test("returns paginated rows + total scoped to caller's business, omits ip_address", async () => {
+    sbMock.setResponses("prompt_audit_log", "select", {
+      data: [
+        {
+          id: "a1",
+          changed_by_user_id: USER,
+          changed_at: "2026-06-04T18:00:00Z",
+          language: "en",
+          source: "owner_raw",
+          old_prompt: "v0",
+          new_prompt: "v1",
+          sync_to_elevenlabs_ok: true,
+          elevenlabs_error: null,
+          user_agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) ...",
+        },
+        {
+          id: "a2",
+          changed_by_user_id: USER,
+          changed_at: "2026-06-04T17:00:00Z",
+          language: "en",
+          source: "voice_change",
+          old_prompt: "voice_old",
+          new_prompt: "voice_new",
+          sync_to_elevenlabs_ok: true,
+          elevenlabs_error: null,
+          user_agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) ...",
+        },
+      ],
+      error: null,
+      count: 7,
+    });
+
+    const res = await callJson(
+      server.baseUrl,
+      "GET",
+      "/api/business/prompt/audit?limit=2",
+      { headers: AUTH_HEADERS },
+    );
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({
+      business_id: BIZ,
+      limit: 2,
+      offset: 0,
+      total: 7,
+    });
+    expect(res.body.rows).toHaveLength(2);
+    expect(res.body.rows[0]).toMatchObject({ id: "a1", source: "owner_raw" });
+    expect(res.body.rows[1]).toMatchObject({ id: "a2", source: "voice_change" });
+
+    // Privacy: ip_address must not leak through the customer endpoint
+    // — neither at the response top level nor on any row. The admin
+    // endpoint above still includes it intentionally.
+    expect(res.body).not.toHaveProperty("ip_address");
+    for (const row of res.body.rows) {
+      expect(row).not.toHaveProperty("ip_address");
+    }
+    // user_agent IS kept — HistoryViewer needs it to identify backfill
+    // scripts inside the diff dialog.
+    expect(res.body.rows[0]).toHaveProperty("user_agent");
+
+    // Cross-tenant guard: the query MUST filter by req.businessId.
+    const selectCall = sbMock.calls.find(
+      (c) => c.table === "prompt_audit_log" && c.op === "select",
+    );
+    expect(selectCall).toBeDefined();
+    expect(
+      selectCall!.filters.some(
+        (f) =>
+          f.kind === "eq" && f.args[0] === "business_id" && f.args[1] === BIZ,
+      ),
+    ).toBe(true);
+    // Defence-in-depth: confirm ip_address wasn't even fetched from DB.
+    expect(selectCall!.cols).not.toContain("ip_address");
+  });
+
+  test("returns empty rows + total: 0 when business has no audit history", async () => {
+    sbMock.setResponses("prompt_audit_log", "select", {
+      data: [],
+      error: null,
+      count: 0,
+    });
+
+    const res = await callJson(
+      server.baseUrl,
+      "GET",
+      "/api/business/prompt/audit",
+      { headers: AUTH_HEADERS },
+    );
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({
+      business_id: BIZ,
+      total: 0,
+      rows: [],
+    });
+  });
+});

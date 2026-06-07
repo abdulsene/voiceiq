@@ -673,6 +673,72 @@ router.post(
   },
 );
 
+// ── GET /api/business/prompt/audit ────────────────────────────────────
+
+router.get(
+  "/business/prompt/audit",
+  requireAuth,
+  requirePermission("settings", "read"),
+  async (req: Request, res: Response) => {
+    try {
+      const supabase = getSupabase();
+      if (!supabase) {
+        return res.status(500).json({ error: "Database not configured" });
+      }
+      const businessId = req.businessId;
+      if (!businessId) {
+        return res.status(400).json({ error: "No active business" });
+      }
+
+      // Customer-facing cap is tighter than the admin endpoint's 100.
+      // The dashboard's HistoryViewer paginates 20 at a time; allowing
+      // up to 50 covers power-user "load more" without inviting full
+      // table scrapes via ?limit=1000.
+      const CUSTOMER_AUDIT_LIMIT_MAX = 50;
+      const parsedLimit = parseInt(String(req.query.limit ?? AUDIT_LIMIT_DEFAULT), 10);
+      const limit = Number.isFinite(parsedLimit)
+        ? Math.max(1, Math.min(CUSTOMER_AUDIT_LIMIT_MAX, parsedLimit))
+        : AUDIT_LIMIT_DEFAULT;
+      const parsedOffset = parseInt(String(req.query.offset ?? 0), 10);
+      const offset = Number.isFinite(parsedOffset) ? Math.max(0, parsedOffset) : 0;
+
+      // ip_address is intentionally NOT selected — exposing a
+      // teammate's IP through the customer-facing surface is a leak.
+      // The admin endpoint below still includes it for incident
+      // response. user_agent IS kept so the dashboard's diff dialog
+      // can distinguish backfill scripts ("backfill-*.ts") from
+      // browser writes.
+      const { data, error, count } = await supabase
+        .from("prompt_audit_log")
+        .select(
+          "id, changed_by_user_id, changed_at, language, source, old_prompt, new_prompt, sync_to_elevenlabs_ok, elevenlabs_error, user_agent",
+          { count: "exact" },
+        )
+        .eq("business_id", businessId)
+        .order("changed_at", { ascending: false })
+        .range(offset, offset + limit - 1);
+      if (error) {
+        console.error(
+          "[prompt:audit:customer] read error:",
+          error.message,
+        );
+        return res.status(500).json({ error: "Failed to load audit history" });
+      }
+
+      return res.json({
+        business_id: businessId,
+        limit,
+        offset,
+        total: count ?? 0,
+        rows: data ?? [],
+      });
+    } catch (e: any) {
+      console.error("[prompt:audit:customer] unexpected:", e?.message ?? e);
+      return res.status(500).json({ error: "server_error" });
+    }
+  },
+);
+
 // ── PATCH /api/admin/business/:businessId/prompt ──────────────────────
 
 router.patch(

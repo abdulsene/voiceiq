@@ -41,6 +41,7 @@ import {
 
 import { fetchApi, getAuthHeaders } from "@/lib/api";
 import PromptEditor from "./AiSettings/PromptEditor";
+import HistoryViewer from "./AiSettings/HistoryViewer";
 
 // ───────────────────────────────────────────────────────────────────────
 // Types
@@ -332,9 +333,7 @@ export default function AiSettingsPage() {
         <TabsList>
           <TabsTrigger value="voice">Voice</TabsTrigger>
           <TabsTrigger value="prompt">Prompt</TabsTrigger>
-          <TabsTrigger value="history" disabled>
-            History <Badge variant="secondary" className="ml-2 text-[10px]">Soon</Badge>
-          </TabsTrigger>
+          <TabsTrigger value="history">History</TabsTrigger>
         </TabsList>
 
         <TabsContent value="voice" className="space-y-6 mt-6">
@@ -535,6 +534,10 @@ export default function AiSettingsPage() {
 
         <TabsContent value="prompt" className="mt-6">
           <PromptEditor onToast={showToast} />
+        </TabsContent>
+
+        <TabsContent value="history" className="mt-6">
+          <HistoryViewer onSwitchTab={(t) => setTab(t)} />
         </TabsContent>
       </Tabs>
 
