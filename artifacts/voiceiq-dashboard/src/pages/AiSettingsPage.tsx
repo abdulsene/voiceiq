@@ -27,7 +27,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
-import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -40,6 +40,7 @@ import {
 } from "@/components/ui/alert-dialog";
 
 import { fetchApi, getAuthHeaders } from "@/lib/api";
+import PromptEditor from "./AiSettings/PromptEditor";
 
 // ───────────────────────────────────────────────────────────────────────
 // Types
@@ -115,6 +116,10 @@ export default function AiSettingsPage() {
   const [confirmVoice, setConfirmVoice] = useState<CatalogVoice | null>(null);
 
   const [toast, setToast] = useState<{ text: string; kind: "ok" | "err" } | null>(null);
+  // Controlled Tabs so we can hoist the active tab if we ever need to
+  // intercept switches. Tab-switch confirmation was cut from scope for
+  // this session — beforeunload is the only guard for dirty prompt edits.
+  const [tab, setTab] = useState<"voice" | "prompt" | "history">("voice");
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const blobUrlRef = useRef<string | null>(null);
   // Holds the voice the user is confirming, independent of React state, so
@@ -323,18 +328,16 @@ export default function AiSettingsPage() {
       </div>
 
       {/* Tabs */}
-      <Tabs defaultValue="voice">
+      <Tabs value={tab} onValueChange={(v) => setTab(v as "voice" | "prompt" | "history")}>
         <TabsList>
           <TabsTrigger value="voice">Voice</TabsTrigger>
-          <TabsTrigger value="prompt" disabled>
-            Prompt <Badge variant="secondary" className="ml-2 text-[10px]">Soon</Badge>
-          </TabsTrigger>
+          <TabsTrigger value="prompt">Prompt</TabsTrigger>
           <TabsTrigger value="history" disabled>
             History <Badge variant="secondary" className="ml-2 text-[10px]">Soon</Badge>
           </TabsTrigger>
         </TabsList>
-      </Tabs>
 
+        <TabsContent value="voice" className="space-y-6 mt-6">
       {/* Load error */}
       {loadError && (
         <Card className="border-red-200 bg-red-50">
@@ -528,6 +531,12 @@ export default function AiSettingsPage() {
           with the previous voice.
         </p>
       </div>
+        </TabsContent>
+
+        <TabsContent value="prompt" className="mt-6">
+          <PromptEditor onToast={showToast} />
+        </TabsContent>
+      </Tabs>
 
       {/* Confirmation dialog */}
       <AlertDialog
