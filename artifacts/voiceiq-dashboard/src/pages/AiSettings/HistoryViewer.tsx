@@ -554,7 +554,7 @@ export default function HistoryViewer({
             Every change to your AI's voice and prompt, in order.
           </p>
         </div>
-        <span className="text-xs text-gray-400 shrink-0">
+        <span className="text-xs text-gray-500 shrink-0">
           {total} total
         </span>
       </div>
@@ -580,7 +580,10 @@ export default function HistoryViewer({
             {summaries.map(({ row, sum }) => (
               <TableRow key={row.id} className="hover:bg-gray-50">
                 <TableCell className="text-sm text-gray-600">
-                  <span title={formatAbsolute(row.changed_at)}>
+                  <span
+                    title={formatAbsolute(row.changed_at)}
+                    aria-label={formatAbsolute(row.changed_at)}
+                  >
                     {formatRelative(row.changed_at)}
                   </span>
                 </TableCell>
@@ -637,6 +640,7 @@ export default function HistoryViewer({
                 <span
                   className="text-xs text-gray-500 shrink-0"
                   title={formatAbsolute(row.changed_at)}
+                  aria-label={formatAbsolute(row.changed_at)}
                 >
                   {formatRelative(row.changed_at)}
                 </span>
@@ -744,9 +748,9 @@ function SyncCell({
     return (
       <span
         className="inline-flex items-center gap-1 text-xs text-green-700"
-        title="Successfully applied to your AI"
+        aria-label="Sync successful — applied to your AI"
       >
-        <Check className="h-3.5 w-3.5" />
+        <Check className="h-3.5 w-3.5" aria-hidden="true" />
         Live
       </span>
     );
@@ -755,14 +759,14 @@ function SyncCell({
     return (
       <span
         className="inline-flex items-center gap-1 text-xs text-red-600"
-        title={err ?? "Sync to AI failed"}
+        aria-label={`Sync failed: ${err ?? "Sync to AI failed"}`}
       >
-        <X className="h-3.5 w-3.5" />
+        <X className="h-3.5 w-3.5" aria-hidden="true" />
         Failed
       </span>
     );
   }
-  return <span className="text-xs text-gray-400">—</span>;
+  return <span className="text-xs text-gray-500" aria-label="No sync status">—</span>;
 }
 
 function InspectDialog({
@@ -877,7 +881,7 @@ function VoiceChangeBody({
             <p className="text-xs text-gray-500 mb-1">Before</p>
             <p className="font-semibold">{oldV.name}</p>
             {!oldV.isCatalog && oldV.rawId && (
-              <p className="text-xs text-gray-400 font-mono mt-1">
+              <p className="text-xs text-gray-500 font-mono mt-1">
                 ({oldV.rawId})
               </p>
             )}
@@ -888,7 +892,7 @@ function VoiceChangeBody({
             <p className="text-xs text-gray-500 mb-1">After</p>
             <p className="font-semibold">{newV.name}</p>
             {!newV.isCatalog && newV.rawId && (
-              <p className="text-xs text-gray-400 font-mono mt-1">
+              <p className="text-xs text-gray-500 font-mono mt-1">
                 ({newV.rawId})
               </p>
             )}
@@ -965,7 +969,7 @@ function PromptDiffBody({
         </div>
         <pre className="bg-gray-50 border rounded-md p-3 text-xs font-mono whitespace-pre-wrap max-h-[400px] overflow-y-auto">
           {row.old_prompt ?? (
-            <span className="italic text-gray-400">(no previous content)</span>
+            <span className="italic text-gray-500">(no previous content)</span>
           )}
         </pre>
       </div>
@@ -995,7 +999,7 @@ function PromptDiffBody({
         </div>
         <pre className="bg-gray-50 border rounded-md p-3 text-xs font-mono whitespace-pre-wrap max-h-[400px] overflow-y-auto">
           {row.new_prompt ?? (
-            <span className="italic text-gray-400">(empty)</span>
+            <span className="italic text-gray-500">(empty)</span>
           )}
         </pre>
       </div>

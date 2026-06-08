@@ -12,6 +12,19 @@
  * setTimeout) — App.tsx doesn't mount a global Toaster.
  */
 
+// TODO(a11y): Pre-existing motion handling gaps not fixed in Polish E:
+//   1. shadcn Dialog/AlertDialog entrance animations ignore
+//      prefers-reduced-motion (tw-animate-css v1.4.0 has no
+//      motion-reduce guards)
+//   2. animate-pulse skeletons + animate-spin spinners ignore it too
+//   Fix path: add to src/index.css:
+//     @media (prefers-reduced-motion: reduce) {
+//       .animate-pulse, .animate-spin, .animate-in {
+//         animation: none !important;
+//       }
+//     }
+//   Out of scope for /settings/ai-specific Polish E.
+
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "wouter";
 import {
@@ -350,7 +363,7 @@ export default function AiSettingsPage() {
           <TabsTrigger value="history">History</TabsTrigger>
         </TabsList>
 
-        <TabsContent value="voice" className="space-y-6 mt-6 data-[state=active]:animate-in data-[state=active]:fade-in-0 data-[state=active]:duration-150 data-[state=active]:ease-out">
+        <TabsContent value="voice" className="space-y-6 mt-6 data-[state=active]:motion-safe:animate-in data-[state=active]:motion-safe:fade-in-0 data-[state=active]:motion-safe:duration-150 data-[state=active]:motion-safe:ease-out">
       {/* Load error */}
       {loadError && (
         <Card className="border-red-200 bg-red-50">
@@ -410,7 +423,7 @@ export default function AiSettingsPage() {
                 <p className="text-gray-500 text-sm">
                   {currentVoiceMatch.descriptor}
                 </p>
-                <p className="text-xs text-gray-400 mt-1">
+                <p className="text-xs text-gray-500 mt-1">
                   {lastSyncedRelative
                     ? `Last changed: ${lastSyncedRelative}`
                     : "This is your AI's voice from when your account was created."}
@@ -559,18 +572,18 @@ export default function AiSettingsPage() {
           </div>
         )}
 
-        <p className="text-xs italic text-gray-400 pt-2">
+        <p className="text-xs italic text-gray-500 pt-2">
           Voice changes apply immediately. Existing calls in progress will finish
           with the previous voice.
         </p>
       </div>
         </TabsContent>
 
-        <TabsContent value="prompt" className="mt-6 data-[state=active]:animate-in data-[state=active]:fade-in-0 data-[state=active]:duration-150 data-[state=active]:ease-out">
+        <TabsContent value="prompt" className="mt-6 data-[state=active]:motion-safe:animate-in data-[state=active]:motion-safe:fade-in-0 data-[state=active]:motion-safe:duration-150 data-[state=active]:motion-safe:ease-out">
           <PromptEditor onToast={showToast} />
         </TabsContent>
 
-        <TabsContent value="history" className="mt-6 data-[state=active]:animate-in data-[state=active]:fade-in-0 data-[state=active]:duration-150 data-[state=active]:ease-out">
+        <TabsContent value="history" className="mt-6 data-[state=active]:motion-safe:animate-in data-[state=active]:motion-safe:fade-in-0 data-[state=active]:motion-safe:duration-150 data-[state=active]:motion-safe:ease-out">
           <HistoryViewer onSwitchTab={(t) => setTab(t)} />
         </TabsContent>
       </Tabs>
@@ -615,7 +628,9 @@ export default function AiSettingsPage() {
       {/* Toast */}
       {toast && (
         <div
-          className={`fixed bottom-6 left-1/2 -translate-x-1/2 z-50 px-4 py-2.5 text-sm rounded-lg shadow-lg max-w-[calc(100vw-2rem)] sm:max-w-md animate-in slide-in-from-bottom-4 fade-in-0 duration-200 ease-out ${
+          role={toast.kind === "ok" ? "status" : "alert"}
+          aria-live={toast.kind === "ok" ? "polite" : "assertive"}
+          className={`fixed bottom-6 left-1/2 -translate-x-1/2 z-50 px-4 py-2.5 text-sm rounded-lg shadow-lg max-w-[calc(100vw-2rem)] sm:max-w-md motion-safe:animate-in motion-safe:slide-in-from-bottom-4 motion-safe:fade-in-0 motion-safe:duration-200 motion-safe:ease-out ${
             toast.kind === "ok"
               ? "bg-gray-900 text-white"
               : "bg-red-600 text-white"

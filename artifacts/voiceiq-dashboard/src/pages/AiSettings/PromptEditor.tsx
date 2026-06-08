@@ -515,6 +515,7 @@ export default function PromptEditor({
               maxLength={TONE_MAX}
               rows={3}
               disabled={saving}
+              aria-label="Tone preference"
             />
             <CharCount n={helpers.tone_preference.length} max={TONE_MAX} />
           </Section>
@@ -545,6 +546,7 @@ export default function PromptEditor({
                       }))
                     }
                     disabled={saving}
+                    aria-label="FAQ question"
                   />
                   <Textarea
                     value={faq.answer}
@@ -559,6 +561,7 @@ export default function PromptEditor({
                       }))
                     }
                     disabled={saving}
+                    aria-label="FAQ answer"
                   />
                 </div>
                 <Button
@@ -571,7 +574,7 @@ export default function PromptEditor({
                     }))
                   }
                   disabled={saving}
-                  className="shrink-0 text-gray-400 hover:text-red-600"
+                  className="shrink-0 text-gray-500 hover:text-red-600"
                   aria-label="Remove FAQ"
                 >
                   <Trash2 className="h-4 w-4" />
@@ -620,6 +623,7 @@ export default function PromptEditor({
                     }))
                   }
                   disabled={saving}
+                  aria-label="Restriction"
                 />
                 <Button
                   variant="ghost"
@@ -631,7 +635,7 @@ export default function PromptEditor({
                     }))
                   }
                   disabled={saving}
-                  className="shrink-0 text-gray-400 hover:text-red-600"
+                  className="shrink-0 text-gray-500 hover:text-red-600"
                   aria-label="Remove restriction"
                 >
                   <Trash2 className="h-4 w-4" />
@@ -681,6 +685,7 @@ export default function PromptEditor({
                       }))
                     }
                     disabled={saving}
+                    aria-label="Objection"
                   />
                   <Textarea
                     value={o.response}
@@ -695,6 +700,7 @@ export default function PromptEditor({
                       }))
                     }
                     disabled={saving}
+                    aria-label="Objection response"
                   />
                 </div>
                 <Button
@@ -707,7 +713,7 @@ export default function PromptEditor({
                     }))
                   }
                   disabled={saving}
-                  className="shrink-0 text-gray-400 hover:text-red-600"
+                  className="shrink-0 text-gray-500 hover:text-red-600"
                   aria-label="Remove objection"
                 >
                   <Trash2 className="h-4 w-4" />
@@ -751,6 +757,7 @@ export default function PromptEditor({
               maxLength={AFTER_HOURS_MAX}
               rows={4}
               disabled={saving}
+              aria-label="After-hours message"
             />
             <CharCount n={helpers.after_hours_message.length} max={AFTER_HOURS_MAX} />
           </Section>
@@ -771,6 +778,7 @@ export default function PromptEditor({
             disabled={saving}
             className="font-mono text-xs min-h-[600px]"
             placeholder="The full system prompt sent to your AI on every call."
+            aria-label="System prompt"
           />
           <CharCount n={rawPrompt.length} max={PROMPT_MAX} />
         </>
@@ -802,7 +810,7 @@ export default function PromptEditor({
               )}
             </>
           ) : (
-            <span className="text-gray-400">Not saved yet</span>
+            <span className="text-gray-500">Not saved yet</span>
           )}
         </div>
         <div className="flex gap-2 shrink-0">
@@ -908,12 +916,12 @@ function Section({
         <div className="flex items-baseline justify-between gap-3">
           <h3 className="font-semibold">{title}</h3>
           {countLabel && (
-            <span className="text-xs text-gray-400 shrink-0">{countLabel}</span>
+            <span className="text-xs text-gray-500 shrink-0">{countLabel}</span>
           )}
         </div>
         {hint && <p className="text-xs text-gray-500 -mt-2">{hint}</p>}
         {emptyState && (
-          <p className="text-sm text-gray-400 italic py-1">{emptyState}</p>
+          <p className="text-sm text-gray-500 italic py-1">{emptyState}</p>
         )}
         {children}
       </CardContent>
@@ -925,7 +933,7 @@ function CharCount({ n, max }: { n: number; max: number }) {
   const close = n > max * 0.9;
   return (
     <p
-      className={`text-xs ${close ? "text-amber-600" : "text-gray-400"} -mt-1 text-right`}
+      className={`text-xs ${close ? "text-amber-600" : "text-gray-500"} -mt-1 text-right`}
     >
       {n} / {max}
     </p>
