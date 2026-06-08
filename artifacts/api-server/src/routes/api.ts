@@ -9,6 +9,10 @@ import { getAvailableSlots, bookAppointment } from "../calendar";
 import { getMicrosoftAuthUrl, getMicrosoftTokens, getOutlookAvailableSlots, bookOutlookAppointment } from "../outlook";
 import { OBJECTION_TEMPLATES } from "../objectionTemplates";
 import { createAgentForBusiness, updateAgentPrompt, deleteAgent } from "../agents";
+import {
+  renderFirstMessage,
+  renderPreviewFirstMessage,
+} from "../lib/first-message-renderer";
 import { getCallerMemory, updateCallerMemory, setVipStatus } from "../memory";
 import { requireAuth, resolveBusinessId } from "../middlewares/auth";
 import { createCheckoutSessionForBusiness, CheckoutHelperError } from "./stripe";
@@ -1718,7 +1722,7 @@ router.post("/onboard", costlyLimiter, requireAuth, async (req: Request, res: Re
       businessId,
       businessName: business_name,
       systemPrompt,
-      firstMessage: `Thank you for calling ${business_name}! How can I help you today?`,
+      firstMessage: renderFirstMessage({ business_name }),
     });
 
     if (agentResult.success && agentResult.agentId && supabase) {
@@ -1885,18 +1889,22 @@ router.post("/preview/generate", async (req: Request, res: Response) => {
       systemPrompt += `\n\nIMPORTANT: This conversation should be conducted primarily in ${label.name}. Greet the caller in ${label.name}. If the caller switches to English, you may respond in English. Use natural, native expressions appropriate for ${label.cultural}.`;
     }
 
-    // Phase 3l: localize the agent's opening line so the demo doesn't open
-    // in English and immediately switch — that breaks the "wow" moment.
-    const FIRST_MESSAGES: Record<string, string> = {
-      en: `Hi! This is a live preview of your ${industryTemplate.name} AI receptionist. Ask me anything about ${business_name} and see how I'd handle it.`,
-      es: `¡Hola! Esta es una demostración en vivo de tu recepcionista AI de ${industryTemplate.name}. Pregúntame lo que quieras sobre ${business_name}.`,
-      fr: `Bonjour! Voici un aperçu en direct de votre réceptionniste AI ${industryTemplate.name}. Posez-moi n'importe quelle question sur ${business_name}.`,
-      pt: `Olá! Esta é uma demonstração ao vivo do seu recepcionista AI de ${industryTemplate.name}. Pode me perguntar qualquer coisa sobre ${business_name}.`,
-      zh: `您好！这是您${industryTemplate.name}AI接待员的实时演示。欢迎询问任何关于${business_name}的问题。`,
-      ar: `مرحباً! هذا عرض مباشر لموظف الاستقبال الذكي الخاص بـ ${business_name} في مجال ${industryTemplate.name}. اسألني أي شيء.`,
-      de: `Guten Tag! Dies ist eine Live-Demo Ihres ${industryTemplate.name}-KI-Empfangs für ${business_name}. Fragen Sie mich gerne alles.`,
-    };
-
+    // Sprint 4: universal recording disclosure prepended to the demo
+    // greeting. The previous localized FIRST_MESSAGES map (en/es/fr/
+    // pt/zh/ar/de) is removed — preview demos now open in English so
+    // the disclosure is in a single audited language.
+    //
+    // TODO: Localized preview greetings should return, but require:
+    //   1. Legal-vetted disclosure phrasing per language (not literal
+    //      translation — Spain vs Mexico Spanish wording matters,
+    //      German GDPR-aligned language differs from Swiss, etc.)
+    //   2. Refactor renderPreviewFirstMessage to accept { industry_name,
+    //      language } and return prepend(disclosure[lang], greeting[lang])
+    //   3. Re-add the 7 localized greetings from git history (this
+    //      commit's parent) as the greetings base.
+    //
+    // Until then: languageDetection: true below still allows
+    // code-switching once the caller speaks.
     const demoBusinessId = `demo_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
     const expiresAt = new Date(Date.now() + PREVIEW_TTL_MS);
 
@@ -1904,7 +1912,9 @@ router.post("/preview/generate", async (req: Request, res: Response) => {
       businessId: demoBusinessId,
       businessName: `[DEMO] ${business_name}`,
       systemPrompt,
-      firstMessage: FIRST_MESSAGES[validLanguage] || FIRST_MESSAGES.en,
+      firstMessage: renderPreviewFirstMessage({
+        industry_name: industryTemplate.name,
+      }),
       language: validLanguage,
       languageDetection: validLanguage !== "en",
     });

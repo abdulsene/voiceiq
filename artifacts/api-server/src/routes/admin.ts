@@ -33,7 +33,7 @@ import {
 } from "../middlewares/staff-rbac.js";
 import getStripe, { getCurrentPeriodEnd, mapStripeStatus } from "../stripe.js";
 import { getUncachableSendGridClient } from "../integrations/sendgrid.js";
-import { getGreeting } from "../data/greetings.js";
+import { renderFirstMessage } from "../lib/first-message-renderer.js";
 import { sendInvitationEmail } from "../services/invitation-email-service.js";
 import { timingSafeEqual } from "node:crypto";
 import { fetchIndustryTemplate, buildSystemPrompt } from "./api.js";
@@ -6817,7 +6817,7 @@ router.post("/demos", requireAuth, requireAdminRole, async (req: Request, res: R
       businessId: demoBusinessId,
       businessName: `[SALES DEMO] ${business_name}`,
       systemPrompt,
-      firstMessage: getGreeting(industry, business_name),
+      firstMessage: renderFirstMessage({ business_name }),
     });
 
     const { data: inserted, error: insertErr } = await supabase

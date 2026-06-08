@@ -11,7 +11,7 @@ import { OBJECTION_TEMPLATES } from "../objectionTemplates";
 import { buildSystemPrompt, fetchIndustryTemplate, fetchObjectionHandlers } from "./api";
 import { scrapeWebsite, type ScrapedData } from "../scraping";
 import { issueAndSendVerification } from "../services/verification-email-service";
-import { getGreeting } from "../data/greetings";
+import { renderFirstMessage } from "../lib/first-message-renderer";
 import {
   provisionTwilioNumberForBusiness,
   TwilioProvisioningError,
@@ -416,7 +416,7 @@ router.post("/auth/complete-onboarding", requireAuth, async (req: Request, res: 
       businessId,
       businessName: business_name,
       systemPrompt,
-      firstMessage: getGreeting(industry, business_name),
+      firstMessage: renderFirstMessage({ business_name }),
     });
 
     if (agentResult.success && agentResult.agentId) {

@@ -759,3 +759,307 @@ export async function updateAgentVoice(
     verifiedAt: new Date(),
   };
 }
+
+// ───────────────────────────────────────────────────────────────────────
+// First-message helpers (Sprint 4)
+//
+// Mirror updateAgentVoice / fetchAgentVoice: same retry policy (one
+// retry after 2s on 429/5xx), same timeout (DEFAULT_TIMEOUT_MS), same
+// verify-after-write contract, same structured-return discriminated
+// unions. Field path is conversation_config.agent.first_message —
+// confirmed by reads in scripts/sprint4-patch-greetings.ts and by
+// ElevenLabs' /v1/convai/agents docs.
+
+const FIRST_MESSAGE_MAX_LENGTH = 2_000;
+
+export interface UpdateFirstMessageSuccess {
+  ok: true;
+  agentId: string;
+  firstMessage: string;
+  verifiedAt: Date;
+}
+
+export interface UpdateFirstMessageFailure {
+  ok: false;
+  agentId: string;
+  firstMessage: string;
+  error: string;
+  httpStatus: number | null;
+  stage: "patch" | "verify";
+}
+
+export type UpdateFirstMessageResult =
+  | UpdateFirstMessageSuccess
+  | UpdateFirstMessageFailure;
+
+export interface FetchFirstMessageSuccess {
+  ok: true;
+  firstMessage: string | null;
+  agentName: string;
+}
+
+export interface FetchFirstMessageFailure {
+  ok: false;
+  error: string;
+  httpStatus: number | null;
+}
+
+export type FetchFirstMessageResult =
+  | FetchFirstMessageSuccess
+  | FetchFirstMessageFailure;
+
+function buildFirstMessagePatchBody(firstMessage: string): unknown {
+  return {
+    conversation_config: {
+      agent: { first_message: firstMessage },
+    },
+  };
+}
+
+function extractFirstMessageFromAgent(agentJson: unknown): string | null {
+  const root = agentJson as
+    | { conversation_config?: { agent?: { first_message?: unknown } } }
+    | null
+    | undefined;
+  const m = root?.conversation_config?.agent?.first_message;
+  return typeof m === "string" ? m : null;
+}
+
+/**
+ * GET an agent and read conversation_config.agent.first_message.
+ * `firstMessage` is `null` when the agent exists but has no first
+ * message configured (rare; ElevenLabs usually sets a default).
+ *
+ * Never throws; validation / network / 401 / 404 / other failures all
+ * flow back through `{ ok: false, error, httpStatus }`.
+ */
+export async function fetchAgentFirstMessage(
+  agentId: string,
+): Promise<FetchFirstMessageResult> {
+  try {
+    validateAgentId(agentId);
+  } catch (err) {
+    return {
+      ok: false,
+      error: err instanceof ElevenLabsAgentError ? err.message : String(err),
+      httpStatus: null,
+    };
+  }
+
+  const url = `${ELEVENLABS_API_BASE}/${agentId}`;
+  let response: Response;
+  try {
+    response = await fetchWithTimeout(
+      url,
+      { headers: { "xi-api-key": getApiKey() } },
+      DEFAULT_TIMEOUT_MS,
+    );
+  } catch (err) {
+    const isAbort = (err as { name?: string })?.name === "AbortError";
+    return {
+      ok: false,
+      error: isAbort
+        ? `Request timed out after ${DEFAULT_TIMEOUT_MS}ms`
+        : `Network error: ${err instanceof Error ? err.message : String(err)}`,
+      httpStatus: null,
+    };
+  }
+
+  if (response.status === 401) {
+    return {
+      ok: false,
+      error: "ELEVENLABS_API_KEY is invalid or revoked (401)",
+      httpStatus: 401,
+    };
+  }
+  if (response.status === 404) {
+    return {
+      ok: false,
+      error: `Agent not found: ${agentId}`,
+      httpStatus: 404,
+    };
+  }
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    return {
+      ok: false,
+      error: `HTTP ${response.status}: ${text.slice(0, 300)}`,
+      httpStatus: response.status,
+    };
+  }
+
+  let json: unknown;
+  try {
+    json = await response.json();
+  } catch (err) {
+    return {
+      ok: false,
+      error: `Invalid JSON response: ${err instanceof Error ? err.message : String(err)}`,
+      httpStatus: response.status,
+    };
+  }
+
+  const firstMessage = extractFirstMessageFromAgent(json);
+  const agentName =
+    typeof (json as { name?: unknown })?.name === "string"
+      ? ((json as { name: string }).name)
+      : "";
+
+  return { ok: true, firstMessage, agentName };
+}
+
+/**
+ * PATCH conversation_config.agent.first_message, then re-GET the
+ * agent and verify byte-for-byte equality.
+ *
+ * Retry policy: ONE retry after 2s for 429 + 5xx responses. Other
+ * statuses (401, 404, other 4xx, 2xx-with-mismatch) return without
+ * retry.
+ *
+ * Never throws; all failure modes flow back through
+ * `{ ok: false, error, httpStatus, stage }`.
+ */
+export async function updateAgentFirstMessage(
+  agentId: string,
+  firstMessage: string,
+): Promise<UpdateFirstMessageResult> {
+  try {
+    validateAgentId(agentId);
+    if (typeof firstMessage !== "string" || firstMessage.length === 0) {
+      throw new ElevenLabsAgentError(
+        "validation",
+        `Invalid firstMessage: must be a non-empty string`,
+      );
+    }
+    if (firstMessage.length > FIRST_MESSAGE_MAX_LENGTH) {
+      throw new ElevenLabsAgentError(
+        "validation",
+        `Invalid firstMessage: exceeds maximum length (${firstMessage.length} > ${FIRST_MESSAGE_MAX_LENGTH})`,
+      );
+    }
+  } catch (err) {
+    return {
+      ok: false,
+      agentId,
+      firstMessage,
+      error: err instanceof ElevenLabsAgentError ? err.message : String(err),
+      httpStatus: null,
+      stage: "patch",
+    };
+  }
+
+  const url = `${ELEVENLABS_API_BASE}/${agentId}`;
+  const body = JSON.stringify(buildFirstMessagePatchBody(firstMessage));
+
+  let response: Response;
+  let attempt = 0;
+  for (;;) {
+    try {
+      response = await fetchWithTimeout(
+        url,
+        {
+          method: "PATCH",
+          headers: {
+            "Content-Type": "application/json",
+            "xi-api-key": getApiKey(),
+          },
+          body,
+        },
+        DEFAULT_TIMEOUT_MS,
+      );
+    } catch (err) {
+      const isAbort = (err as { name?: string })?.name === "AbortError";
+      return {
+        ok: false,
+        agentId,
+        firstMessage,
+        error: isAbort
+          ? `PATCH request timed out after ${DEFAULT_TIMEOUT_MS}ms`
+          : `Network error: ${err instanceof Error ? err.message : String(err)}`,
+        httpStatus: null,
+        stage: "patch",
+      };
+    }
+
+    if (response.status === 401) {
+      return {
+        ok: false,
+        agentId,
+        firstMessage,
+        error: "ELEVENLABS_API_KEY is invalid or revoked (401)",
+        httpStatus: 401,
+        stage: "patch",
+      };
+    }
+    if (response.status === 404) {
+      return {
+        ok: false,
+        agentId,
+        firstMessage,
+        error: `Agent not found: ${agentId}`,
+        httpStatus: 404,
+        stage: "patch",
+      };
+    }
+
+    if (response.status === 429 || response.status >= 500) {
+      if (attempt < 1) {
+        attempt++;
+        await sleep(RETRY_DELAY_MS);
+        continue;
+      }
+      const text = await response.text().catch(() => "");
+      return {
+        ok: false,
+        agentId,
+        firstMessage,
+        error: `PATCH failed after retry: HTTP ${response.status}: ${text.slice(0, 300)}`,
+        httpStatus: response.status,
+        stage: "patch",
+      };
+    }
+    break;
+  }
+
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    return {
+      ok: false,
+      agentId,
+      firstMessage,
+      error: `PATCH failed: HTTP ${response.status}: ${text.slice(0, 300)}`,
+      httpStatus: response.status,
+      stage: "patch",
+    };
+  }
+
+  // Verify-after-write.
+  const verify = await fetchAgentFirstMessage(agentId);
+  if (!verify.ok) {
+    return {
+      ok: false,
+      agentId,
+      firstMessage,
+      error: `Verify-after-write failed: ${verify.error}`,
+      httpStatus: verify.httpStatus,
+      stage: "verify",
+    };
+  }
+  if (verify.firstMessage !== firstMessage) {
+    return {
+      ok: false,
+      agentId,
+      firstMessage,
+      error: `Verify mismatch: sent ${firstMessage.length} chars, ElevenLabs returned ${verify.firstMessage?.length ?? 0} chars`,
+      httpStatus: null,
+      stage: "verify",
+    };
+  }
+
+  return {
+    ok: true,
+    agentId,
+    firstMessage,
+    verifiedAt: new Date(),
+  };
+}

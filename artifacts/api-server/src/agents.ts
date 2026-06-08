@@ -1,3 +1,5 @@
+import { renderFirstMessage } from './lib/first-message-renderer';
+
 function getApiKey(): string {
   const key = process.env.ELEVENLABS_API_KEY;
   if (!key) throw new Error('ELEVENLABS_API_KEY environment variable is required but not set');
@@ -19,7 +21,12 @@ export async function createAgentForBusiness(opts: {
       prompt: {
         prompt: opts.systemPrompt
       },
-      first_message: opts.firstMessage || `Hello, thank you for calling ${opts.businessName}. How can I help you today?`,
+      // Defensive fallback: every production caller now passes a
+      // disclosure-compliant firstMessage built via renderFirstMessage.
+      // If a future caller forgets, we still emit a compliant greeting
+      // instead of the legacy "Hello, thank you for calling…" template
+      // that lacked the recording disclosure.
+      first_message: opts.firstMessage || renderFirstMessage({ business_name: opts.businessName }),
       language: opts.language || 'en',
     };
     if (opts.languageDetection) {

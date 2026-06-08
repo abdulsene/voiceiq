@@ -13,7 +13,16 @@
 
 import { describe, test, expect, beforeEach, afterEach, vi } from "vitest";
 
-import { updateAgentPrompt, fetchAgentPrompt } from "./elevenlabs-agent";
+// TODO(2026): updateAgentVoice/fetchAgentVoice (Session 1) lack direct
+// unit tests — they're covered only indirectly via routes/voices.test.ts
+// mocking the helpers. Add direct coverage when next touching this file.
+
+import {
+  updateAgentPrompt,
+  fetchAgentPrompt,
+  updateAgentFirstMessage,
+  fetchAgentFirstMessage,
+} from "./elevenlabs-agent";
 
 // ───────────────────────────────────────────────────────────────────────
 // Shared setup
@@ -332,5 +341,277 @@ describe("Mocked fetchAgentPrompt", () => {
       expect(result.httpStatus).toBe(404);
       expect(result.error).toMatch(/not found/i);
     }
+  });
+});
+
+// ───────────────────────────────────────────────────────────────────────
+// First-message helpers (Sprint 4)
+
+describe("updateAgentFirstMessage — input validation", () => {
+  test("rejects malformed agentId", async () => {
+    const result = await updateAgentFirstMessage("agent-bad", "hi");
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error).toMatch(/Invalid agentId/);
+      expect(result.httpStatus).toBeNull();
+      expect(result.stage).toBe("patch");
+    }
+  });
+
+  test("rejects empty firstMessage", async () => {
+    const result = await updateAgentFirstMessage("agent_abc123def456", "");
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error).toMatch(/Invalid firstMessage/);
+    }
+  });
+
+  test("rejects oversized firstMessage (> 2000 chars)", async () => {
+    const oversized = "x".repeat(2_001);
+    const result = await updateAgentFirstMessage("agent_abc123def456", oversized);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error).toMatch(/exceeds maximum length/);
+      expect(result.error).toContain("2001");
+    }
+  });
+});
+
+describe("updateAgentFirstMessage — mocked PATCH path", () => {
+  test("happy path returns { ok: true, firstMessage } and PATCHes the agent.first_message field", async () => {
+    const greeting =
+      "Thank you for calling EZ Rentals. This call may be recorded for quality and training purposes. How can I help you today?";
+    let patchedBody: unknown = null;
+
+    const fetchMock = vi
+      .fn()
+      .mockImplementation(async (_url: string, init?: RequestInit) => {
+        if (init?.method === "PATCH") {
+          patchedBody = init.body ? JSON.parse(String(init.body)) : null;
+          return new Response("{}", { status: 200 });
+        }
+        // GET (verify): return the same first_message we sent.
+        return new Response(
+          JSON.stringify({
+            name: "Neverr - EZ Rentals",
+            conversation_config: { agent: { first_message: greeting } },
+          }),
+          { status: 200 },
+        );
+      });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await updateAgentFirstMessage(
+      "agent_abc123def456",
+      greeting,
+    );
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.agentId).toBe("agent_abc123def456");
+      expect(result.firstMessage).toBe(greeting);
+      expect(result.verifiedAt).toBeInstanceOf(Date);
+    }
+    expect(patchedBody).toEqual({
+      conversation_config: { agent: { first_message: greeting } },
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  test("PATCH 404 returns { ok: false, stage: 'patch', httpStatus: 404 }", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(new Response("Agent not found", { status: 404 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await updateAgentFirstMessage(
+      "agent_abc123def456",
+      "Hello.",
+    );
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error).toMatch(/not found/i);
+      expect(result.httpStatus).toBe(404);
+      expect(result.stage).toBe("patch");
+    }
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  test("PATCH 200 + verify mismatch returns { ok: false, stage: 'verify' }", async () => {
+    const sent = "What we sent — exact wording.";
+    const actuallyReturned = "What ElevenLabs persisted — slightly different.";
+
+    const fetchMock = vi
+      .fn()
+      .mockImplementation(async (_url: string, init?: RequestInit) => {
+        if (init?.method === "PATCH") {
+          return new Response("{}", { status: 200 });
+        }
+        return new Response(
+          JSON.stringify({
+            name: "Test",
+            conversation_config: {
+              agent: { first_message: actuallyReturned },
+            },
+          }),
+          { status: 200 },
+        );
+      });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await updateAgentFirstMessage(
+      "agent_abc123def456",
+      sent,
+    );
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.stage).toBe("verify");
+      expect(result.error).toMatch(/mismatch/i);
+      expect(result.error).toContain(`sent ${sent.length}`);
+      expect(result.error).toContain(`returned ${actuallyReturned.length}`);
+      expect(result.httpStatus).toBeNull();
+    }
+  });
+
+  test("PATCH 429 retries once after 2s, then fails if still rate-limited", async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(new Response("Too many", { status: 429 }))
+      .mockResolvedValueOnce(new Response("Still too many", { status: 429 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const pending = updateAgentFirstMessage(
+      "agent_abc123def456",
+      "Hello.",
+    );
+    await vi.advanceTimersByTimeAsync(2_500);
+    const result = await pending;
+    vi.useRealTimers();
+
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error).toMatch(/after retry/);
+      expect(result.httpStatus).toBe(429);
+      expect(result.stage).toBe("patch");
+    }
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  test("PATCH 500 retries once after 2s, then succeeds on second attempt", async () => {
+    vi.useFakeTimers();
+    const greeting = "Recovered greeting.";
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(new Response("Server error", { status: 500 }))
+      .mockResolvedValueOnce(new Response("{}", { status: 200 }))
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            name: "Test",
+            conversation_config: { agent: { first_message: greeting } },
+          }),
+          { status: 200 },
+        ),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const pending = updateAgentFirstMessage("agent_abc123def456", greeting);
+    await vi.advanceTimersByTimeAsync(2_500);
+    const result = await pending;
+    vi.useRealTimers();
+
+    expect(result.ok).toBe(true);
+    // 1 failed PATCH + 1 successful PATCH + 1 verify GET = 3 calls
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+});
+
+describe("fetchAgentFirstMessage", () => {
+  test("returns the first_message string when the agent has one set", async () => {
+    const greeting = "Thank you for calling Acme. ...";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            name: "Neverr - Acme",
+            conversation_config: { agent: { first_message: greeting } },
+          }),
+          { status: 200 },
+        ),
+      ),
+    );
+
+    const result = await fetchAgentFirstMessage("agent_abc123def456");
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.firstMessage).toBe(greeting);
+      expect(result.agentName).toBe("Neverr - Acme");
+    }
+  });
+
+  test("returns firstMessage: null when the agent has no first_message set", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            name: "Bare agent",
+            conversation_config: { agent: {} },
+          }),
+          { status: 200 },
+        ),
+      ),
+    );
+
+    const result = await fetchAgentFirstMessage("agent_abc123def456");
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.firstMessage).toBeNull();
+      expect(result.agentName).toBe("Bare agent");
+    }
+  });
+
+  test("404 returns { ok: false, httpStatus: 404 }", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(new Response("", { status: 404 })),
+    );
+
+    const result = await fetchAgentFirstMessage("agent_abc123def456");
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.httpStatus).toBe(404);
+      expect(result.error).toMatch(/not found/i);
+    }
+  });
+
+  test("network error returns { ok: false, error: 'Network error: …' }", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockRejectedValue(new Error("ECONNREFUSED")),
+    );
+
+    const result = await fetchAgentFirstMessage("agent_abc123def456");
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error).toMatch(/Network error/);
+      expect(result.httpStatus).toBeNull();
+    }
+  });
+
+  test("rejects malformed agentId without making a network call", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await fetchAgentFirstMessage("bogus");
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error).toMatch(/Invalid agentId/);
+    }
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 });
