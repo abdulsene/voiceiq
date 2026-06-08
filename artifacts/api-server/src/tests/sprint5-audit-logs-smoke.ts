@@ -4,7 +4,7 @@
  * Validates GET /api/admin/audit-logs:
  *  - 401 when no token
  *  - 403 for a non-admin user (role=user)
- *  - 200 for an admin user (role=owner)  ← matches requireAdminRole
+ *  - 200 for a user with an active user_roles row (staff RBAC)
  *  - filters: action, business_id, from/to, limit
  *  - pagination: offset reflected in response
  *  - audit-loop sanity: trigger an auth event, see the new row appear

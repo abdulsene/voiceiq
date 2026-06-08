@@ -10,7 +10,10 @@
  *   - GET    /api/admin/business/:businessId/prompt/audit  admin: per-business history
  *
  * Auth: customer endpoints use requireAuth + requirePermission("settings", *).
- * Admin endpoints use requireAuth + a local 6-line requireAdminRole.
+ * Admin endpoints use requireAuth + requireStaffPermission("customers", *)
+ * from staff-rbac.ts — verifies the caller's staff role from user_roles,
+ * NOT the per-tenant `req.isAdmin` flag (which would let any business
+ * owner cross-tenant via /admin/business/:businessId/*).
  *
  * Sync model: synchronous PATCH to ElevenLabs via lib/elevenlabs-agent.ts
  * with verify-after-write. If DB persists but ElevenLabs sync fails, the
@@ -32,13 +35,13 @@ import {
   type IRouter,
   type Request,
   type Response,
-  type NextFunction,
 } from "express";
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import {
   requireAuth,
   requirePermission,
 } from "../middlewares/auth";
+import { requireStaffPermission } from "../middlewares/staff-rbac";
 
 import { renderPromptFromHelpers } from "../lib/prompt-renderer";
 import { updateAgentPrompt, type UpdateAgentResult } from "../lib/elevenlabs-agent";
@@ -93,16 +96,10 @@ function getSupabase(): SupabaseClient | null {
 }
 
 // ───────────────────────────────────────────────────────────────────────
-// Local admin guard — duplicates the 6-line helper from admin.ts.
-
-function requireAdminRole(req: Request, res: Response, next: NextFunction): void {
-  if (!req.isAdmin) {
-    res.status(403).json({ error: "Admin access required" });
-    return;
-  }
-  next();
-}
-
+// Admin endpoints are gated by `requireStaffPermission("customers", ...)`
+// from staff-rbac.ts. The previous local `requireAdminRole` helper only
+// checked `req.isAdmin` (per-tenant owner/admin role) and was deleted in
+// the security hotfix that landed alongside this comment.
 // ───────────────────────────────────────────────────────────────────────
 // Helper validation
 
@@ -744,7 +741,7 @@ router.get(
 router.patch(
   "/admin/business/:businessId/prompt",
   requireAuth,
-  requireAdminRole,
+  requireStaffPermission("customers", "write"),
   async (req: Request, res: Response) => {
     try {
       const supabase = getSupabase();
@@ -807,7 +804,7 @@ router.patch(
 router.get(
   "/admin/business/:businessId/prompt/audit",
   requireAuth,
-  requireAdminRole,
+  requireStaffPermission("customers", "read"),
   async (req: Request, res: Response) => {
     try {
       const supabase = getSupabase();

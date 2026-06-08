@@ -53,6 +53,30 @@ vi.mock("../middlewares/auth", () => ({
     },
 }));
 
+// Security hotfix (separate commit): admin endpoints in prompt.ts now
+// gate on staff-rbac instead of the deleted requireAdminRole. Mock
+// behaves like the production middleware — strict-string match on
+// (resource, action), reading the granted set from a test header.
+vi.mock("../middlewares/staff-rbac", () => ({
+  requireStaffPermission:
+    (resource: string, action: string) =>
+    (req: any, res: any, next: any) => {
+      if (!req.userId) {
+        res.status(401).json({ error: "auth_required_for_test" });
+        return;
+      }
+      const perms = String(req.headers["x-test-staff-perms"] || "");
+      const granted = perms.split(",").map((s) => s.trim()).filter(Boolean);
+      if (!granted.includes(`${resource}:${action}`)) {
+        res.status(403).json({
+          error: `Insufficient permissions for ${action} on ${resource}`,
+        });
+        return;
+      }
+      next();
+    },
+}));
+
 // Real imports AFTER the mocks above.
 import express from "express";
 import http from "node:http";
@@ -361,6 +385,10 @@ const AUTH_HEADERS = {
 const ADMIN_AUTH_HEADERS = {
   ...AUTH_HEADERS,
   "x-test-is-admin": "true",
+  // Post-hotfix: prompt.ts admin endpoints gate on staff-rbac
+  // (customers:write for PATCH, customers:read for the audit GET).
+  // Granting both keeps every existing admin test green.
+  "x-test-staff-perms": "customers:read,customers:write",
 };
 
 describe("GET /api/business/prompt", () => {
@@ -538,7 +566,9 @@ describe("PATCH /api/admin/business/:businessId/prompt", () => {
       { headers: AUTH_HEADERS, body: { system_prompt: "anything" } },
     );
     expect(res.status).toBe(403);
-    expect(res.body.error).toMatch(/Admin access required/);
+    // Post-hotfix: error message comes from requireStaffPermission, which
+    // formats as "Insufficient permissions for <action> on <resource>".
+    expect(res.body.error).toMatch(/Insufficient permissions/);
   });
 
   test("admin can save cross-tenant; source records as admin_raw", async () => {

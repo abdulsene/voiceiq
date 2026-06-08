@@ -27,6 +27,7 @@ import {
   lookupStaffRole,
   superAdminExists,
   requireStaffOrBootstrap,
+  requireStaffPermission,
   secureToken,
   type StaffRole,
   type StaffStatus,
@@ -52,12 +53,13 @@ function getSupabase(): SupabaseClient | null {
   return _supabase;
 }
 
-function requireAdminRole(req: Request, res: Response, next: () => void) {
-  if (!req.isAdmin) {
-    return res.status(403).json({ error: "Admin access required" });
-  }
-  next();
-}
+// Security hotfix: the previous `requireAdminRole(req)` helper only
+// checked `req.isAdmin`, which is set in auth.ts when the caller is the
+// owner/admin of any business they belong to — a per-tenant role, NOT a
+// staff role. Every admin endpoint now uses `requireStaffPermission`
+// from staff-rbac.ts, which reads the user_roles table and verifies
+// the caller holds the specific (resource, action) pair. Strict-string
+// match — no implicit hierarchy (admin does NOT imply write/read).
 
 // MRR pricing — sourced from the same plan IDs Stripe uses.
 const PLAN_PRICING: Record<string, number> = {
@@ -80,7 +82,7 @@ function priceFor(planId?: string | null): number {
 router.get(
   "/customers",
   requireAuth,
-  requireAdminRole,
+  requireStaffPermission("customers", "read"),
   async (req: Request, res: Response) => {
     try {
       const supabase = getSupabase();
@@ -218,7 +220,7 @@ router.get(
 router.get(
   "/analytics/overview",
   requireAuth,
-  requireAdminRole,
+  requireStaffPermission("analytics", "read"),
   async (req: Request, res: Response) => {
     try {
       const supabase = getSupabase();
@@ -345,7 +347,7 @@ router.get(
 router.get(
   "/customers/:customerId",
   requireAuth,
-  requireAdminRole,
+  requireStaffPermission("customers", "read"),
   async (req: Request, res: Response) => {
     try {
       const supabase = getSupabase();
@@ -482,7 +484,7 @@ const VALID_PLANS = Object.keys(PLAN_PRICING);
 router.put(
   "/customers/:customerId/plan",
   requireAuth,
-  requireAdminRole,
+  requireStaffPermission("customers", "write"),
   async (req: Request, res: Response) => {
     try {
       const { customerId } = req.params;
@@ -582,7 +584,7 @@ const VALID_STATUSES = [
 router.put(
   "/customers/:customerId/status",
   requireAuth,
-  requireAdminRole,
+  requireStaffPermission("customers", "write"),
   async (req: Request, res: Response) => {
     try {
       const { customerId } = req.params;
@@ -670,7 +672,7 @@ router.put(
 router.post(
   "/customers/:customerId/reset-usage",
   requireAuth,
-  requireAdminRole,
+  requireStaffPermission("customers", "write"),
   async (req: Request, res: Response) => {
     try {
       const { customerId } = req.params;
@@ -799,7 +801,7 @@ function buildIntelligence(body: any, prior?: any) {
 router.post(
   "/customers/:customerId/intelligence",
   requireAuth,
-  requireAdminRole,
+  requireStaffPermission("customers", "write"),
   async (req: Request, res: Response) => {
     try {
       const { customerId } = req.params;
@@ -873,7 +875,7 @@ router.post(
 router.get(
   "/analytics/segmentation",
   requireAuth,
-  requireAdminRole,
+  requireStaffPermission("analytics", "read"),
   async (req: Request, res: Response) => {
     try {
       const supabase = getSupabase();
@@ -1009,7 +1011,7 @@ router.get(
 router.post(
   "/customers/bulk-intelligence",
   requireAuth,
-  requireAdminRole,
+  requireStaffPermission("customers", "write"),
   async (req: Request, res: Response) => {
     try {
       const supabase = getSupabase();
@@ -1140,7 +1142,7 @@ router.post(
 router.get(
   "/customers/:customerId/health",
   requireAuth,
-  requireAdminRole,
+  requireStaffPermission("customers", "read"),
   async (req: Request, res: Response) => {
     try {
       const supabase = getSupabase();
@@ -1413,7 +1415,7 @@ const VALID_TICKET_CATEGORIES = [
 router.post(
   "/customers/:customerId/tickets",
   requireAuth,
-  requireAdminRole,
+  requireStaffPermission("support", "write"),
   async (req: Request, res: Response) => {
     try {
       const supabase = getSupabase();
@@ -1505,7 +1507,7 @@ router.post(
 router.get(
   "/support/dashboard",
   requireAuth,
-  requireAdminRole,
+  requireStaffPermission("support", "read"),
   async (req: Request, res: Response) => {
     try {
       const supabase = getSupabase();
@@ -1576,7 +1578,7 @@ router.get(
 router.post(
   "/migrate-jsonb-tickets",
   requireAuth,
-  requireAdminRole,
+  requireStaffPermission("support", "write"),
   async (req: Request, res: Response) => {
     try {
       const supabase = getSupabase();
@@ -1682,7 +1684,7 @@ router.post(
 router.post(
   "/create-tickets-table",
   requireAuth,
-  requireAdminRole,
+  requireStaffPermission("support", "write"),
   async (req: Request, res: Response) => {
     try {
       const supabase = getSupabase();
@@ -1760,7 +1762,7 @@ CREATE INDEX IF NOT EXISTS idx_support_tickets_assigned ON support_tickets(assig
 router.post(
   "/backfill-users",
   requireAuth,
-  requireAdminRole,
+  requireStaffPermission("users", "write"),
   async (req: Request, res: Response) => {
     try {
       const supabase = getSupabase();
@@ -2002,7 +2004,7 @@ router.post(
 router.post(
   "/fix-stripe-data",
   requireAuth,
-  requireAdminRole,
+  requireStaffPermission("billing", "write"),
   async (req: Request, res: Response) => {
     try {
       const supabase = getSupabase();
@@ -2514,7 +2516,7 @@ router.get("/monitoring/dashboard", requireAuth, requirePermission("analytics", 
 // CUSTOMER SUCCESS AUTOMATION
 // ============================================================================
 
-router.post("/automation/evaluate-triggers", requireAuth, requireAdminRole, async (req: any, res: any) => {
+router.post("/automation/evaluate-triggers", requireAuth, requireStaffPermission("automation", "write"), async (req: any, res: any) => {
   try {
     const supabase = getSupabase();
     const triggeredWorkflows: any[] = [];
@@ -2732,7 +2734,7 @@ router.post("/automation/evaluate-triggers", requireAuth, requireAdminRole, asyn
   }
 });
 
-router.post("/automation/execute-workflows", requireAuth, requireAdminRole, async (req: any, res: any) => {
+router.post("/automation/execute-workflows", requireAuth, requireStaffPermission("automation", "write"), async (req: any, res: any) => {
   try {
     const { workflows, dryRun = false } = req.body || {};
 
@@ -2881,7 +2883,7 @@ router.post("/automation/execute-workflows", requireAuth, requireAdminRole, asyn
   }
 });
 
-router.get("/automation/dashboard", requireAuth, requireAdminRole, async (_req: any, res: any) => {
+router.get("/automation/dashboard", requireAuth, requireStaffPermission("automation", "read"), async (_req: any, res: any) => {
   try {
     const supabase = getSupabase();
     const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
@@ -3010,7 +3012,7 @@ function computePreservedCustomers(
     .filter(Boolean);
 }
 
-router.get("/cleanup/preview-test-data", requireAuth, requireAdminRole, async (req: any, res: any) => {
+router.get("/cleanup/preview-test-data", requireAuth, requireStaffPermission("customers", "read"), async (req: any, res: any) => {
   try {
     const supabase = getSupabase();
     const excludeRaw = req.query.excludeBusinessIds;
@@ -3078,7 +3080,7 @@ router.get("/cleanup/preview-test-data", requireAuth, requireAdminRole, async (r
   }
 });
 
-router.post("/cleanup/remove-test-data", requireAuth, requireAdminRole, async (req: any, res: any) => {
+router.post("/cleanup/remove-test-data", requireAuth, requireStaffPermission("customers", "delete"), async (req: any, res: any) => {
   try {
     const { confirmCleanup = false, excludeBusinessIds = [] } = req.body || {};
     const excludeSet = new Set((Array.isArray(excludeBusinessIds) ? excludeBusinessIds : []).map(String));
@@ -3417,7 +3419,7 @@ async function sendTemplatedEmail(
   }
 }
 
-router.get("/emails/templates", requireAuth, requireAdminRole, async (_req: any, res: any) => {
+router.get("/emails/templates", requireAuth, requireStaffPermission("support", "read"), async (_req: any, res: any) => {
   try {
     const templates = (Object.keys(emailTemplates) as EmailTemplateName[]).map((name) => ({
       name,
@@ -3430,7 +3432,7 @@ router.get("/emails/templates", requireAuth, requireAdminRole, async (_req: any,
   }
 });
 
-router.post("/emails/preview", requireAuth, requireAdminRole, async (req: any, res: any) => {
+router.post("/emails/preview", requireAuth, requireStaffPermission("support", "write"), async (req: any, res: any) => {
   try {
     const { template, data } = req.body || {};
     const tmpl = emailTemplates[template as EmailTemplateName];
@@ -3451,7 +3453,7 @@ router.post("/emails/preview", requireAuth, requireAdminRole, async (req: any, r
   }
 });
 
-router.post("/emails/send", requireAuth, requireAdminRole, async (req: any, res: any) => {
+router.post("/emails/send", requireAuth, requireStaffPermission("support", "write"), async (req: any, res: any) => {
   try {
     const { customerId, template, data, toOverride } = req.body || {};
     if (!customerId || !template) {
@@ -3536,7 +3538,7 @@ function safePctChange(current: number, previous: number): number | null {
   return Math.round(((current - previous) / previous) * 10000) / 100;
 }
 
-router.get("/analytics/revenue", requireAuth, requireAdminRole, async (req: any, res: any) => {
+router.get("/analytics/revenue", requireAuth, requireStaffPermission("analytics", "read"), async (req: any, res: any) => {
   try {
     const timeRange = String(req.query.timeRange || "12m");
     const granularity = req.query.granularity === "week" ? "week" : "month";
@@ -3627,7 +3629,7 @@ function monthDiff(from: Date, to: Date): number {
   return (to.getFullYear() - from.getFullYear()) * 12 + (to.getMonth() - from.getMonth());
 }
 
-router.get("/analytics/cohorts", requireAuth, requireAdminRole, async (req: any, res: any) => {
+router.get("/analytics/cohorts", requireAuth, requireStaffPermission("analytics", "read"), async (req: any, res: any) => {
   try {
     const cohortType = req.query.cohortType === "weekly" ? "weekly" : "monthly";
     const periodsBack = Math.max(1, Math.min(36, parseInt(String(req.query.periodsBack || "12"), 10) || 12));
@@ -3766,7 +3768,7 @@ function generateChurnRecommendations(riskLevel: string, riskFactors: string[]):
   return [...new Set(recs)];
 }
 
-router.get("/analytics/churn-risk", requireAuth, requireAdminRole, async (_req: any, res: any) => {
+router.get("/analytics/churn-risk", requireAuth, requireStaffPermission("analytics", "read"), async (_req: any, res: any) => {
   try {
     const supabase = getSupabase();
     if (!supabase) return res.status(500).json({ error: "Database unavailable" });
@@ -4021,7 +4023,7 @@ const ACQUISITION_RISK_SCORE: Record<string, number> = {
 const VALID_MODEL_TYPES = ["ensemble", "logisticRegression", "randomForest", "gradientBoosting"] as const;
 type ModelType = (typeof VALID_MODEL_TYPES)[number];
 
-router.get("/analytics/churn-prediction", requireAuth, requireAdminRole, async (req: any, res: any) => {
+router.get("/analytics/churn-prediction", requireAuth, requireStaffPermission("analytics", "read"), async (req: any, res: any) => {
   try {
     const modelType = String(req.query.modelType || "ensemble") as ModelType;
     if (!VALID_MODEL_TYPES.includes(modelType)) {
@@ -4239,7 +4241,7 @@ router.get("/analytics/churn-prediction", requireAuth, requireAdminRole, async (
 router.get(
   "/system/health-check",
   requireAuth,
-  requireAdminRole,
+  requireStaffPermission("monitoring", "read"),
   async (_req: any, res: any) => {
     try {
       const supabase = getSupabase();
@@ -4430,7 +4432,7 @@ async function computeChurnRiskMap(
 router.post(
   "/automation/intelligent-workflows",
   requireAuth,
-  requireAdminRole,
+  requireStaffPermission("automation", "write"),
   async (req: any, res: any) => {
     try {
       const { dryRun = false } = req.body || {};
@@ -4763,7 +4765,7 @@ router.post(
 router.post(
   "/automation/execute-intelligent",
   requireAuth,
-  requireAdminRole,
+  requireStaffPermission("automation", "write"),
   async (req: any, res: any) => {
     try {
       const { workflows, dryRun = false } = req.body || {};
@@ -4956,7 +4958,7 @@ router.post(
 router.get(
   "/automation/intelligent-dashboard",
   requireAuth,
-  requireAdminRole,
+  requireStaffPermission("automation", "read"),
   async (_req: any, res: any) => {
     try {
       const supabase = getSupabase();
@@ -6696,7 +6698,7 @@ function publicBaseUrl(): string {
   return process.env.PUBLIC_BASE_URL || "https://neverr.ai";
 }
 
-router.get("/demos", requireAuth, requireAdminRole, async (req: Request, res: Response) => {
+router.get("/demos", requireAuth, requireStaffPermission("customers", "read"), async (req: Request, res: Response) => {
   const supabase = getSupabase();
   if (!supabase) {
     return res.status(500).json({ error: "Database unavailable" });
@@ -6754,7 +6756,7 @@ router.get("/demos", requireAuth, requireAdminRole, async (req: Request, res: Re
   }
 });
 
-router.post("/demos", requireAuth, requireAdminRole, async (req: Request, res: Response) => {
+router.post("/demos", requireAuth, requireStaffPermission("customers", "write"), async (req: Request, res: Response) => {
   const supabase = getSupabase();
   if (!supabase) {
     return res.status(500).json({ error: "Database unavailable" });
@@ -6893,7 +6895,7 @@ router.post("/demos", requireAuth, requireAdminRole, async (req: Request, res: R
 router.post(
   "/demos/:id/revoke",
   requireAuth,
-  requireAdminRole,
+  requireStaffPermission("customers", "write"),
   async (req: Request, res: Response) => {
     const supabase = getSupabase();
     if (!supabase) {
@@ -7022,11 +7024,15 @@ router.post(
 router.get(
   "/audit-logs",
   requireAuth,
-  // Gate on Neverr back-office staff RBAC (or pre-bootstrap tenant-owner),
-  // NOT per-tenant `requireAdminRole` — `req.isAdmin` is set off the active
-  // tenant membership and would let any paying customer (tenant owner/admin)
-  // read every other tenant's audit trail. `requireStaffOrBootstrap` is the
-  // same gate the staff-management endpoints (e.g. /admin/users/*) use.
+  // Gate on Neverr back-office staff RBAC (or pre-bootstrap tenant-owner).
+  // Historically the rest of the /admin/* surface used a thin
+  // `requireAdminRole` helper that only checked `req.isAdmin` (per-tenant
+  // owner/admin role) and was deleted in the security hotfix that landed
+  // alongside this comment. /audit-logs was always on
+  // `requireStaffOrBootstrap` because the per-tenant check would have let
+  // any paying customer (tenant owner/admin) read every other tenant's
+  // audit trail. Same gate the staff-management endpoints
+  // (e.g. /admin/users/*) use.
   requireStaffOrBootstrap("read"),
   async (req: Request, res: Response) => {
     try {
@@ -7119,12 +7125,16 @@ router.get(
 // live run that releases DIDs. The returned report shape is the same
 // either way.
 //
-// Auth: requireAuth + requireAdminRole (req.isAdmin). Mirrors every
-// other /admin endpoint in this file.
+// Auth: requireAuth + requireStaffPermission("customers", "admin").
+// Strongest action tier — touches external paid services (Twilio
+// number provisioning + release), can spend money, irrecoverable
+// side effects. Strict-match: caller must have "admin" explicitly
+// in user_roles.permissions.customers (super_admin has it by default;
+// regular admin role does NOT).
 router.post(
   "/reconcile-twilio",
   requireAuth,
-  requireAdminRole,
+  requireStaffPermission("customers", "admin"),
   async (req: Request, res: Response) => {
     const meta = extractRequestMeta(req);
     try {
@@ -7207,10 +7217,13 @@ router.post(
 // The underlying provisionTwilioNumberForBusiness is idempotent: if the
 // business already has a twilio_phone_number, the existing value is
 // returned without re-purchasing. See twilio-provisioning.ts JSDoc.
+// Auth: requireAuth + requireStaffPermission("customers", "admin").
+// Strongest action tier — provisions/purchases Twilio DIDs (real
+// money). Strict-match: see /reconcile-twilio above for rationale.
 router.post(
   "/provision/:businessId",
   requireAuth,
-  requireAdminRole,
+  requireStaffPermission("customers", "admin"),
   async (req: Request, res: Response) => {
     const meta = extractRequestMeta(req);
     // Express's typing for this codebase widens `req.params.X` to
