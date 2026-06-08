@@ -780,7 +780,7 @@ function InspectDialog({
     <Dialog open={true} onOpenChange={(o) => !o && onClose()}>
       <DialogContent className="max-w-4xl max-h-[85vh] overflow-y-auto">
         <DialogHeader>
-          <DialogTitle className="flex items-center gap-2">
+          <DialogTitle className="flex flex-wrap items-center gap-2">
             <span
               className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-md border text-xs font-medium ${COLOR_CLASSES[sum.meta.color]}`}
             >
@@ -824,8 +824,8 @@ function InspectDialog({
           <div className="text-xs text-gray-500 border-t pt-3">
             <span className="font-medium">Source:</span>{" "}
             {ua.kind === "script" ? (
-              <span className="inline-flex items-center gap-1 font-mono text-gray-700">
-                <Code className="h-3 w-3" />
+              <span className="inline-flex items-center gap-1 font-mono text-gray-700 break-all">
+                <Code className="h-3 w-3 shrink-0" />
                 {ua.label}
               </span>
             ) : (

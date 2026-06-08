@@ -375,17 +375,17 @@ export default function AiSettingsPage() {
               </div>
             </div>
           ) : currentVoiceMatch ? (
-            <div className="flex items-center gap-4">
+            <div className="flex flex-col sm:flex-row sm:items-center gap-4">
               <div
-                className={`h-14 w-14 rounded-full bg-gray-900 text-white flex items-center justify-center ${
+                className={`h-14 w-14 rounded-full bg-gray-900 text-white flex items-center justify-center shrink-0 ${
                   previewingVoiceId === currentVoiceMatch.voice_id ? "animate-pulse" : ""
                 }`}
               >
                 <Mic className="h-6 w-6" />
               </div>
-              <div className="flex-1">
+              <div className="flex-1 min-w-0">
                 <div className="flex items-center gap-2 flex-wrap">
-                  <h2 className="text-2xl font-semibold">{currentVoiceMatch.name}</h2>
+                  <h2 className="text-xl sm:text-2xl font-semibold">{currentVoiceMatch.name}</h2>
                   <Badge variant="outline" className="text-xs">
                     {currentVoiceMatch.gender}
                   </Badge>
@@ -411,7 +411,7 @@ export default function AiSettingsPage() {
                 variant="outline"
                 size="sm"
                 onClick={() => handlePreview(currentVoiceMatch)}
-                className="shrink-0"
+                className="shrink-0 w-full sm:w-auto mt-1 sm:mt-0"
               >
                 {previewingVoiceId === currentVoiceMatch.voice_id ? (
                   <>
@@ -425,8 +425,8 @@ export default function AiSettingsPage() {
               </Button>
             </div>
           ) : (
-            <div className="flex items-center gap-3 text-gray-500">
-              <Volume2 className="h-5 w-5" />
+            <div className="flex items-start gap-3 text-gray-500">
+              <Volume2 className="h-5 w-5 mt-0.5 shrink-0" />
               <span className="text-sm">
                 {currentState?.voice_id
                   ? `Your AI is using voice "${currentState.voice_id}", which isn't in the curated catalog. Pick one below to switch.`
@@ -591,7 +591,7 @@ export default function AiSettingsPage() {
       {/* Toast */}
       {toast && (
         <div
-          className={`fixed bottom-6 left-1/2 -translate-x-1/2 z-50 px-4 py-2.5 text-sm rounded-lg shadow-lg ${
+          className={`fixed bottom-6 left-1/2 -translate-x-1/2 z-50 px-4 py-2.5 text-sm rounded-lg shadow-lg max-w-[calc(100vw-2rem)] sm:max-w-md ${
             toast.kind === "ok"
               ? "bg-gray-900 text-white"
               : "bg-red-600 text-white"

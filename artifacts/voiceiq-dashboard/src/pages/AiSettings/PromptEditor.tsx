@@ -435,8 +435,8 @@ export default function PromptEditor({
   return (
     <div className="space-y-4">
       {/* Header + mode toggle */}
-      <div className="flex items-start justify-between gap-3">
-        <div className="flex-1">
+      <div className="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-3">
+        <div className="flex-1 min-w-0">
           <h2 className="text-xl font-semibold">
             {mode === "raw" ? "Raw Prompt" : "Editing your AI's behavior"}
           </h2>
@@ -452,7 +452,7 @@ export default function PromptEditor({
             size="sm"
             onClick={() => setMode("raw")}
             disabled={saving}
-            className="shrink-0"
+            className="shrink-0 self-start sm:self-auto"
           >
             <Code className="h-4 w-4 mr-1.5" />
             Advanced: Edit raw prompt
@@ -463,7 +463,7 @@ export default function PromptEditor({
             size="sm"
             onClick={requestModeSwitchToStructured}
             disabled={saving}
-            className="shrink-0"
+            className="shrink-0 self-start sm:self-auto"
           >
             <ArrowLeft className="h-4 w-4 mr-1.5" />
             Back to structured view
