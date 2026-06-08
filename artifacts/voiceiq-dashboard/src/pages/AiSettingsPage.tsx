@@ -20,6 +20,7 @@ import {
   Mic,
   Pause,
   Play,
+  RefreshCw,
   Volume2,
 } from "lucide-react";
 
@@ -142,27 +143,30 @@ export default function AiSettingsPage() {
   // which would otherwise toast "Couldn't play preview audio" on every Pause.
   const isManualStopRef = useRef(false);
 
+  // Extracted from the mount effect so the "Try again" button in the
+  // error state can re-trigger the same fetch without a page reload.
+  // Polish B: B2.
+  async function loadAll(): Promise<void> {
+    setLoading(true);
+    setLoadError(null);
+    try {
+      const [catalogRes, stateRes] = await Promise.all([
+        fetchApi("/voices/catalog") as Promise<{ voices: CatalogVoice[] }>,
+        fetchApi("/business/voice") as Promise<VoiceStateResponse>,
+      ]);
+      setCatalog(catalogRes.voices);
+      setCurrentState(stateRes);
+    } catch (e: any) {
+      setLoadError(e?.message ?? "Failed to load voice settings");
+    } finally {
+      setLoading(false);
+    }
+  }
+
   // Mount: fetch catalog + current voice state in parallel.
   useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        const [catalogRes, stateRes] = await Promise.all([
-          fetchApi("/voices/catalog") as Promise<{ voices: CatalogVoice[] }>,
-          fetchApi("/business/voice") as Promise<VoiceStateResponse>,
-        ]);
-        if (cancelled) return;
-        setCatalog(catalogRes.voices);
-        setCurrentState(stateRes);
-        setLoading(false);
-      } catch (e: any) {
-        if (cancelled) return;
-        setLoadError(e?.message ?? "Failed to load voice settings");
-        setLoading(false);
-      }
-    })();
+    void loadAll();
     return () => {
-      cancelled = true;
       stopAudio();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -350,10 +354,20 @@ export default function AiSettingsPage() {
       {/* Load error */}
       {loadError && (
         <Card className="border-red-200 bg-red-50">
-          <CardContent className="pt-6">
-            <p className="text-red-700 text-sm">
+          <CardContent className="pt-6 flex items-start justify-between gap-3 flex-wrap">
+            <p className="text-red-700 text-sm flex-1 min-w-0">
               Couldn't load voice settings: {loadError}
             </p>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => void loadAll()}
+              disabled={loading}
+              className="shrink-0"
+            >
+              <RefreshCw className={`h-3.5 w-3.5 mr-1.5 ${loading ? "animate-spin" : ""}`} />
+              Try again
+            </Button>
           </CardContent>
         </Card>
       )}
@@ -461,6 +475,16 @@ export default function AiSettingsPage() {
               </Card>
             ))}
           </div>
+        ) : galleryVoices.length === 0 ? (
+          // Polish B: B1. Cheap fallback for the edge case where the curated
+          // catalog ships empty or is filtered down to zero — keeps the
+          // "Choose a Voice" heading from sitting over nothing.
+          <Card>
+            <CardContent className="pt-6 text-sm text-gray-500">
+              No alternate voices available. Your current voice is the only
+              one in the curated catalog.
+            </CardContent>
+          </Card>
         ) : (
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             {galleryVoices.map((voice) => {

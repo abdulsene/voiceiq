@@ -38,6 +38,7 @@ import {
   GitCommit,
   MessageCircle,
   Mic,
+  RefreshCw,
   ShieldAlert,
   ShieldCheck,
   Sparkles,
@@ -422,29 +423,29 @@ export default function HistoryViewer({
     };
   }, []);
 
-  // Page fetch — re-runs whenever offset changes.
-  useEffect(() => {
-    let cancelled = false;
+  // Extracted from the page-fetch effect so the "Try again" button in
+  // the error state can re-trigger the current page without a reload.
+  // Polish B: B6.
+  async function loadPage(targetOffset: number): Promise<void> {
     setLoading(true);
     setError(null);
-    (async () => {
-      try {
-        const res = (await fetchApi(
-          `/business/prompt/audit?limit=${PAGE_LIMIT}&offset=${offset}`,
-        )) as AuditResponse;
-        if (cancelled) return;
-        setRows(res.rows ?? []);
-        setTotal(res.total ?? 0);
-        setLoading(false);
-      } catch (e: any) {
-        if (cancelled) return;
-        setError(e?.message ?? "Failed to load history");
-        setLoading(false);
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
+    try {
+      const res = (await fetchApi(
+        `/business/prompt/audit?limit=${PAGE_LIMIT}&offset=${targetOffset}`,
+      )) as AuditResponse;
+      setRows(res.rows ?? []);
+      setTotal(res.total ?? 0);
+    } catch (e: any) {
+      setError(e?.message ?? "Failed to load history");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  // Page fetch — re-runs whenever offset changes.
+  useEffect(() => {
+    void loadPage(offset);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [offset]);
 
   const summaries = useMemo(
@@ -482,10 +483,20 @@ export default function HistoryViewer({
   if (error) {
     return (
       <Card className="border-red-200 bg-red-50">
-        <CardContent className="pt-6">
-          <p className="text-red-700 text-sm">
+        <CardContent className="pt-6 flex items-start justify-between gap-3 flex-wrap">
+          <p className="text-red-700 text-sm flex-1 min-w-0">
             Couldn't load change history: {error}
           </p>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => void loadPage(offset)}
+            disabled={loading}
+            className="shrink-0"
+          >
+            <RefreshCw className={`h-3.5 w-3.5 mr-1.5 ${loading ? "animate-spin" : ""}`} />
+            Try again
+          </Button>
         </CardContent>
       </Card>
     );
@@ -548,6 +559,10 @@ export default function HistoryViewer({
         </span>
       </div>
 
+      {/* Polish B: B5. Wrap the table + mobile card stack so we can dim
+          them during pagination fetches without losing the stale view —
+          gives a soft "loading" cue without flickering empty content. */}
+      <div className={loading ? "opacity-60 transition-opacity duration-150 pointer-events-none" : "transition-opacity duration-150"}>
       {/* Desktop table */}
       <Card className="hidden md:block">
         <Table>
@@ -650,6 +665,7 @@ export default function HistoryViewer({
             </CardContent>
           </Card>
         ))}
+      </div>
       </div>
 
       {/* Pagination */}

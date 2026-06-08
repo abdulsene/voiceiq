@@ -30,6 +30,7 @@ import {
   Code,
   Loader2,
   Plus,
+  RefreshCw,
   Trash2,
 } from "lucide-react";
 
@@ -200,37 +201,38 @@ export default function PromptEditor({
   const rawDirty = useMemo(() => rawPrompt !== rawSnapshot, [rawPrompt, rawSnapshot]);
   const dirty = mode === "structured" ? helpersDirty : rawDirty;
 
+  // Extracted from the mount effect so the "Try again" button in the
+  // error state can re-trigger without a page reload. Polish B: B4.
+  async function loadState(): Promise<void> {
+    setLoading(true);
+    setLoadError(null);
+    try {
+      // /auth/me runs in parallel just to identify the current user UUID
+      // so we can render "You saved X ago" vs anonymized "Saved X ago"
+      // when the last write came from a teammate.
+      const [promptRes, meRes] = await Promise.all([
+        fetchApi("/business/prompt") as Promise<PromptState>,
+        fetchApi("/auth/me").catch(() => null) as Promise<{ user?: { id?: string } } | null>,
+      ]);
+      setState(promptRes);
+      const h = helpersFromState(promptRes);
+      setHelpers(h);
+      setHelpersSnapshot(h);
+      const raw = promptRes.system_prompt ?? "";
+      setRawPrompt(raw);
+      setRawSnapshot(raw);
+      setCurrentUserId(meRes?.user?.id ?? null);
+    } catch (e: any) {
+      setLoadError(e?.message ?? "Failed to load prompt");
+    } finally {
+      setLoading(false);
+    }
+  }
+
   // ── Initial load ──────────────────────────────────────────────────────
   useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        // /auth/me runs in parallel just to identify the current user UUID
-        // so we can render "You saved X ago" vs anonymized "Saved X ago"
-        // when the last write came from a teammate.
-        const [promptRes, meRes] = await Promise.all([
-          fetchApi("/business/prompt") as Promise<PromptState>,
-          fetchApi("/auth/me").catch(() => null) as Promise<{ user?: { id?: string } } | null>,
-        ]);
-        if (cancelled) return;
-        setState(promptRes);
-        const h = helpersFromState(promptRes);
-        setHelpers(h);
-        setHelpersSnapshot(h);
-        const raw = promptRes.system_prompt ?? "";
-        setRawPrompt(raw);
-        setRawSnapshot(raw);
-        setCurrentUserId(meRes?.user?.id ?? null);
-        setLoading(false);
-      } catch (e: any) {
-        if (cancelled) return;
-        setLoadError(e?.message ?? "Failed to load prompt");
-        setLoading(false);
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
+    void loadState();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // beforeunload guard — browser confirms before closing tab when dirty.
@@ -390,29 +392,39 @@ export default function PromptEditor({
 
   // ── Render: loading / error gates ─────────────────────────────────────
   if (loading) {
+    // Polish B: B3. Render one skeleton card per real Section (5 total) so
+    // the page doesn't suddenly grow when content swaps in.
     return (
       <div className="space-y-4">
         <Skeleton className="h-6 w-64" />
-        <Card>
-          <CardContent className="pt-6 space-y-3">
-            <Skeleton className="h-5 w-40" />
-            <Skeleton className="h-20 w-full" />
-          </CardContent>
-        </Card>
-        <Card>
-          <CardContent className="pt-6 space-y-3">
-            <Skeleton className="h-5 w-40" />
-            <Skeleton className="h-16 w-full" />
-          </CardContent>
-        </Card>
+        {[0, 1, 2, 3, 4].map((i) => (
+          <Card key={i}>
+            <CardContent className="pt-6 space-y-3">
+              <Skeleton className="h-5 w-40" />
+              <Skeleton className="h-16 w-full" />
+            </CardContent>
+          </Card>
+        ))}
       </div>
     );
   }
   if (loadError) {
     return (
       <Card className="border-red-200 bg-red-50">
-        <CardContent className="pt-6">
-          <p className="text-red-700 text-sm">Couldn't load prompt: {loadError}</p>
+        <CardContent className="pt-6 flex items-start justify-between gap-3 flex-wrap">
+          <p className="text-red-700 text-sm flex-1 min-w-0">
+            Couldn't load prompt: {loadError}
+          </p>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => void loadState()}
+            disabled={loading}
+            className="shrink-0"
+          >
+            <RefreshCw className={`h-3.5 w-3.5 mr-1.5 ${loading ? "animate-spin" : ""}`} />
+            Try again
+          </Button>
         </CardContent>
       </Card>
     );
