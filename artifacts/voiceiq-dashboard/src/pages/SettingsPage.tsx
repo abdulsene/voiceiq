@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { Link } from "wouter";
 import {
   Bot, Building2, Bell, Phone, Shield, CreditCard, Save, CheckCircle,
   AlertTriangle, Globe, ShieldCheck, ShieldOff, Loader2, Lock, Eye,
@@ -1852,266 +1853,76 @@ function ObjectionHandlersTab({ industry }: { industry: string }) {
   );
 }
 
-type CustomizationState = {
-  custom_faqs: Array<{ question: string; answer: string }>;
-  objection_handling: Array<{ objection: string; response: string }>;
-  tone_preference: string;
-  never_say_list: string[];
-  updated_at: string | null;
-};
-
-function AiCustomizationTab({ businessId }: { businessId: string }) {
-  const [state, setState] = useState<CustomizationState>({
-    custom_faqs: [],
-    objection_handling: [],
-    tone_preference: "",
-    never_say_list: [],
-    updated_at: null,
-  });
-  const [originalState, setOriginalState] = useState<CustomizationState | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [saving, setSaving] = useState(false);
-  const [saveMsg, setSaveMsg] = useState<{ type: "ok" | "err"; text: string } | null>(null);
-
-  const token = localStorage.getItem("neverr_token");
-  const headers = { Authorization: `Bearer ${token}`, "Content-Type": "application/json" };
-
-  useEffect(() => {
-    async function load() {
-      try {
-        const r = await fetch(`${API}/business/${businessId}/customization`, { headers });
-        if (!r.ok) {
-          setSaveMsg({ type: "err", text: `Failed to load (HTTP ${r.status})` });
-          setLoading(false);
-          return;
-        }
-        const d = await r.json();
-        const c = d.customization || {};
-        const loaded: CustomizationState = {
-          custom_faqs: c.custom_faqs || [],
-          objection_handling: c.objection_handling || [],
-          tone_preference: c.tone_preference || "",
-          never_say_list: c.never_say_list || [],
-          updated_at: c.updated_at || null,
-        };
-        setState(loaded);
-        setOriginalState(loaded);
-      } catch (e: any) {
-        setSaveMsg({ type: "err", text: e.message || "Load failed" });
-      }
-      setLoading(false);
-    }
-    load();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [businessId]);
-
-  const isDirty = originalState !== null && JSON.stringify(state) !== JSON.stringify(originalState);
-
-  async function handleSave() {
-    setSaving(true);
-    setSaveMsg(null);
-    try {
-      const payload = {
-        custom_faqs: state.custom_faqs.filter(f => f.question.trim() && f.answer.trim()),
-        tone_preference: state.tone_preference.trim(),
-        never_say_list: state.never_say_list.filter(s => s.trim()),
-      };
-      const r = await fetch(`${API}/business/${businessId}/customization`, {
-        method: "PUT",
-        headers,
-        body: JSON.stringify(payload),
-      });
-      if (!r.ok) {
-        const err = await r.json().catch(() => ({}));
-        setSaveMsg({ type: "err", text: err.error || `Save failed (HTTP ${r.status})` });
-      } else {
-        const d = await r.json();
-        const newState = {
-          ...state,
-          custom_faqs: d.customization?.custom_faqs || state.custom_faqs,
-          tone_preference: d.customization?.tone_preference || state.tone_preference,
-          never_say_list: d.customization?.never_say_list || state.never_say_list,
-          updated_at: new Date().toISOString(),
-        };
-        setState(newState);
-        setOriginalState(newState);
-        setSaveMsg({
-          type: "ok",
-          text: d.agent_updated
-            ? "Saved and pushed to your AI receptionist."
-            : "Saved (agent will update on next sync).",
-        });
-      }
-    } catch (e: any) {
-      setSaveMsg({ type: "err", text: e.message || "Save failed" });
-    }
-    setSaving(false);
-  }
-
-  function addFaq() {
-    setState(s => ({ ...s, custom_faqs: [...s.custom_faqs, { question: "", answer: "" }] }));
-  }
-  function removeFaq(i: number) {
-    setState(s => ({ ...s, custom_faqs: s.custom_faqs.filter((_, idx) => idx !== i) }));
-  }
-  function updateFaq(i: number, field: "question" | "answer", val: string) {
-    setState(s => ({
-      ...s,
-      custom_faqs: s.custom_faqs.map((f, idx) => idx === i ? { ...f, [field]: val } : f),
-    }));
-  }
-  function addNeverSay() {
-    setState(s => ({ ...s, never_say_list: [...s.never_say_list, ""] }));
-  }
-  function removeNeverSay(i: number) {
-    setState(s => ({ ...s, never_say_list: s.never_say_list.filter((_, idx) => idx !== i) }));
-  }
-  function updateNeverSay(i: number, val: string) {
-    setState(s => ({
-      ...s,
-      never_say_list: s.never_say_list.map((x, idx) => idx === i ? val : x),
-    }));
-  }
-
-  if (loading) {
-    return <div className="flex items-center justify-center py-12"><div className="animate-spin w-8 h-8 border-3 border-[#2E75B6] border-t-transparent rounded-full" /></div>;
-  }
-
+/**
+ * Legacy stub: this used to be a self-contained editor for the same
+ * helper fields (tone_preference, custom_faqs, never_say_list) writing
+ * to PUT /api/business/:id/customization. As of Sprint 3 Stage 5, AI
+ * customization lives on /settings/ai with stricter validation, an
+ * after-hours field, raw-prompt mode, and an audit history. The
+ * legacy backend endpoint stays in place for rollback safety; this
+ * UI is now a redirect-only CTA pointing to the new workspace.
+ *
+ * Tab strip continues to render this component (line ~3129) so
+ * bookmarked /settings#customization URLs still resolve — we just
+ * swap the body for a "feature moved" card.
+ *
+ * businessId prop is intentionally unused now but kept to preserve the
+ * call site at line ~3129 without a separate JSX edit.
+ */
+function AiCustomizationTab(_props: { businessId: string }) {
   return (
-    <div className="space-y-8">
-      <div>
-        <h2 className="text-lg font-semibold text-gray-900 mb-1">AI Customization</h2>
-        <p className="text-sm text-gray-500">
-          Teach your AI receptionist about your business. These settings are woven into every call your agent handles.
-        </p>
-        {state.updated_at && (
-          <p className="text-xs text-gray-400 mt-2">
-            Last updated: {new Date(state.updated_at).toLocaleString()}
+    <div className="space-y-6">
+      <div className="bg-blue-50/50 border border-blue-200 rounded-xl p-6 md:p-8">
+        <div className="flex items-start gap-3 mb-4">
+          <div className="p-2 bg-white rounded-lg border border-blue-200 shrink-0">
+            <Sparkles className="w-5 h-5 text-[#2E75B6]" />
+          </div>
+          <div>
+            <h2 className="text-lg font-semibold text-gray-900">
+              AI Customization moved
+            </h2>
+            <p className="text-sm text-gray-600 mt-1">
+              Your AI receptionist's voice, prompt, and change history now
+              live in a dedicated workspace with more controls and better
+              feedback.
+            </p>
+          </div>
+        </div>
+
+        <div className="mt-5">
+          <Link href="/settings/ai?tab=prompt">
+            <a className="inline-flex items-center gap-1.5 px-5 py-2.5 bg-[#2E75B6] text-white rounded-lg text-sm font-semibold hover:bg-[#1e5a8f] shadow-md transition-colors">
+              Go to AI Receptionist Settings
+              <ChevronRight className="w-4 h-4" />
+            </a>
+          </Link>
+        </div>
+
+        <div className="mt-6 pt-5 border-t border-blue-200">
+          <p className="text-xs font-semibold text-gray-700 uppercase tracking-wide mb-3">
+            What moved
           </p>
-        )}
-      </div>
-
-      <div className="bg-gray-50 rounded-xl p-5 border border-gray-200">
-        <label className="block text-sm font-semibold text-gray-900 mb-1">Tone & Voice Preference</label>
-        <p className="text-xs text-gray-500 mb-3">
-          Describe how your AI should sound. Example: "Warm and professional, use humor occasionally. Never stuffy."
-        </p>
-        <textarea
-          className="w-full p-3 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-[#2E75B6] focus:border-transparent"
-          rows={4}
-          maxLength={2000}
-          placeholder="Warm, professional, slightly casual..."
-          value={state.tone_preference}
-          onChange={e => setState(s => ({ ...s, tone_preference: e.target.value }))}
-        />
-        <p className="text-xs text-gray-400 mt-1">{state.tone_preference.length} / 2000</p>
-      </div>
-
-      <div className="bg-gray-50 rounded-xl p-5 border border-gray-200">
-        <div className="flex items-center justify-between mb-1">
-          <label className="block text-sm font-semibold text-gray-900">Business-Specific FAQs</label>
-          <span className="text-xs text-gray-400">{state.custom_faqs.length} / 50</span>
+          <ul className="space-y-2 text-sm text-gray-700">
+            <li className="flex items-start gap-2">
+              <CheckCircle className="w-4 h-4 text-[#2E75B6] mt-0.5 shrink-0" />
+              <span>Voice selection — preview before switching</span>
+            </li>
+            <li className="flex items-start gap-2">
+              <CheckCircle className="w-4 h-4 text-[#2E75B6] mt-0.5 shrink-0" />
+              <span>Tone &amp; FAQs editor — structured + raw views</span>
+            </li>
+            <li className="flex items-start gap-2">
+              <CheckCircle className="w-4 h-4 text-[#2E75B6] mt-0.5 shrink-0" />
+              <span>Custom instructions &amp; restrictions</span>
+            </li>
+            <li className="flex items-start gap-2">
+              <CheckCircle className="w-4 h-4 text-[#2E75B6] mt-0.5 shrink-0" />
+              <span>
+                <strong>New:</strong> change history with side-by-side diff
+              </span>
+            </li>
+          </ul>
         </div>
-        <p className="text-xs text-gray-500 mb-3">
-          When a caller asks one of these, your AI uses your answer as its foundation.
-        </p>
-        <div className="space-y-3">
-          {state.custom_faqs.map((faq, i) => (
-            <div key={i} className="bg-white border border-gray-200 rounded-lg p-3 space-y-2">
-              <div className="flex items-start gap-2">
-                <input
-                  type="text"
-                  placeholder="Question (e.g., What are your pricing tiers?)"
-                  className="flex-1 p-2 border border-gray-300 rounded text-sm"
-                  value={faq.question}
-                  onChange={e => updateFaq(i, "question", e.target.value)}
-                />
-                <button
-                  onClick={() => removeFaq(i)}
-                  className="p-2 text-gray-400 hover:text-red-500 transition-colors"
-                  title="Remove"
-                >
-                  ×
-                </button>
-              </div>
-              <textarea
-                placeholder="Answer (the AI will adapt phrasing but won't contradict the facts)"
-                className="w-full p-2 border border-gray-300 rounded text-sm"
-                rows={3}
-                value={faq.answer}
-                onChange={e => updateFaq(i, "answer", e.target.value)}
-              />
-            </div>
-          ))}
-        </div>
-        {state.custom_faqs.length < 50 && (
-          <button
-            onClick={addFaq}
-            className="mt-3 px-4 py-2 text-sm font-medium text-[#2E75B6] border border-[#2E75B6] rounded-lg hover:bg-[#2E75B6] hover:text-white transition-colors"
-          >
-            + Add FAQ
-          </button>
-        )}
-      </div>
-
-      <div className="bg-gray-50 rounded-xl p-5 border border-gray-200">
-        <div className="flex items-center justify-between mb-1">
-          <label className="block text-sm font-semibold text-gray-900">Strict Prohibitions (Never Say / Do)</label>
-          <span className="text-xs text-gray-400">{state.never_say_list.length} / 30</span>
-        </div>
-        <p className="text-xs text-gray-500 mb-3">
-          Hard rules your AI must never break, regardless of what callers ask.
-        </p>
-        <div className="space-y-2">
-          {state.never_say_list.map((item, i) => (
-            <div key={i} className="flex items-start gap-2">
-              <input
-                type="text"
-                placeholder="e.g., Never discuss competitor pricing"
-                className="flex-1 p-2 border border-gray-300 rounded text-sm"
-                maxLength={500}
-                value={item}
-                onChange={e => updateNeverSay(i, e.target.value)}
-              />
-              <button
-                onClick={() => removeNeverSay(i)}
-                className="p-2 text-gray-400 hover:text-red-500 transition-colors"
-                title="Remove"
-              >
-                ×
-              </button>
-            </div>
-          ))}
-        </div>
-        {state.never_say_list.length < 30 && (
-          <button
-            onClick={addNeverSay}
-            className="mt-3 px-4 py-2 text-sm font-medium text-[#2E75B6] border border-[#2E75B6] rounded-lg hover:bg-[#2E75B6] hover:text-white transition-colors"
-          >
-            + Add Rule
-          </button>
-        )}
-      </div>
-
-      <div className="flex items-center justify-between pt-4 border-t border-gray-200">
-        <div>
-          {saveMsg && (
-            <span className={`text-sm font-medium ${saveMsg.type === "ok" ? "text-green-600" : "text-red-600"}`}>
-              {saveMsg.text}
-            </span>
-          )}
-        </div>
-        <button
-          onClick={handleSave}
-          disabled={!isDirty || saving}
-          className={`px-6 py-2.5 rounded-lg text-sm font-medium transition-all ${
-            !isDirty || saving
-              ? "bg-gray-200 text-gray-400 cursor-not-allowed"
-              : "bg-[#2E75B6] text-white hover:bg-[#1e5a8f] shadow-md"
-          }`}
-        >
-          {saving ? "Saving..." : "Save Customization"}
-        </button>
       </div>
     </div>
   );

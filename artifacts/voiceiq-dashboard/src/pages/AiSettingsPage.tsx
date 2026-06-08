@@ -120,7 +120,17 @@ export default function AiSettingsPage() {
   // Controlled Tabs so we can hoist the active tab if we ever need to
   // intercept switches. Tab-switch confirmation was cut from scope for
   // this session — beforeunload is the only guard for dirty prompt edits.
-  const [tab, setTab] = useState<"voice" | "prompt" | "history">("voice");
+  // Initial tab honors a ?tab= query param so deep links from elsewhere
+  // (e.g. the legacy /settings → AI Customization redirect card) can
+  // land the customer directly on the relevant tab. Lazy initializer
+  // so window.location is only read once on mount, not every render.
+  // We don't sync setTab back to the URL — keeping the URL static
+  // avoids router-history churn for what's just a UI hint.
+  const [tab, setTab] = useState<"voice" | "prompt" | "history">(() => {
+    const params = new URLSearchParams(window.location.search);
+    const t = params.get("tab");
+    return t === "voice" || t === "prompt" || t === "history" ? t : "voice";
+  });
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const blobUrlRef = useRef<string | null>(null);
   // Holds the voice the user is confirming, independent of React state, so
