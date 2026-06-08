@@ -350,7 +350,7 @@ export default function AiSettingsPage() {
           <TabsTrigger value="history">History</TabsTrigger>
         </TabsList>
 
-        <TabsContent value="voice" className="space-y-6 mt-6">
+        <TabsContent value="voice" className="space-y-6 mt-6 data-[state=active]:animate-in data-[state=active]:fade-in-0 data-[state=active]:duration-150 data-[state=active]:ease-out">
       {/* Load error */}
       {loadError && (
         <Card className="border-red-200 bg-red-50">
@@ -566,11 +566,11 @@ export default function AiSettingsPage() {
       </div>
         </TabsContent>
 
-        <TabsContent value="prompt" className="mt-6">
+        <TabsContent value="prompt" className="mt-6 data-[state=active]:animate-in data-[state=active]:fade-in-0 data-[state=active]:duration-150 data-[state=active]:ease-out">
           <PromptEditor onToast={showToast} />
         </TabsContent>
 
-        <TabsContent value="history" className="mt-6">
+        <TabsContent value="history" className="mt-6 data-[state=active]:animate-in data-[state=active]:fade-in-0 data-[state=active]:duration-150 data-[state=active]:ease-out">
           <HistoryViewer onSwitchTab={(t) => setTab(t)} />
         </TabsContent>
       </Tabs>
@@ -615,7 +615,7 @@ export default function AiSettingsPage() {
       {/* Toast */}
       {toast && (
         <div
-          className={`fixed bottom-6 left-1/2 -translate-x-1/2 z-50 px-4 py-2.5 text-sm rounded-lg shadow-lg max-w-[calc(100vw-2rem)] sm:max-w-md ${
+          className={`fixed bottom-6 left-1/2 -translate-x-1/2 z-50 px-4 py-2.5 text-sm rounded-lg shadow-lg max-w-[calc(100vw-2rem)] sm:max-w-md animate-in slide-in-from-bottom-4 fade-in-0 duration-200 ease-out ${
             toast.kind === "ok"
               ? "bg-gray-900 text-white"
               : "bg-red-600 text-white"
