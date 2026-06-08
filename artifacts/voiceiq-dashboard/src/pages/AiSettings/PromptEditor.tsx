@@ -288,7 +288,10 @@ export default function PromptEditor({
       // any blank rows the user added vanish from "dirty" comparisons.
       setHelpers(payload);
       setHelpersSnapshot(payload);
-      onToast("Saved", "ok");
+      // "Edits saved" (vs the final "Saved and applied to your AI" in
+      // Phase 2) makes the two-step nature visible — the brief flash
+      // between toasts reads as progress, not a swallowed message.
+      onToast("Edits saved", "ok");
 
       // Phase 2 — regenerate.
       setSavePhase("regen");
@@ -310,7 +313,7 @@ export default function PromptEditor({
           onToast("Saved and applied to your AI", "ok");
         } else if (result.savedToDb) {
           onToast(
-            `Saved but couldn't update your AI yet: ${result.syncError}. We'll retry.`,
+            `Saved but couldn't update your AI yet: ${result.syncError}. Save again to retry.`,
             "err",
           );
         }
@@ -355,7 +358,7 @@ export default function PromptEditor({
           onToast("Saved and applied to your AI", "ok");
         } else if (result.savedToDb) {
           onToast(
-            `Saved but couldn't update your AI yet: ${result.syncError}. We'll retry.`,
+            `Saved but couldn't update your AI yet: ${result.syncError}. Save again to retry.`,
             "err",
           );
         }
@@ -452,11 +455,12 @@ export default function PromptEditor({
           <h2 className="text-xl font-semibold">
             {mode === "raw" ? "Raw Prompt" : "Editing your AI's behavior"}
           </h2>
-          <p className="text-sm text-gray-500 mt-0.5">
-            {mode === "raw"
-              ? "Direct prompt override. The structured settings still exist underneath but won't update your AI until you save them again."
-              : "(Also available in classic Settings → AI Customization — same data, this is the updated experience.)"}
-          </p>
+          {mode === "raw" && (
+            <p className="text-sm text-gray-500 mt-0.5">
+              Direct prompt override. The structured settings still exist
+              underneath but won't update your AI until you save them again.
+            </p>
+          )}
         </div>
         {mode === "structured" ? (
           <Button
@@ -798,7 +802,7 @@ export default function PromptEditor({
               )}
             </>
           ) : (
-            <span className="text-gray-400">No prompt saved yet</span>
+            <span className="text-gray-400">Not saved yet</span>
           )}
         </div>
         <div className="flex gap-2 shrink-0">
@@ -817,7 +821,8 @@ export default function PromptEditor({
           >
             {saving ? (
               <>
-                <Loader2 className="h-3 w-3 mr-1.5 animate-spin" /> Saving…
+                <Loader2 className="h-3 w-3 mr-1.5 animate-spin" />
+                {savePhase === "regen" ? "Updating…" : "Saving…"}
               </>
             ) : (
               "Save"

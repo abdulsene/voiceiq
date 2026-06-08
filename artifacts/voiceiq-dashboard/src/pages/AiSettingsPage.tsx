@@ -443,7 +443,7 @@ export default function AiSettingsPage() {
               <Volume2 className="h-5 w-5 mt-0.5 shrink-0" />
               <span className="text-sm">
                 {currentState?.voice_id
-                  ? `Your AI is using voice "${currentState.voice_id}", which isn't in the curated catalog. Pick one below to switch.`
+                  ? "Your AI is using a custom voice not in this catalog. Pick one below to switch."
                   : "Your AI has no voice configured yet. Pick one below."}
               </span>
             </div>
@@ -456,7 +456,7 @@ export default function AiSettingsPage() {
         <div>
           <h2 className="text-xl font-semibold">Choose a Voice</h2>
           <p className="text-sm text-gray-500">
-            Click preview to hear how each voice sounds when calling your business.
+            Preview how each voice sounds on calls to your business.
           </p>
         </div>
 
