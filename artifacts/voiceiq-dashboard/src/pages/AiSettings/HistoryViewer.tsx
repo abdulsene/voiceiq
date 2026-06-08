@@ -36,8 +36,10 @@ import {
   Copy,
   Eye,
   GitCommit,
+  MessageCircle,
   Mic,
   ShieldAlert,
+  ShieldCheck,
   Sparkles,
   Wrench,
   X,
@@ -102,7 +104,7 @@ const PAGE_LIMIT = 20;
 // ───────────────────────────────────────────────────────────────────────
 // Source → presentation mapping
 
-type SourceColor = "blue" | "purple" | "amber" | "gray";
+type SourceColor = "blue" | "purple" | "amber" | "gray" | "teal";
 
 interface SourceMeta {
   label: string;
@@ -122,6 +124,10 @@ function sourceToMeta(source: string): SourceMeta {
       return { label: "Migration", color: "gray", icon: Wrench };
     case "voice_change":
       return { label: "Voice changed", color: "purple", icon: Mic };
+    case "first_message_change":
+      return { label: "Greeting edited", color: "teal", icon: MessageCircle };
+    case "first_message_backfill":
+      return { label: "Compliance update", color: "amber", icon: ShieldCheck };
     case "system":
       return { label: "System", color: "gray", icon: Bot };
     default:
@@ -134,6 +140,7 @@ const COLOR_CLASSES: Record<SourceColor, string> = {
   purple: "bg-purple-50 text-purple-700 border-purple-200",
   amber: "bg-amber-50 text-amber-700 border-amber-200",
   gray: "bg-gray-100 text-gray-700 border-gray-200",
+  teal: "bg-teal-50 text-teal-700 border-teal-200",
 };
 
 // ───────────────────────────────────────────────────────────────────────
@@ -306,6 +313,34 @@ function summarizeRow(
         detailsForDialog: null,
         isVoiceChange: false,
         isBackfill: true,
+      };
+    case "first_message_change": {
+      // Show the new greeting inline (truncated). The diff dialog
+      // falls through to PromptDiffBody — first_message strings live
+      // in old_prompt/new_prompt so the generic side-by-side panels
+      // render correctly without a new component.
+      const formatted = `Greeting: "${row.new_prompt ?? ""}"`;
+      const details =
+        formatted.length > 80 ? `${formatted.slice(0, 79)}…` : formatted;
+      return {
+        meta,
+        details,
+        detailsForDialog: null,
+        isVoiceChange: false,
+        isBackfill: false,
+      };
+    }
+    case "first_message_backfill":
+      // Sprint 4 disclosure backfill rows. isBackfill stays false so
+      // the diff dialog uses PromptDiffBody (before/after panels with
+      // copy buttons), not the generic BackfillBody — customers want
+      // to see exactly what their greeting changed to.
+      return {
+        meta,
+        details: "Recording disclosure added to greeting",
+        detailsForDialog: null,
+        isVoiceChange: false,
+        isBackfill: false,
       };
     case "system":
       return {
