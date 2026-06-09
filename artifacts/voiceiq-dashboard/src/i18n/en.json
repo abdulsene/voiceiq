@@ -567,7 +567,7 @@
           "name": "Professional",
           "features": [
             "Everything in Starter",
-            "CRM sync (HubSpot, Salesforce, Clio, Dentrix...)",
+            "CRM sync via Zapier (HubSpot, Salesforce, Clio, Dentrix, 5,000+ apps) or custom webhook",
             "Custom voice + persona",
             "Automated follow-up sequences",
             "Webhook + Zapier",
@@ -780,7 +780,7 @@
       "integrationsHeadings": {
         "identity": "Identity",
         "telephony": "Telephony",
-        "crm": "CRM & calendar"
+        "integrations": "Calendar & apps"
       },
       "integrationsFooter": "Custom integrations on the enterprise tier. If your stack isn't on this list, we'll scope it.",
       "faqHeading": "Procurement questions, answered",
@@ -795,7 +795,7 @@
         },
         {
           "q": "What's your data residency?",
-          "a": "Primary data lives in Supabase (US-East). Voice calls route through Twilio US data centers. Voice synthesis through ElevenLabs (US). For EU residency requirements, talk to us — we can scope EU data placement on the enterprise tier."
+          "a": "Primary data lives in Supabase (US-East). Voice calls route through Twilio US data centers. Voice synthesis through ElevenLabs (US). All Neverr infrastructure is US-only at this time — if EU residency is a hard requirement, we may not be the right fit yet."
         },
         {
           "q": "Can you sign a BAA for healthcare?",

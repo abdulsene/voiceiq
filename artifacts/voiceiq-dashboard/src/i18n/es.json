@@ -567,7 +567,7 @@
           "name": "Profesional",
           "features": [
             "Todo en Inicial",
-            "Sincronización CRM (HubSpot, Salesforce, Clio, Dentrix…)",
+            "Sincronización CRM vía Zapier (HubSpot, Salesforce, Clio, Dentrix, 5.000+ apps) o webhook personalizado",
             "Voz y personalidad personalizadas",
             "Secuencias de seguimiento automatizadas",
             "Webhook + Zapier",
@@ -780,7 +780,7 @@
       "integrationsHeadings": {
         "identity": "Identidad",
         "telephony": "Telefonía",
-        "crm": "CRM y calendario"
+        "integrations": "Calendario y apps"
       },
       "integrationsFooter": "Integraciones a medida en el nivel enterprise. Si tu stack no está en esta lista, lo dimensionamos.",
       "faqHeading": "Preguntas de compras, respondidas",
@@ -795,7 +795,7 @@
         },
         {
           "q": "¿Cuál es vuestra residencia de datos?",
-          "a": "Los datos primarios viven en Supabase (US-East). Las llamadas de voz se enrutan por centros de datos de Twilio en EE. UU. La síntesis de voz por ElevenLabs (EE. UU.). Para requisitos de residencia en la UE, hablémoslo — podemos dimensionar el emplazamiento de datos en la UE en el nivel enterprise."
+          "a": "Los datos primarios viven en Supabase (US-East). Las llamadas de voz se enrutan por centros de datos de Twilio en EE. UU. La síntesis de voz por ElevenLabs (EE. UU.). Toda la infraestructura de Neverr está en EE. UU. en este momento — si la residencia de datos en la UE es un requisito estricto, es posible que aún no seamos la solución adecuada para ti."
         },
         {
           "q": "¿Pueden firmar un BAA para salud?",

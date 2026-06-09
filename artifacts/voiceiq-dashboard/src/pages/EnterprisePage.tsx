@@ -10,11 +10,22 @@ const CONTACT_HREF = getDiscoveryCallUrl();
 
 const FEATURE_EMOJIS = ["🏢", "🔐", "🌐", "📋", "⏰", "📜"];
 const INDUSTRY_EMOJIS = ["🏥", "🏛️", "🍕", "⚖️", "🔧", "🏢"];
-const INTEGRATION_KEYS = ["identity", "telephony", "crm"] as const;
+const INTEGRATION_KEYS = ["identity", "telephony", "integrations"] as const;
 const INTEGRATION_ITEMS: Record<(typeof INTEGRATION_KEYS)[number], string[]> = {
   identity: ["SAML 2.0 SSO", "Okta", "Azure AD", "Auth0", "Google Workspace", "OneLogin"],
   telephony: ["Twilio (SOC 2, HITRUST)", "Number porting available", "Multi-line per location"],
-  crm: ["HubSpot", "Salesforce (via webhook)", "Google Calendar", "Microsoft 365", "Calendly"],
+  // QA accuracy fix (commit message details): HubSpot + Salesforce are
+  // "Coming soon" in the product, so we no longer claim them as live
+  // integrations. Microsoft 365 / Google Calendar are real (outlook.ts
+  // + googleapis OAuth flows used by Appointments). Zapier covers the
+  // long-tail CRMs that customers actually need to wire up. HMAC-signed
+  // webhook claim verified against webhook-service.ts signPayload().
+  integrations: [
+    "Google Calendar & Microsoft 365 (native two-way sync)",
+    "Calendly",
+    "Zapier (5,000+ apps including HubSpot, Salesforce, Clio, Dentrix)",
+    "Custom webhook (HMAC-signed)",
+  ],
 };
 
 function FaqItem({ q, a, defaultOpen }: { q: string; a: string; defaultOpen?: boolean }) {
