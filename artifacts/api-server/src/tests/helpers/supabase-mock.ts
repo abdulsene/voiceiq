@@ -132,6 +132,22 @@ export function createSupabaseMock(): SupabaseMockHandle {
       return this;
     }
 
+    neq(col: string, val: unknown): this {
+      this.filters.push({ kind: 'neq', args: [col, val] });
+      return this;
+    }
+
+    /** Multi-column OR — Supabase's free-form filter string syntax. */
+    or(filter: string): this {
+      this.filters.push({ kind: 'or', args: [filter] });
+      return this;
+    }
+
+    ilike(col: string, pattern: string): this {
+      this.filters.push({ kind: 'ilike', args: [col, pattern] });
+      return this;
+    }
+
     /** SELECT modifier — recorded for diagnostics, doesn't affect execution. */
     order(col: string, opts?: unknown): this {
       this.filters.push({ kind: 'order', args: [col, opts] });

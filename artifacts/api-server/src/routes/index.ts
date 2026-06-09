@@ -17,6 +17,7 @@ import chatTtsRouter from "./chat-tts";
 import configRouter from "./config";
 import promptRouter from "./prompt";
 import voicesRouter from "./voices";
+import adminBusinessesRouter from "./admin-businesses";
 
 const router: IRouter = Router();
 
@@ -72,6 +73,12 @@ router.use(promptRouter);
 // Mounted BEFORE the catch-all apiRouter so /api/voices/* and the
 // /api/business/voice path are claimed here.
 router.use(voicesRouter);
+// Stage 6 Phase 1: admin override surface — list + drill-in + admin
+// voice switch. Declares paths starting with /admin/business(es) at
+// root so it doesn't collide with the catch-all adminRouter mounted
+// at /admin above. Auth gated via requireStaffPermission("customers",
+// ...) per the post-hotfix RBAC pattern (commit aaf14de).
+router.use(adminBusinessesRouter);
 router.use(apiRouter);
 
 export default router;
