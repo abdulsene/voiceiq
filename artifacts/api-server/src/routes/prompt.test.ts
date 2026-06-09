@@ -768,3 +768,273 @@ describe("GET /api/business/prompt/audit (customer)", () => {
     });
   });
 });
+
+// ───────────────────────────────────────────────────────────────────────
+// Stage 6 Phase 3A — admin prompt endpoint parity
+//
+// Three new admin endpoints mirror the customer GET/PATCH-helpers/POST-
+// regenerate trio but key off the URL path param instead of
+// req.businessId, and (for helpers PATCH) write a forensic audit row
+// attributing the staff caller. These tests cover the auth ladder, the
+// audit attribution, the perm-strictness guard, and the cross-tenant
+// defense (target = path param, not req.businessId).
+
+const TARGET_BIZ = "biz_target_phase3a";
+
+describe("GET /api/admin/business/:businessId/prompt", () => {
+  test("401 without auth", async () => {
+    const res = await callJson(
+      server.baseUrl,
+      "GET",
+      `/api/admin/business/${TARGET_BIZ}/prompt`,
+    );
+    expect(res.status).toBe(401);
+  });
+
+  test("403 with customers:write but NOT customers:read (strict match)", async () => {
+    const res = await callJson(
+      server.baseUrl,
+      "GET",
+      `/api/admin/business/${TARGET_BIZ}/prompt`,
+      {
+        headers: {
+          "x-test-user-id": USER,
+          "x-test-staff-perms": "customers:write",
+        },
+      },
+    );
+    expect(res.status).toBe(403);
+  });
+
+  test("returns flat row keyed by path param (not req.businessId)", async () => {
+    sbMock.setResponses("business_configs", "select", {
+      data: {
+        business_id: TARGET_BIZ,
+        business_name: "Target Co",
+        system_prompt: "you are Alex…",
+        prompt_updated_at: "2026-06-09T10:00:00Z",
+      },
+      error: null,
+    });
+
+    const res = await callJson(
+      server.baseUrl,
+      "GET",
+      `/api/admin/business/${TARGET_BIZ}/prompt`,
+      { headers: ADMIN_AUTH_HEADERS },
+    );
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({
+      business_id: TARGET_BIZ,
+      business_name: "Target Co",
+    });
+
+    // Cross-tenant defense: the SELECT must filter by the path-param
+    // business_id, not the staff caller's req.businessId (BIZ).
+    const selectCall = sbMock.calls.find(
+      (c) => c.table === "business_configs" && c.op === "select",
+    );
+    expect(
+      selectCall!.filters.some(
+        (f) =>
+          f.kind === "eq" &&
+          f.args[0] === "business_id" &&
+          f.args[1] === TARGET_BIZ,
+      ),
+    ).toBe(true);
+  });
+
+  test("404 when business not found", async () => {
+    sbMock.setResponses("business_configs", "select", {
+      data: null,
+      error: null,
+    });
+    const res = await callJson(
+      server.baseUrl,
+      "GET",
+      "/api/admin/business/biz_does_not_exist/prompt",
+      { headers: ADMIN_AUTH_HEADERS },
+    );
+    expect(res.status).toBe(404);
+    expect(res.body.error).toMatch(/not found/i);
+  });
+});
+
+describe("PATCH /api/admin/business/:businessId/prompt/helpers", () => {
+  test("401 without auth", async () => {
+    const res = await callJson(
+      server.baseUrl,
+      "PATCH",
+      `/api/admin/business/${TARGET_BIZ}/prompt/helpers`,
+      { body: { tone_preference: "warm" } },
+    );
+    expect(res.status).toBe(401);
+  });
+
+  test("happy path writes audit row attributing the STAFF caller (not the business owner) with source='admin_raw' and JSON-serialized payload in new_prompt", async () => {
+    const res = await callJson(
+      server.baseUrl,
+      "PATCH",
+      `/api/admin/business/${TARGET_BIZ}/prompt/helpers`,
+      {
+        headers: ADMIN_AUTH_HEADERS,
+        body: {
+          tone_preference: "Warm and direct",
+          custom_faqs: [{ question: "Hours?", answer: "9–5" }],
+        },
+      },
+    );
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ ok: true });
+    expect(res.body.updated).toEqual(
+      expect.arrayContaining(["tone_preference", "custom_faqs"]),
+    );
+
+    // UPDATE to business_configs must target the path-param business_id.
+    const updCall = sbMock.calls.find(
+      (c) => c.table === "business_configs" && c.op === "update",
+    );
+    expect(updCall).toBeDefined();
+    expect(
+      updCall!.filters.some(
+        (f) =>
+          f.kind === "eq" &&
+          f.args[0] === "business_id" &&
+          f.args[1] === TARGET_BIZ,
+      ),
+    ).toBe(true);
+
+    // Audit row attribution: staff caller as changed_by_user_id, NOT
+    // the business owner; source=admin_raw; payload JSON in new_prompt.
+    const auditCall = sbMock.calls.find(
+      (c) => c.table === "prompt_audit_log" && c.op === "insert",
+    );
+    expect(auditCall).toBeDefined();
+    const auditVals = auditCall!.values as Record<string, unknown>;
+    expect(auditVals).toMatchObject({
+      business_id: TARGET_BIZ,
+      changed_by_user_id: USER,
+      source: "admin_raw",
+      sync_to_elevenlabs_ok: true,
+      elevenlabs_error: null,
+    });
+    expect(String(auditVals.old_prompt)).toBe("(helpers state pre-edit)");
+    expect(String(auditVals.new_prompt)).toContain("tone_preference");
+    expect(String(auditVals.new_prompt)).toContain("Warm and direct");
+  });
+
+  test("400 on validation failure (malformed custom_faqs)", async () => {
+    const res = await callJson(
+      server.baseUrl,
+      "PATCH",
+      `/api/admin/business/${TARGET_BIZ}/prompt/helpers`,
+      {
+        headers: ADMIN_AUTH_HEADERS,
+        body: { custom_faqs: [{ question: "" }] }, // missing answer + empty question
+      },
+    );
+    expect(res.status).toBe(400);
+    expect(res.body.error).toMatch(/custom_faqs/);
+    // No DB write should have happened.
+    expect(
+      sbMock.calls.some(
+        (c) => c.op === "insert" || c.op === "update",
+      ),
+    ).toBe(false);
+  });
+});
+
+describe("POST /api/admin/business/:businessId/prompt/regenerate", () => {
+  test("403 with customers:read but NOT customers:write (strict match — read does not grant write)", async () => {
+    const res = await callJson(
+      server.baseUrl,
+      "POST",
+      `/api/admin/business/${TARGET_BIZ}/prompt/regenerate`,
+      {
+        headers: {
+          "x-test-user-id": USER,
+          "x-test-staff-perms": "customers:read",
+        },
+      },
+    );
+    expect(res.status).toBe(403);
+  });
+
+  test("happy path writes audit row source='admin_raw' attributing the staff caller; cfg read scoped to path-param business_id", async () => {
+    sbMock.setResponses("business_configs", "select", {
+      data: {
+        business_id: TARGET_BIZ,
+        business_name: "Target Co",
+        industry: "general",
+        business_hours: "9-5",
+        agent_id: AGENT,
+        system_prompt: "old prompt",
+      },
+      error: null,
+    });
+    sbMock.setResponses("prompt_audit_log", "insert", {
+      data: { id: "audit_regen_admin" },
+      error: null,
+    });
+
+    const res = await callJson(
+      server.baseUrl,
+      "POST",
+      `/api/admin/business/${TARGET_BIZ}/prompt/regenerate`,
+      { headers: ADMIN_AUTH_HEADERS },
+    );
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({
+      ok: true,
+      auditLogId: "audit_regen_admin",
+    });
+
+    // cfg read must be scoped to the path-param business.
+    const selectCall = sbMock.calls.find(
+      (c) => c.table === "business_configs" && c.op === "select",
+    );
+    expect(
+      selectCall!.filters.some(
+        (f) =>
+          f.kind === "eq" &&
+          f.args[0] === "business_id" &&
+          f.args[1] === TARGET_BIZ,
+      ),
+    ).toBe(true);
+
+    // Audit attribution: source=admin_raw + staff caller as
+    // changed_by_user_id. This is the staff override fingerprint
+    // that lets HistoryViewer distinguish admin edits.
+    const auditCall = sbMock.calls.find(
+      (c) => c.table === "prompt_audit_log" && c.op === "insert",
+    );
+    expect(auditCall!.values).toMatchObject({
+      business_id: TARGET_BIZ,
+      changed_by_user_id: USER,
+      source: "admin_raw",
+    });
+  });
+
+  test("409 when target business has no agent_id", async () => {
+    sbMock.setResponses("business_configs", "select", {
+      data: {
+        business_id: TARGET_BIZ,
+        business_name: "Target Co",
+        industry: "general",
+        business_hours: "9-5",
+        agent_id: null, // ← the trigger
+        system_prompt: "old",
+      },
+      error: null,
+    });
+
+    const res = await callJson(
+      server.baseUrl,
+      "POST",
+      `/api/admin/business/${TARGET_BIZ}/prompt/regenerate`,
+      { headers: ADMIN_AUTH_HEADERS },
+    );
+    expect(res.status).toBe(409);
+    expect(res.body.error).toMatch(/no ElevenLabs agent/);
+  });
+});
