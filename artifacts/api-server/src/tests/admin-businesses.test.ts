@@ -464,6 +464,83 @@ describe("GET /api/admin/business/:businessId", () => {
 // ───────────────────────────────────────────────────────────────────────
 // 3 tests — PATCH /api/admin/business/:businessId/voice
 
+// ───────────────────────────────────────────────────────────────────────
+// 3 tests — GET /api/admin/business/:businessId/voice (Stage 6 Phase 3B prereq)
+
+describe("GET /api/admin/business/:businessId/voice", () => {
+  test("401 without auth", async () => {
+    const res = await callJson(
+      server.baseUrl,
+      "GET",
+      `/api/admin/business/${TARGET_BIZ}/voice`,
+    );
+    expect(res.status).toBe(401);
+  });
+
+  test("403 with customers:write but NOT customers:read (strict match)", async () => {
+    const res = await callJson(
+      server.baseUrl,
+      "GET",
+      `/api/admin/business/${TARGET_BIZ}/voice`,
+      {
+        headers: {
+          "x-test-user-id": STAFF_USER,
+          "x-test-staff-perms": "customers:write",
+        },
+      },
+    );
+    expect(res.status).toBe(403);
+  });
+
+  test("happy path returns customer-mirroring shape (includes agent_id + catalog_match), scoped to path-param business_id", async () => {
+    // Voice ID is the curated Sarah from VOICE_CATALOG so catalog_match
+    // resolves server-side rather than null.
+    sbMock.setResponses("business_configs", "select", {
+      data: {
+        business_id: TARGET_BIZ,
+        voice_id: "EXAVITQu4vr4xnSDxMaL",
+        voice_last_synced_at: "2026-06-09T10:00:00Z",
+        voice_sync_error: null,
+        agent_id: "agent_target_abc",
+      },
+      error: null,
+    });
+
+    const res = await callJson(
+      server.baseUrl,
+      "GET",
+      `/api/admin/business/${TARGET_BIZ}/voice`,
+      { headers: AUTH_READER },
+    );
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({
+      business_id: TARGET_BIZ,
+      voice_id: "EXAVITQu4vr4xnSDxMaL",
+      voice_last_synced_at: "2026-06-09T10:00:00Z",
+      voice_sync_error: null,
+      agent_id: "agent_target_abc",
+    });
+    // catalog_match resolved server-side from the curated catalog.
+    expect(res.body.catalog_match).toMatchObject({
+      voice_id: "EXAVITQu4vr4xnSDxMaL",
+      name: "Sarah",
+    });
+
+    // Cross-tenant defense: SELECT filters by path-param, not req.businessId.
+    const selectCall = sbMock.calls.find(
+      (c) => c.table === "business_configs" && c.op === "select",
+    );
+    expect(
+      selectCall!.filters.some(
+        (f) =>
+          f.kind === "eq" &&
+          f.args[0] === "business_id" &&
+          f.args[1] === TARGET_BIZ,
+      ),
+    ).toBe(true);
+  });
+});
+
 describe("PATCH /api/admin/business/:businessId/voice", () => {
   test("happy path: updates voice, writes admin_voice_change audit row with staff caller as changed_by_user_id, returns refreshed detail", async () => {
     // Read of current cfg before update.

@@ -173,8 +173,10 @@ function formatRelative(iso: string | null): string | null {
 // Component
 
 export default function PromptEditor({
+  apiBase = "business",
   onToast,
 }: {
+  apiBase?: string;
   onToast: (text: string, kind: "ok" | "err") => void;
 }) {
   const [loading, setLoading] = useState(true);
@@ -211,7 +213,7 @@ export default function PromptEditor({
       // so we can render "You saved X ago" vs anonymized "Saved X ago"
       // when the last write came from a teammate.
       const [promptRes, meRes] = await Promise.all([
-        fetchApi("/business/prompt") as Promise<PromptState>,
+        fetchApi(`/${apiBase}/prompt`) as Promise<PromptState>,
         fetchApi("/auth/me").catch(() => null) as Promise<{ user?: { id?: string } } | null>,
       ]);
       setState(promptRes);
@@ -230,10 +232,13 @@ export default function PromptEditor({
   }
 
   // ── Initial load ──────────────────────────────────────────────────────
+  // Re-runs on apiBase change so admin navigations between businesses
+  // reload state. For /settings/ai (apiBase="business"), apiBase is
+  // stable so this is effectively a mount-only effect.
   useEffect(() => {
     void loadState();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [apiBase]);
 
   // beforeunload guard — browser confirms before closing tab when dirty.
   useEffect(() => {
@@ -249,7 +254,7 @@ export default function PromptEditor({
   // ── Refresh state from server (after successful saves) ────────────────
   async function refreshState(): Promise<void> {
     try {
-      const fresh = (await fetchApi("/business/prompt")) as PromptState;
+      const fresh = (await fetchApi(`/${apiBase}/prompt`)) as PromptState;
       setState(fresh);
       const h = helpersFromState(fresh);
       setHelpers(h);
@@ -271,7 +276,7 @@ export default function PromptEditor({
 
     const payload = helpersForSave(helpers);
     try {
-      const r1 = await fetch("/api/business/prompt/helpers", {
+      const r1 = await fetch(`/api/${apiBase}/prompt/helpers`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json", ...getAuthHeaders() },
         body: JSON.stringify(payload),
@@ -295,7 +300,7 @@ export default function PromptEditor({
 
       // Phase 2 — regenerate.
       setSavePhase("regen");
-      const r2 = await fetch("/api/business/prompt/regenerate", {
+      const r2 = await fetch(`/api/${apiBase}/prompt/regenerate`, {
         method: "POST",
         headers: { "Content-Type": "application/json", ...getAuthHeaders() },
       });
@@ -334,7 +339,7 @@ export default function PromptEditor({
     setSaving(true);
     setSavePhase("raw");
     try {
-      const r = await fetch("/api/business/prompt", {
+      const r = await fetch(`/api/${apiBase}/prompt`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json", ...getAuthHeaders() },
         body: JSON.stringify({ system_prompt: rawPrompt }),

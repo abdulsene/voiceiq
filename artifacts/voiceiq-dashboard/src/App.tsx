@@ -11,6 +11,7 @@ import Analytics from "./pages/Analytics";
 import Benchmarks from "./pages/Benchmarks";
 import AdminAuditLogs from "./pages/AdminAuditLogs";
 import BusinessesList from "./pages/admin/BusinessesList";
+import BusinessDetail from "./pages/admin/BusinessDetail";
 import Government from "./pages/Government";
 import SettingsPage from "./pages/SettingsPage";
 import AiSettingsPage from "./pages/AiSettingsPage";
@@ -617,6 +618,14 @@ function DashboardLayout() {
                   see an "Admin access required" empty state on the page
                   itself (same pattern as AdminAuditLogs). */}
               <Route path="/admin/businesses" component={BusinessesList} />
+              {/* Stage 6 Phase 3B: admin drill-in. Reuses VoiceTab +
+                  PromptEditor + HistoryViewer via apiBase prop. Auth
+                  gated server-side; non-staff see "Admin access
+                  required" on the page itself. */}
+              <Route
+                path="/admin/businesses/:businessId"
+                component={BusinessDetail}
+              />
               <Route path="/settings" component={SettingsPage} />
               {/* Sprint 3 Stage 5 / Phase 3: AI receptionist voice picker. */}
               <Route path="/settings/ai" component={AiSettingsPage} />

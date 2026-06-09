@@ -440,6 +440,73 @@ router.get(
   },
 );
 
+// ── GET /api/admin/business/:businessId/voice ──────────────────────────
+// Mirrors the customer GET /business/voice shape EXACTLY so VoiceTab
+// works via pure URL swap (apiBase prop). Same fields including
+// catalog_match resolved server-side, same agent_id, same scoping
+// pattern (path-param business_id, not req.businessId). Stage 6
+// Phase 3B prerequisite for the admin drill-in's Voice tab.
+
+router.get(
+  "/admin/business/:businessId/voice",
+  requireAuth,
+  requireStaffPermission("customers", "read"),
+  async (req: Request, res: Response) => {
+    try {
+      const supabase = getSupabase();
+      if (!supabase) {
+        return res.status(500).json({ error: "Database not configured" });
+      }
+      const targetBusinessId = String(req.params.businessId);
+      if (!targetBusinessId || targetBusinessId === "undefined") {
+        return res
+          .status(400)
+          .json({ error: "businessId path param required" });
+      }
+
+      const { data, error } = await supabase
+        .from("business_configs")
+        .select(
+          "business_id, voice_id, voice_last_synced_at, voice_sync_error, agent_id",
+        )
+        .eq("business_id", targetBusinessId)
+        .maybeSingle();
+      if (error) {
+        console.error(
+          "[admin-businesses:voice-get] read error:",
+          error.message,
+        );
+        return res.status(500).json({ error: "Failed to load voice state" });
+      }
+      if (!data) return res.status(404).json({ error: "Business not found" });
+      const row = data as {
+        business_id: string;
+        voice_id: string | null;
+        voice_last_synced_at: string | null;
+        voice_sync_error: string | null;
+        agent_id: string | null;
+      };
+      const knownVoice = row.voice_id
+        ? VOICE_BY_ID.get(row.voice_id) ?? null
+        : null;
+      return res.json({
+        business_id: row.business_id,
+        voice_id: row.voice_id,
+        voice_last_synced_at: row.voice_last_synced_at,
+        voice_sync_error: row.voice_sync_error,
+        agent_id: row.agent_id,
+        catalog_match: knownVoice,
+      });
+    } catch (e: any) {
+      console.error(
+        "[admin-businesses:voice-get] unexpected:",
+        e?.message ?? e,
+      );
+      return res.status(500).json({ error: "server_error" });
+    }
+  },
+);
+
 // ── GET /api/admin/business/:businessId ────────────────────────────────
 
 router.get(

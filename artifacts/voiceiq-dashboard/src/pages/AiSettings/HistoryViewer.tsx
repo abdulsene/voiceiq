@@ -375,8 +375,10 @@ async function copyText(text: string): Promise<boolean> {
 // Component
 
 export default function HistoryViewer({
+  apiBase = "business",
   onSwitchTab,
 }: {
+  apiBase?: string;
   onSwitchTab: (tab: "voice" | "prompt") => void;
 }) {
   const [rows, setRows] = useState<AuditRow[]>([]);
@@ -431,7 +433,7 @@ export default function HistoryViewer({
     setError(null);
     try {
       const res = (await fetchApi(
-        `/business/prompt/audit?limit=${PAGE_LIMIT}&offset=${targetOffset}`,
+        `/${apiBase}/prompt/audit?limit=${PAGE_LIMIT}&offset=${targetOffset}`,
       )) as AuditResponse;
       setRows(res.rows ?? []);
       setTotal(res.total ?? 0);
@@ -442,11 +444,13 @@ export default function HistoryViewer({
     }
   }
 
-  // Page fetch — re-runs whenever offset changes.
+  // Page fetch — re-runs on offset or apiBase change (admin navigations
+  // between businesses keep the same component mounted with a different
+  // URL prefix, so we must refetch when apiBase shifts).
   useEffect(() => {
     void loadPage(offset);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [offset]);
+  }, [offset, apiBase]);
 
   const summaries = useMemo(
     () => rows.map((r) => ({ row: r, sum: summarizeRow(r, voiceCatalog) })),
