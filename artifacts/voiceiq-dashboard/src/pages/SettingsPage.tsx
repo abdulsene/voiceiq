@@ -1,5 +1,4 @@
 import { useEffect, useState } from "react";
-import { Link } from "wouter";
 import {
   Bot, Building2, Bell, Phone, Shield, CreditCard, Save, CheckCircle,
   AlertTriangle, Globe, ShieldCheck, ShieldOff, Loader2, Lock, Eye,
@@ -1853,80 +1852,11 @@ function ObjectionHandlersTab({ industry }: { industry: string }) {
   );
 }
 
-/**
- * Legacy stub: this used to be a self-contained editor for the same
- * helper fields (tone_preference, custom_faqs, never_say_list) writing
- * to PUT /api/business/:id/customization. As of Sprint 3 Stage 5, AI
- * customization lives on /settings/ai with stricter validation, an
- * after-hours field, raw-prompt mode, and an audit history. The
- * legacy backend endpoint stays in place for rollback safety; this
- * UI is now a redirect-only CTA pointing to the new workspace.
- *
- * Tab strip continues to render this component (line ~3129) so
- * bookmarked /settings#customization URLs still resolve — we just
- * swap the body for a "feature moved" card.
- *
- * businessId prop is intentionally unused now but kept to preserve the
- * call site at line ~3129 without a separate JSX edit.
- */
-function AiCustomizationTab(_props: { businessId: string }) {
-  return (
-    <div className="space-y-6">
-      <div className="bg-blue-50/50 border border-blue-200 rounded-xl p-6 md:p-8">
-        <div className="flex items-start gap-3 mb-4">
-          <div className="p-2 bg-white rounded-lg border border-blue-200 shrink-0">
-            <Sparkles className="w-5 h-5 text-[#2E75B6]" />
-          </div>
-          <div>
-            <h2 className="text-lg font-semibold text-gray-900">
-              AI Customization moved
-            </h2>
-            <p className="text-sm text-gray-600 mt-1">
-              Your AI receptionist's voice, prompt, and change history now
-              live in a dedicated workspace with more controls and better
-              feedback.
-            </p>
-          </div>
-        </div>
-
-        <div className="mt-5">
-          <Link href="/settings/ai?tab=prompt">
-            <a className="inline-flex items-center gap-1.5 px-5 py-2.5 bg-[#2E75B6] text-white rounded-lg text-sm font-semibold hover:bg-[#1e5a8f] shadow-md transition-colors">
-              Go to AI Receptionist Settings
-              <ChevronRight className="w-4 h-4" />
-            </a>
-          </Link>
-        </div>
-
-        <div className="mt-6 pt-5 border-t border-blue-200">
-          <p className="text-xs font-semibold text-gray-700 uppercase tracking-wide mb-3">
-            What moved
-          </p>
-          <ul className="space-y-2 text-sm text-gray-700">
-            <li className="flex items-start gap-2">
-              <CheckCircle className="w-4 h-4 text-[#2E75B6] mt-0.5 shrink-0" />
-              <span>Voice selection — preview before switching</span>
-            </li>
-            <li className="flex items-start gap-2">
-              <CheckCircle className="w-4 h-4 text-[#2E75B6] mt-0.5 shrink-0" />
-              <span>Tone &amp; FAQs editor — structured + raw views</span>
-            </li>
-            <li className="flex items-start gap-2">
-              <CheckCircle className="w-4 h-4 text-[#2E75B6] mt-0.5 shrink-0" />
-              <span>Custom instructions &amp; restrictions</span>
-            </li>
-            <li className="flex items-start gap-2">
-              <CheckCircle className="w-4 h-4 text-[#2E75B6] mt-0.5 shrink-0" />
-              <span>
-                <strong>New:</strong> change history with side-by-side diff
-              </span>
-            </li>
-          </ul>
-        </div>
-      </div>
-    </div>
-  );
-}
+// Legacy AiCustomizationTab + redirect card removed in Stage 6
+// follow-ups (commit dropped ~250 lines of dead code). The /settings/ai
+// surface has been the only path for AI customization since the
+// Monday decommission; the redirect card had been in place long enough
+// for any bookmark traffic to discover the new location.
 
 type WebsiteState = {
   website: string | null;
@@ -2349,7 +2279,6 @@ export default function SettingsPage() {
   const tabs = [
     { id: "business", label: "Business Profile", icon: Building2 },
     { id: "ai", label: "AI Receptionist", icon: Bot },
-    { id: "customization", label: "AI Customization", icon: Sparkles },
     { id: "website", label: "Website", icon: Globe },
     { id: "phone", label: "Phone Setup", icon: Phone },
     { id: "locations", label: "Locations", icon: MapPin },
@@ -2936,8 +2865,6 @@ export default function SettingsPage() {
         {tab === "team" && <TeamTab />}
 
         {tab === "sales_demos" && isAdmin && <SalesDemosTab />}
-
-        {tab === "customization" && <AiCustomizationTab businessId={localStorage.getItem("neverr_active_business_id") || localStorage.getItem("neverr_business_id") || ""} />}
 
         {tab === "website" && <WebsiteTab businessId={localStorage.getItem("neverr_active_business_id") || localStorage.getItem("neverr_business_id") || ""} />}
 

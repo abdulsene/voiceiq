@@ -352,6 +352,41 @@ describe("GET /api/admin/businesses", () => {
     ).toBe(true);
   });
 
+  test("test-business heuristic also excludes lowercase placeholders (test/tes/fdfds) via ilike NOT", async () => {
+    sbMock.setResponses("business_configs", "select", {
+      data: [],
+      error: null,
+      count: 0,
+    });
+    sbMock.setResponses("user_businesses", "select", { data: [], error: null });
+
+    await callJson(
+      server.baseUrl,
+      "GET",
+      "/api/admin/businesses",
+      { headers: AUTH_READER },
+    );
+
+    const selectCall = sbMock.calls.find(
+      (c) => c.table === "business_configs" && c.op === "select",
+    );
+    const notFilters = selectCall!.filters.filter((f) => f.kind === "not");
+
+    // Each lowercase placeholder gets its own NOT ilike with an
+    // exact-match pattern (no % wildcards) so we don't falsely
+    // exclude e.g. "Test Kitchen Co" — only the bare placeholders.
+    for (const placeholder of ["test", "tes", "fdfds"]) {
+      expect(
+        notFilters.some(
+          (f) =>
+            f.args[0] === "business_name" &&
+            f.args[1] === "ilike" &&
+            f.args[2] === placeholder,
+        ),
+      ).toBe(true);
+    }
+  });
+
   test("include_test=true skips exclusion chain entirely", async () => {
     sbMock.setResponses("business_configs", "select", {
       data: [],

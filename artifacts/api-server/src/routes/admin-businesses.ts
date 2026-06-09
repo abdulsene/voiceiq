@@ -391,7 +391,14 @@ router.get(
           .neq("business_id", "demo-business")
           .not("business_name", "like", "[DEMO]%")
           .not("business_name", "like", "[SALES DEMO]%")
-          .not("business_name", "like", "Test %");
+          .not("business_name", "like", "Test %")
+          // Lowercase placeholder names that the original "Test %"
+          // heuristic missed. Exact-match on the LOWER() to catch
+          // both "test" and "Test" while not falsely excluding
+          // legitimate names that happen to contain "test".
+          .not("business_name", "ilike", "test")
+          .not("business_name", "ilike", "tes")
+          .not("business_name", "ilike", "fdfds");
       }
 
       const orderCol =

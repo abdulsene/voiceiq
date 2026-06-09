@@ -642,6 +642,19 @@ function AgentBadge({ agentId }: { agentId: string | null }) {
 }
 
 function SyncBadge({ row }: { row: BusinessSummary }) {
+  // Three-state: no agent_id means there's nothing to sync, so
+  // "Healthy" would be misleading. Show an em-dash to indicate
+  // "not applicable" instead.
+  if (!row.agent_id) {
+    return (
+      <span
+        className="text-xs text-gray-500"
+        aria-label="No agent — nothing to sync"
+      >
+        —
+      </span>
+    );
+  }
   const errors: string[] = [];
   if (row.voice_sync_error) errors.push(`Voice: ${row.voice_sync_error}`);
   if (row.prompt_sync_error) errors.push(`Prompt: ${row.prompt_sync_error}`);

@@ -40,10 +40,9 @@ export default function AiSettingsPage() {
   // Controlled Tabs so we can hoist the active tab if we ever need to
   // intercept switches. Tab-switch confirmation was cut from scope —
   // beforeunload is the only guard for dirty prompt edits.
-  // Initial tab honors a ?tab= query param so deep links from
-  // elsewhere (e.g. the legacy /settings → AI Customization redirect
-  // card) can land the customer directly on the relevant tab. Lazy
-  // initializer so window.location is only read once on mount.
+  // Initial tab honors a ?tab= query param so deep links can land the
+  // customer directly on the relevant tab. Lazy initializer so
+  // window.location is only read once on mount.
   const [tab, setTab] = useState<TabKey>(() => {
     const params = new URLSearchParams(window.location.search);
     const t = params.get("tab");
