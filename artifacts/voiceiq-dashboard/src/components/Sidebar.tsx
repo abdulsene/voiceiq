@@ -13,6 +13,7 @@ import {
   Landmark,
   LogOut,
   Award,
+  Briefcase,
   Clapperboard,
   Shield,
 } from "lucide-react";
@@ -41,10 +42,15 @@ const navItems = [
   { path: "/government", labelKey: "nav.government", icon: Landmark },
   { path: "/demos", labelKey: "nav.demoLibrary", icon: Clapperboard, external: true },
   // Sprint 5: read-only admin viewer over audit_logs. Endpoint enforces
-  // requireAdminRole; non-admins clicking through see the in-page
-  // "Admin access required" empty state. Sidebar shows the link to
-  // everyone for simplicity — real gating lives on the API.
+  // requireStaffPermission post-hotfix (aaf14de); non-staff clicking
+  // through see the in-page "Admin access required" empty state.
+  // Sidebar shows the link to everyone for simplicity — real gating
+  // lives on the API.
   { path: "/admin/audit-logs", labelKey: "nav.auditLogs", label: "Audit Logs", icon: Shield },
+  // Stage 6 Phase 2: admin override list. Same nav-visibility-for-all
+  // precedent as audit-logs; server gates via requireStaffPermission
+  // ("customers", "read").
+  { path: "/admin/businesses", labelKey: "nav.customerBusinesses", label: "Customer Businesses", icon: Briefcase },
   { path: "/settings", labelKey: "nav.settings", icon: Settings },
 ];
 

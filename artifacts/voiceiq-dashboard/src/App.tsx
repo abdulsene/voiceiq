@@ -10,6 +10,7 @@ import SmsCampaigns from "./pages/SmsCampaigns";
 import Analytics from "./pages/Analytics";
 import Benchmarks from "./pages/Benchmarks";
 import AdminAuditLogs from "./pages/AdminAuditLogs";
+import BusinessesList from "./pages/admin/BusinessesList";
 import Government from "./pages/Government";
 import SettingsPage from "./pages/SettingsPage";
 import AiSettingsPage from "./pages/AiSettingsPage";
@@ -610,6 +611,12 @@ function DashboardLayout() {
               <Route path="/analytics" component={Analytics} />
               <Route path="/benchmarks" component={Benchmarks} />
               <Route path="/admin/audit-logs" component={AdminAuditLogs} />
+              {/* Stage 6 Phase 2: admin override UI list page. Auth
+                  gated server-side via requireStaffPermission("customers",
+                  "read") on GET /api/admin/businesses. Non-staff callers
+                  see an "Admin access required" empty state on the page
+                  itself (same pattern as AdminAuditLogs). */}
+              <Route path="/admin/businesses" component={BusinessesList} />
               <Route path="/settings" component={SettingsPage} />
               {/* Sprint 3 Stage 5 / Phase 3: AI receptionist voice picker. */}
               <Route path="/settings/ai" component={AiSettingsPage} />
