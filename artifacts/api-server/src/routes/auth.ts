@@ -6,7 +6,7 @@ import { requireAuth } from "../middlewares/auth";
 import { createAgentForBusiness } from "../agents";
 import { sendSMS } from "../sms";
 import { auditLog, extractRequestMeta } from "../middlewares/audit";
-import { validate, authLoginSchema, authSignupSchema } from "../middlewares/validate";
+import { validate, authLoginSchema, authSignupSchema, authForgotPasswordSchema, authResetPasswordSchema } from "../middlewares/validate";
 import { OBJECTION_TEMPLATES } from "../objectionTemplates";
 import { buildSystemPrompt, fetchIndustryTemplate, fetchObjectionHandlers } from "./api";
 import { scrapeWebsite, type ScrapedData } from "../scraping";
@@ -237,6 +237,107 @@ router.post("/auth/login", validate(authLoginSchema), async (req: Request, res: 
       businesses: memberships || [],
     });
   } catch (err: any) {
+    res.status(500).json({ error: "An unexpected error occurred" });
+  }
+});
+
+// Build the redirect URL Supabase will land the user on after they click
+// the link in the recovery email. Prefers DASHBOARD_URL (explicit
+// configuration), falls back to the Origin header (dashboard and api-server
+// share an origin on Replit), and last-resorts to the request's own
+// protocol+host. The path is appended here, not configured in Supabase
+// Studio, so a single Site URL whitelist entry covers the full callback URL.
+function resolveDashboardUrl(req: Request): string {
+  const fromEnv = process.env.DASHBOARD_URL;
+  if (fromEnv) return fromEnv.replace(/\/+$/, "");
+  const origin = req.get("origin");
+  if (origin) return origin.replace(/\/+$/, "");
+  return `${req.protocol}://${req.get("host")}`;
+}
+
+// PUBLIC — bypass-listed in app.ts AUTH_BYPASS_PATTERNS. Always returns 204
+// so an attacker can't enumerate which emails have accounts by probing
+// status codes (matches the anti-enumeration posture of /auth/verify-email).
+// Real upstream failures (Supabase Auth down, bad SERVICE_KEY, etc.) are
+// captured to Sentry so on-call sees them without changing the wire
+// response.
+router.post("/auth/forgot-password", validate(authForgotPasswordSchema), async (req: Request, res: Response) => {
+  const { email } = req.body;
+  const supabase = getSupabaseAdmin();
+  const meta = extractRequestMeta(req);
+  const redirectTo = `${resolveDashboardUrl(req)}/reset-password`;
+  try {
+    // resetPasswordForEmail does NOT distinguish "user not found" from
+    // success at the SDK level — both shapes return { error: null }. So
+    // any error here is a real upstream problem, not a missing user.
+    const { error } = await supabase.auth.resetPasswordForEmail(email, { redirectTo });
+    if (error) {
+      Sentry.captureMessage("forgot_password_supabase_error", {
+        level: "error",
+        extra: { email, error: error.message, redirectTo },
+      });
+    }
+    await auditLog({
+      action: "auth.forgot_password.requested",
+      ...meta,
+      details: { email, redirectTo },
+    });
+  } catch (err: any) {
+    Sentry.captureException(err, { extra: { email, route: "/auth/forgot-password" } });
+  }
+  res.status(204).end();
+});
+
+// PUBLIC — bypass-listed in app.ts AUTH_BYPASS_PATTERNS. The access_token
+// in the request body IS the credential: it's the JWT Supabase Auth
+// minted when the user clicked their recovery link and was redirected
+// back to /reset-password#access_token=…&type=recovery. We validate it
+// via getUser (which checks signature + expiry against Supabase Auth)
+// and update the password with the service-key admin client.
+router.post("/auth/reset-password", validate(authResetPasswordSchema), async (req: Request, res: Response) => {
+  const { access_token, new_password } = req.body;
+  const supabase = getSupabaseAdmin();
+  const meta = extractRequestMeta(req);
+  try {
+    const { data: userData, error: userErr } = await supabase.auth.getUser(access_token);
+    if (userErr || !userData?.user?.id) {
+      await auditLog({
+        action: "auth.reset_password.invalid_token",
+        ...meta,
+        success: false,
+        details: { reason: userErr?.message || "no_user" },
+      });
+      res.status(401).json({ error: "Link expired or invalid" });
+      return;
+    }
+    const userId = userData.user.id;
+    const { error: updateErr } = await supabase.auth.admin.updateUserById(userId, {
+      password: new_password,
+    });
+    if (updateErr) {
+      Sentry.captureMessage("reset_password_update_failed", {
+        level: "error",
+        extra: { user_id: userId, error: updateErr.message },
+      });
+      await auditLog({
+        userId,
+        action: "auth.reset_password.update_failed",
+        ...meta,
+        success: false,
+        details: { error: updateErr.message },
+      });
+      res.status(500).json({ error: "Couldn't update password" });
+      return;
+    }
+    await auditLog({
+      userId,
+      action: "auth.reset_password.success",
+      ...meta,
+      details: {},
+    });
+    res.json({ success: true });
+  } catch (err: any) {
+    Sentry.captureException(err, { extra: { route: "/auth/reset-password" } });
     res.status(500).json({ error: "An unexpected error occurred" });
   }
 });

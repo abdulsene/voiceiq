@@ -109,6 +109,13 @@ app.use("/api", generalLimiter);
 app.use("/api/auth/login", authLimiter);
 app.use("/api/auth/signup", authLimiter);
 app.use("/api/auth/refresh", authLimiter);
+// Both unauthenticated and either hit Supabase Auth's recovery endpoint
+// (forgot-password → resetPasswordForEmail; spammable) or update a
+// password from a token alone (reset-password; brute-forceable on
+// access_token if an attacker is also probing). authLimiter throttles
+// both surfaces under the same 10-req/15-min/IP envelope as login.
+app.use("/api/auth/forgot-password", authLimiter);
+app.use("/api/auth/reset-password", authLimiter);
 // Activation is unauthenticated and creates a Supabase Auth user — apply
 // the strict authLimiter to throttle brute-force on invite tokens and DoS
 // on the upstream auth provider.
@@ -139,7 +146,7 @@ const AUTH_BYPASS_PATTERNS = [
   // in the request body IS the credential. /auth/resend-verification is
   // NOT public (requireAuth — must be a logged-in user requesting a
   // resend for their own account).
-  /^\/api\/auth\/(login|signup|refresh|verify-email)$/,
+  /^\/api\/auth\/(login|signup|refresh|verify-email|forgot-password|reset-password)$/,
   /^\/api\/auth\/google/,
   /^\/api\/auth\/microsoft/,
   /^\/api\/twilio\//,

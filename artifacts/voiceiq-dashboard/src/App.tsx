@@ -45,6 +45,7 @@ import AddBusinessModal from "./components/AddBusinessModal";
 import ActivateAccount from "./pages/ActivateAccount";
 import SmsOptInPage from "./pages/SmsOptInPage";
 import VerifyEmail from "./pages/VerifyEmail";
+import ResetPassword from "./pages/ResetPassword";
 import EmailVerificationScreen from "./components/EmailVerificationScreen";
 // Sprint 5 Alex Phase 2: floating chat widget mounted at App level so a
 // single instance survives client-side navigations. The component
@@ -754,6 +755,13 @@ function App() {
             lands cleanly (the page itself doesn't need auth — the token
             in the URL is the credential). */}
         <Route path="/verify-email" component={VerifyEmail} />
+        {/* Public landing for Supabase Auth recovery redirect. The
+            recovery email's link sends users to /reset-password with the
+            access_token in the URL fragment — page reads it client-side,
+            posts to /api/auth/reset-password, then routes to /login.
+            Sits OUTSIDE DashboardLayout so a logged-out user landing
+            here doesn't bounce off AuthGuard. */}
+        <Route path="/reset-password" component={ResetPassword} />
         <Route path="/dashboard" component={() => <DashboardLayout />} />
         <Route path="/calls" component={() => <DashboardLayout />} />
         <Route path="/contacts" component={() => <DashboardLayout />} />

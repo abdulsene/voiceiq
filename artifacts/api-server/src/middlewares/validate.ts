@@ -32,6 +32,19 @@ export const authLoginSchema = z.object({
   password: z.string().min(6).max(128),
 });
 
+export const authForgotPasswordSchema = z.object({
+  email: z.string().email().max(255),
+});
+
+// access_token comes from the URL fragment Supabase Auth appends to the
+// recovery redirect (e.g. /reset-password#access_token=<JWT>&type=recovery).
+// JWTs in practice are >20 chars; 4096 is a generous ceiling that still
+// rejects obvious garbage without sniffing the JWT shape ourselves.
+export const authResetPasswordSchema = z.object({
+  access_token: z.string().min(20).max(4096),
+  new_password: z.string().min(8).max(128),
+});
+
 export const authSignupSchema = z.object({
   email: z.string().email().max(255),
   password: z.string().min(8).max(128),
