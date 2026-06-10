@@ -31,7 +31,21 @@ import { getSmsUnreadCount, fetchApi } from "../lib/api";
 import { clearSession } from "../App";
 import LanguageSwitcher from "./LanguageSwitcher";
 
-const navItems = [
+// adminOnly items are filtered out for any caller whose /auth/me returns a
+// null staff_role. The four flagged below are the ones a paying customer
+// (e.g. EZ Rentals) was seeing in the sidebar despite the backend gating
+// them via requireStaffPermission. The API gate stays — this is purely a
+// UI fix to stop showing nav for routes the customer can't usefully reach.
+type NavItem = {
+  path: string;
+  labelKey: string;
+  label?: string;
+  icon: typeof LayoutDashboard;
+  external?: boolean;
+  adminOnly?: boolean;
+};
+
+const navItems: NavItem[] = [
   { path: "/dashboard", labelKey: "nav.commandCenter", icon: LayoutDashboard },
   { path: "/calls", labelKey: "nav.callsLeads", icon: Phone },
   { path: "/contacts", labelKey: "nav.contacts", icon: Users },
@@ -39,18 +53,16 @@ const navItems = [
   { path: "/sms", labelKey: "nav.sms", icon: MessageSquare },
   { path: "/analytics", labelKey: "nav.analytics", icon: BarChart3 },
   { path: "/benchmarks", labelKey: "nav.benchmarks", icon: Award },
-  { path: "/government", labelKey: "nav.government", icon: Landmark },
-  { path: "/demos", labelKey: "nav.demoLibrary", icon: Clapperboard, external: true },
+  { path: "/government", labelKey: "nav.government", icon: Landmark, adminOnly: true },
+  { path: "/demos", labelKey: "nav.demoLibrary", icon: Clapperboard, external: true, adminOnly: true },
   // Sprint 5: read-only admin viewer over audit_logs. Endpoint enforces
-  // requireStaffPermission post-hotfix (aaf14de); non-staff clicking
-  // through see the in-page "Admin access required" empty state.
-  // Sidebar shows the link to everyone for simplicity — real gating
-  // lives on the API.
-  { path: "/admin/audit-logs", labelKey: "nav.auditLogs", label: "Audit Logs", icon: Shield },
-  // Stage 6 Phase 2: admin override list. Same nav-visibility-for-all
-  // precedent as audit-logs; server gates via requireStaffPermission
-  // ("customers", "read").
-  { path: "/admin/businesses", labelKey: "nav.customerBusinesses", label: "Customer Businesses", icon: Briefcase },
+  // requireStaffPermission post-hotfix (aaf14de); customer-side visibility
+  // is now gated by adminOnly (was: "shown to everyone for simplicity").
+  { path: "/admin/audit-logs", labelKey: "nav.auditLogs", label: "Audit Logs", icon: Shield, adminOnly: true },
+  // Stage 6 Phase 2: admin override list. Server gates via
+  // requireStaffPermission ("customers", "read"); sidebar visibility now
+  // also gated by adminOnly.
+  { path: "/admin/businesses", labelKey: "nav.customerBusinesses", label: "Customer Businesses", icon: Briefcase, adminOnly: true },
   { path: "/settings", labelKey: "nav.settings", icon: Settings },
 ];
 
@@ -58,6 +70,10 @@ export default function Sidebar() {
   const [location] = useLocation();
   const [businessName, setBusinessName] = useState("");
   const [smsUnread, setSmsUnread] = useState(0);
+  // null until /auth/me resolves; null thereafter means "not a staff user"
+  // (no row in user_roles, or row exists but status !== 'active'). Same
+  // value either way — the only meaningful gate is null vs non-null.
+  const [staffRole, setStaffRole] = useState<string | null>(null);
   const { t } = useTranslation();
 
   const pollUnread = useCallback(() => {
@@ -81,6 +97,10 @@ export default function Sidebar() {
         const biz = (activeBiz && list.find((b) => b.business_id === activeBiz)) || list[0];
         const config = biz?.business_configs && (Array.isArray(biz.business_configs) ? biz.business_configs[0] : biz.business_configs);
         if (config?.business_name) setBusinessName(config.business_name);
+        // staff_role is null for customers; a string ("super_admin", "admin",
+        // etc.) for active staff. Stored as-is and used only as a null check
+        // when filtering adminOnly nav items below.
+        setStaffRole((d?.staff_role as string | null) ?? null);
       })
       .catch(() => {});
     pollUnread();
@@ -107,7 +127,11 @@ export default function Sidebar() {
         </div>
 
         <nav className="flex-1 px-3 py-3 space-y-0.5">
-          {navItems.map((item) => {
+          {/* TODO: tighten to per-resource gating (analyst sees Audit Logs
+              but not Customer Businesses) — binary "any staff role" is the
+              hot-fix for the EZ Rentals leak; per-resource is the follow-up.
+              Default for null/unknown role = HIDE adminOnly items. */}
+          {navItems.filter((item) => !item.adminOnly || staffRole !== null).map((item) => {
             const active =
               item.path === "/"
                 ? location === "/" || location === ""

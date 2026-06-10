@@ -372,11 +372,42 @@ router.get("/auth/me", requireAuth, async (req: Request, res: Response) => {
     }
   } catch {}
 
+  // Best-effort staff role lookup — mirrors staff-rbac.ts:200-223. Customer
+  // accounts have NO row in user_roles, so they get staff_role: null and the
+  // dashboard's Sidebar uses that to hide admin nav items (Government, Demo
+  // Library, Audit Logs, Customer Businesses). This is purely a UI hint —
+  // the API still enforces per-resource gating via requireStaffPermission on
+  // every admin endpoint. Inactive rows also degrade to null so a suspended
+  // staff member doesn't keep seeing admin nav. Any DB hiccup falls through
+  // to null too: failing-closed is the right call for an authorization hint.
+  let staffRole: string | null = null;
+  try {
+    let { data: roleRow } = await supabase
+      .from("user_roles")
+      .select("role, status")
+      .eq("user_id", req.userId!)
+      .maybeSingle();
+    if (!roleRow && req.userEmail) {
+      const { data: byEmail } = await supabase
+        .from("user_roles")
+        .select("role, status")
+        .ilike("email", req.userEmail)
+        .maybeSingle();
+      if (byEmail) roleRow = byEmail;
+    }
+    if (roleRow && roleRow.status === "active") {
+      staffRole = roleRow.role as string;
+    }
+  } catch {
+    // Best-effort: keep null on any error rather than 500 the whole /auth/me.
+  }
+
   res.json({
     success: true,
     user: { id: req.userId, email: req.userEmail, user_metadata: userMeta },
     current_business_id: req.businessId,
     businesses: memberships || [],
+    staff_role: staffRole,
   });
 });
 
