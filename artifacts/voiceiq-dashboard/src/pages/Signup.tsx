@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from "react";
+import { Link } from "wouter";
 import { AlertCircle, CreditCard, Loader2 } from "lucide-react";
-import * as Sentry from "@sentry/react";
 import LandingNav from "../components/LandingNav";
 // Sprint 1 BUG-17 sub-step 3e: PLAN_PRICES + VALID_PLANS were hoisted to
 // lib/plans.ts so PendingPaymentScreen renders the same labels and prices
@@ -147,15 +147,6 @@ export default function Signup({ initialTab = "signup" }: { initialTab?: "login"
   // call — never a "done" flash between them.
   const [stage, setStage] = useState<"idle" | "creating" | "checkout">("idle");
   const [error, setError] = useState("");
-  // Forgot-password affordance on the login tab. State is local to the
-  // login form (cleared on tab switch below) so a successful reset
-  // request on this visit doesn't bleed into a fresh login attempt.
-  //   idle   — nothing in flight, button shows "Forgot password?"
-  //   sending — POST /api/auth/forgot-password in flight
-  //   sent   — server returned 204 (anti-enumeration: same shape whether
-  //            the email exists or not — UI just says "check your email")
-  //   error  — network or 5xx; user can retry
-  const [forgotState, setForgotState] = useState<"idle" | "sending" | "sent" | "error">("idle");
   // When /auth/signup succeeds but the Checkout session call fails, we
   // surface a "Retry checkout" affordance instead of looping the user back
   // through signup. The account already exists; localStorage stays intact
@@ -469,42 +460,6 @@ export default function Signup({ initialTab = "signup" }: { initialTab?: "login"
     }
   }
 
-  async function handleForgotPassword() {
-    // Reuse the email already typed into the login form. No separate
-    // input — matches the existing SsoLoginButton UX on the same tab.
-    const email = (form.email || "").trim();
-    if (!email) {
-      setFieldErrors({ email: "Enter your email above first, then click Forgot password" });
-      setTimeout(() => inputRefs.current["email"]?.focus(), 0);
-      return;
-    }
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-      setFieldErrors({ email: "Enter a valid email address" });
-      setTimeout(() => inputRefs.current["email"]?.focus(), 0);
-      return;
-    }
-    setFieldErrors({});
-    setForgotState("sending");
-    try {
-      const r = await fetch(`${API}/auth/forgot-password`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ email }),
-      });
-      // Server always 204s on success regardless of whether the email
-      // exists (anti-enumeration). Treat any non-2xx as a real failure
-      // worth surfacing — the rate-limiter is the only realistic source.
-      if (r.ok || r.status === 204) {
-        setForgotState("sent");
-        return;
-      }
-      throw new Error(`forgot-password returned ${r.status}`);
-    } catch (err) {
-      Sentry.captureException(err, { extra: { route: "/auth/forgot-password" } });
-      setForgotState("error");
-    }
-  }
-
   async function handleLogin() {
     // Sprint 3 BUG-09: same client-side gate as handleSignup. Login only
     // requires email + password to be present — format validation is the
@@ -654,7 +609,7 @@ export default function Signup({ initialTab = "signup" }: { initialTab?: "login"
         <div style={{ background: "white", border: "1px solid #e2e8f0", borderRadius: "14px", padding: "36px", boxShadow: "0 1px 3px rgba(0,0,0,0.06)" }}>
           <div style={{ display: "flex", background: "#f8fafc", borderRadius: "8px", padding: "3px", marginBottom: "20px" }}>
             {(["signup", "login"] as const).map(t => (
-              <button key={t} onClick={() => { setTab(t); setError(""); setFieldErrors({}); setForgotState("idle"); }} style={{ flex: 1, padding: "8px", border: "none", borderRadius: "6px", fontSize: "14px", fontWeight: 500, cursor: "pointer", background: tab === t ? "white" : "transparent", color: tab === t ? "#1B2537" : "#64748b", boxShadow: tab === t ? "0 1px 3px rgba(0,0,0,0.1)" : "none", transition: "all 0.15s" }}>
+              <button key={t} onClick={() => { setTab(t); setError(""); setFieldErrors({}); }} style={{ flex: 1, padding: "8px", border: "none", borderRadius: "6px", fontSize: "14px", fontWeight: 500, cursor: "pointer", background: tab === t ? "white" : "transparent", color: tab === t ? "#1B2537" : "#64748b", boxShadow: tab === t ? "0 1px 3px rgba(0,0,0,0.1)" : "none", transition: "all 0.15s" }}>
                 {t === "signup" ? "Create account" : "Sign in"}
               </button>
             ))}
@@ -841,43 +796,22 @@ export default function Signup({ initialTab = "signup" }: { initialTab?: "login"
                   </div>
                 );
               })}
-              {/* "Forgot password?" affordance. Posts to the api-server's
-                  /auth/forgot-password (which calls
-                  supabase.auth.resetPasswordForEmail server-side and
-                  always returns 204 — anti-enumeration). Supabase then
-                  emails the user a recovery link that points at
-                  /reset-password on this dashboard; ResetPassword.tsx
-                  reads the access_token from the URL fragment and posts
-                  it to /auth/reset-password to finish the flow.
-                  Replaced the original Sprint 3 BUG-10 mailto:
-                  fallback. */}
+              {/* Forgot password? — links to the dedicated /forgot-password
+                  page (was previously an inline POST + state machine on
+                  this tab). The page handles the same /auth/forgot-password
+                  endpoint and shows its own success/error states. */}
               <div style={{ textAlign: "right", marginTop: "-4px", marginBottom: "14px" }}>
-                <button
-                  type="button"
-                  onClick={handleForgotPassword}
-                  disabled={forgotState === "sending"}
+                <Link
+                  href="/forgot-password"
                   style={{
-                    background: "none",
-                    border: "none",
-                    padding: 0,
                     fontSize: "12.5px",
-                    color: forgotState === "sending" ? "#94a3b8" : "#2E75B6",
+                    color: "#2E75B6",
                     fontWeight: 500,
-                    cursor: forgotState === "sending" ? "not-allowed" : "pointer",
+                    textDecoration: "none",
                   }}
                 >
-                  {forgotState === "sending" ? "Sending..." : "Forgot password?"}
-                </button>
-                {forgotState === "sent" && (
-                  <p style={{ fontSize: "12px", color: "#047857", marginTop: "6px", marginBottom: 0, lineHeight: 1.4 }}>
-                    Check your email for a reset link.
-                  </p>
-                )}
-                {forgotState === "error" && (
-                  <p style={{ fontSize: "12px", color: "#dc2626", marginTop: "6px", marginBottom: 0, lineHeight: 1.4 }}>
-                    We couldn't send the email — please contact support.
-                  </p>
-                )}
+                  Forgot password?
+                </Link>
               </div>
               <button onClick={handleLogin} disabled={loading} style={{ width: "100%", padding: "11px", background: loading ? "#94a3b8" : "#2E75B6", color: "white", border: "none", borderRadius: "10px", fontSize: "15px", fontWeight: 600, cursor: loading ? "not-allowed" : "pointer" }}>
                 {loading ? "Signing in..." : "Sign in to dashboard"}

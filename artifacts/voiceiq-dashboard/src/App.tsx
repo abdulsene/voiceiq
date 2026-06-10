@@ -45,6 +45,7 @@ import AddBusinessModal from "./components/AddBusinessModal";
 import ActivateAccount from "./pages/ActivateAccount";
 import SmsOptInPage from "./pages/SmsOptInPage";
 import VerifyEmail from "./pages/VerifyEmail";
+import ForgotPassword from "./pages/ForgotPassword";
 import ResetPassword from "./pages/ResetPassword";
 import EmailVerificationScreen from "./components/EmailVerificationScreen";
 // Sprint 5 Alex Phase 2: floating chat widget mounted at App level so a
@@ -755,6 +756,11 @@ function App() {
             lands cleanly (the page itself doesn't need auth — the token
             in the URL is the credential). */}
         <Route path="/verify-email" component={VerifyEmail} />
+        {/* Dedicated /forgot-password entry. Replaced the inline button
+            that lived on the login tab of Signup.tsx so the affordance
+            is bookmarkable, shareable, and consistent with
+            /reset-password. Public, outside AuthGuard. */}
+        <Route path="/forgot-password" component={ForgotPassword} />
         {/* Public landing for Supabase Auth recovery redirect. The
             recovery email's link sends users to /reset-password with the
             access_token in the URL fragment — page reads it client-side,
