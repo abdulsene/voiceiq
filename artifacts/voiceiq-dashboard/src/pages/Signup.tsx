@@ -796,11 +796,12 @@ export default function Signup({ initialTab = "signup" }: { initialTab?: "login"
                   </div>
                 );
               })}
-              {/* Forgot password? — links to the dedicated /forgot-password
-                  page (was previously an inline POST + state machine on
-                  this tab). The page handles the same /auth/forgot-password
-                  endpoint and shows its own success/error states. */}
-              <div style={{ textAlign: "right", marginTop: "-4px", marginBottom: "14px" }}>
+              {/* Forgot password? / Forgot email? — both link to dedicated
+                  pages. Forgot password was previously an inline POST +
+                  state machine on this tab; Forgot email is new and routes
+                  to the help-recover-account support intake. Both pages
+                  handle their own success/error states. */}
+              <div style={{ textAlign: "right", marginTop: "-4px", marginBottom: "14px", display: "flex", justifyContent: "flex-end", gap: "12px" }}>
                 <Link
                   href="/forgot-password"
                   style={{
@@ -811,6 +812,18 @@ export default function Signup({ initialTab = "signup" }: { initialTab?: "login"
                   }}
                 >
                   Forgot password?
+                </Link>
+                <span style={{ fontSize: "12.5px", color: "#cbd5e1" }}>·</span>
+                <Link
+                  href="/forgot-username"
+                  style={{
+                    fontSize: "12.5px",
+                    color: "#2E75B6",
+                    fontWeight: 500,
+                    textDecoration: "none",
+                  }}
+                >
+                  Forgot email?
                 </Link>
               </div>
               <button onClick={handleLogin} disabled={loading} style={{ width: "100%", padding: "11px", background: loading ? "#94a3b8" : "#2E75B6", color: "white", border: "none", borderRadius: "10px", fontSize: "15px", fontWeight: 600, cursor: loading ? "not-allowed" : "pointer" }}>

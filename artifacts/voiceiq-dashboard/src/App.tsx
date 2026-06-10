@@ -46,6 +46,7 @@ import ActivateAccount from "./pages/ActivateAccount";
 import SmsOptInPage from "./pages/SmsOptInPage";
 import VerifyEmail from "./pages/VerifyEmail";
 import ForgotPassword from "./pages/ForgotPassword";
+import ForgotUsername from "./pages/ForgotUsername";
 import ResetPassword from "./pages/ResetPassword";
 import EmailVerificationScreen from "./components/EmailVerificationScreen";
 // Sprint 5 Alex Phase 2: floating chat widget mounted at App level so a
@@ -761,6 +762,10 @@ function App() {
             is bookmarkable, shareable, and consistent with
             /reset-password. Public, outside AuthGuard. */}
         <Route path="/forgot-password" component={ForgotPassword} />
+        {/* "I forgot which email I signed up with" — manual support
+            intake. POSTs to /api/auth/help-recover-account which audit-
+            logs + emails the support inbox. Public, outside AuthGuard. */}
+        <Route path="/forgot-username" component={ForgotUsername} />
         {/* Public landing for Supabase Auth recovery redirect. The
             recovery email's link sends users to /reset-password with the
             access_token in the URL fragment — page reads it client-side,

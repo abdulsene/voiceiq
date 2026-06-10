@@ -45,6 +45,19 @@ export const authResetPasswordSchema = z.object({
   new_password: z.string().min(8).max(128),
 });
 
+// "I forgot the email I signed up with" support intake. business_phone is
+// deliberately permissive on shape (US-formatted, E.164, with or without
+// dashes/parens) — the route handler normalizes to a digits-only key before
+// querying. business_name lets us catch typos via ILIKE. contact_email is
+// required because by definition the user has lost access to the original
+// account email; we need an alternate channel.
+export const helpRecoverAccountSchema = z.object({
+  business_name: z.string().trim().min(1).max(200),
+  business_phone: z.string().trim().regex(/^[\d\s\-().+]+$/).min(7).max(20),
+  contact_email: z.string().email().max(255),
+  details: z.string().max(500).optional(),
+});
+
 export const authSignupSchema = z.object({
   email: z.string().email().max(255),
   password: z.string().min(8).max(128),

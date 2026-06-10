@@ -6,7 +6,7 @@ import { requireAuth } from "../middlewares/auth";
 import { createAgentForBusiness } from "../agents";
 import { sendSMS } from "../sms";
 import { auditLog, extractRequestMeta } from "../middlewares/audit";
-import { validate, authLoginSchema, authSignupSchema, authForgotPasswordSchema, authResetPasswordSchema } from "../middlewares/validate";
+import { validate, authLoginSchema, authSignupSchema, authForgotPasswordSchema, authResetPasswordSchema, helpRecoverAccountSchema } from "../middlewares/validate";
 import { OBJECTION_TEMPLATES } from "../objectionTemplates";
 import { buildSystemPrompt, fetchIndustryTemplate, fetchObjectionHandlers } from "./api";
 import { scrapeWebsite, type ScrapedData } from "../scraping";
@@ -340,6 +340,132 @@ router.post("/auth/reset-password", validate(authResetPasswordSchema), async (re
     Sentry.captureException(err, { extra: { route: "/auth/reset-password" } });
     res.status(500).json({ error: "An unexpected error occurred" });
   }
+});
+
+// PUBLIC — bypass-listed in app.ts AUTH_BYPASS_PATTERNS. The user has
+// forgotten which email they signed up with, so there's no account email
+// to recover via Supabase's resetPasswordForEmail flow. We collect business
+// identifying info + a fresh contact email, attempt a best-effort lookup
+// against business_configs, and email the support inbox so a human can
+// follow up. Always returns 204 (anti-enumeration AND lets us fail
+// gracefully on Resend hiccups without leaking infra state to the form).
+router.post("/auth/help-recover-account", validate(helpRecoverAccountSchema), async (req: Request, res: Response) => {
+  const { business_name, business_phone, contact_email, details } = req.body as {
+    business_name: string;
+    business_phone: string;
+    contact_email: string;
+    details?: string;
+  };
+  const supabase = getSupabaseAdmin();
+  const meta = extractRequestMeta(req);
+
+  // Normalize the phone to a digits-only string. For US numbers we then
+  // key on the last 10 digits, which matches both +1AAANNNNNNN (E.164) and
+  // bare (AAA)NNN-NNNN inputs. Anything shorter than 7 digits is too noisy
+  // to query.
+  const digitsOnly = business_phone.replace(/\D/g, "");
+  const phoneKey = digitsOnly.length >= 10 ? digitsOnly.slice(-10) : digitsOnly;
+
+  // Best-effort matched-user lookup. Two narrow queries (one per column)
+  // and merge in JS. Server-side filter trims candidates to a small set so
+  // we don't pull the whole business_configs table just to phone-match.
+  let matchedEmail: string | null = null;
+  let matchedBusinessId: string | null = null;
+  try {
+    const { data: byName } = await supabase
+      .from("business_configs")
+      .select("business_id, business_name, email, phone_number")
+      .ilike("business_name", `%${business_name}%`)
+      .limit(25);
+
+    const { data: byPhone } = phoneKey.length >= 7
+      ? await supabase
+          .from("business_configs")
+          .select("business_id, business_name, email, phone_number")
+          .ilike("phone_number", `%${phoneKey}%`)
+          .limit(25)
+      : { data: [] as any[] };
+
+    const candidates = [...(byName || []), ...(byPhone || [])];
+    // Prefer a candidate whose phone digits exactly match the last 10 of
+    // the submitted phone (strongest signal). Falls back to the first
+    // name-match if no phone match lands.
+    const phoneMatch = candidates.find((c) => {
+      const candDigits = (c.phone_number || "").replace(/\D/g, "");
+      return phoneKey.length >= 10 && candDigits.endsWith(phoneKey);
+    });
+    const winner = phoneMatch || candidates[0];
+    if (winner) {
+      matchedEmail = winner.email || null;
+      matchedBusinessId = winner.business_id || null;
+    }
+  } catch (err: any) {
+    // Lookup is best-effort; a DB hiccup shouldn't block the support email.
+    Sentry.captureException(err, { extra: { route: "/auth/help-recover-account", phase: "lookup" } });
+  }
+
+  await auditLog({
+    action: "auth.help_recover_account.requested",
+    ...meta,
+    details: {
+      business_name,
+      business_phone,
+      contact_email,
+      matched_business_id: matchedBusinessId,
+      matched_email: matchedEmail,
+    },
+  });
+
+  // Ship the intake email to support. From-address mirrors the call-summary
+  // mailer style; uses noreply@neverr.ai so replies don't bounce into a
+  // mailbox nobody monitors.
+  const supportInbox = process.env.SUPPORT_INBOX_EMAIL || "abdul.sene@gtacfinance.com";
+  try {
+    const resendKey = process.env.RESEND_API_KEY;
+    if (!resendKey) {
+      // Dev/preview env without Resend wired up — the audit log above is
+      // the durable record. Don't pretend we delivered anything; just log.
+      console.log("[help-recover-account] RESEND_API_KEY not set, support email skipped");
+    } else {
+      const { Resend } = await import("resend");
+      const resend = new Resend(resendKey);
+      const esc = (s: string) =>
+        s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+      const html = `
+<!DOCTYPE html><html><body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#F8FAFC;margin:0;padding:32px 16px;">
+  <div style="max-width:560px;margin:0 auto;background:white;border-radius:12px;padding:24px;border:1px solid #E2E8F0;">
+    <h2 style="margin:0 0 8px;color:#1B2537;font-size:18px;">Account-recovery help request</h2>
+    <p style="margin:0 0 16px;color:#64748B;font-size:13px;">A customer can't log in because they forgot which email they used. Reach back out within 24 hours.</p>
+    <table style="width:100%;border-collapse:collapse;font-size:14px;color:#1B2537;">
+      <tr><td style="padding:6px 0;color:#64748B;width:40%;">Business name</td><td style="padding:6px 0;font-weight:600;">${esc(business_name)}</td></tr>
+      <tr><td style="padding:6px 0;color:#64748B;">Business phone</td><td style="padding:6px 0;font-weight:600;">${esc(business_phone)}</td></tr>
+      <tr><td style="padding:6px 0;color:#64748B;">Contact email</td><td style="padding:6px 0;font-weight:600;"><a href="mailto:${esc(contact_email)}">${esc(contact_email)}</a></td></tr>
+      <tr><td style="padding:6px 0;color:#64748B;vertical-align:top;">Details</td><td style="padding:6px 0;">${esc(details || "(none)")}</td></tr>
+      <tr><td style="padding:6px 0;color:#64748B;">Submitted</td><td style="padding:6px 0;">${new Date().toISOString()}</td></tr>
+      <tr><td style="padding:6px 0;color:#64748B;">Source IP</td><td style="padding:6px 0;">${esc(meta.ipAddress || "unknown")}</td></tr>
+    </table>
+    <hr style="border:none;border-top:1px solid #E2E8F0;margin:16px 0;" />
+    <h3 style="margin:0 0 8px;color:#1B2537;font-size:15px;">Best-effort match</h3>
+    ${matchedEmail
+      ? `<p style="margin:0;color:#1B2537;font-size:14px;">Likely account: <strong>${esc(matchedEmail)}</strong>${matchedBusinessId ? ` (business_id: ${esc(matchedBusinessId)})` : ""}</p>`
+      : `<p style="margin:0;color:#94A3B8;font-size:14px;">No business_configs row matched on name or phone.</p>`}
+  </div>
+</body></html>`;
+      await resend.emails.send({
+        from: "Neverr Support <noreply@neverr.ai>",
+        to: supportInbox,
+        replyTo: contact_email,
+        subject: `Account recovery request — ${business_name}`,
+        html,
+      });
+    }
+  } catch (err: any) {
+    // Resend itself failed — Sentry it but DON'T 500 the form. The audit log
+    // above means the request is recoverable manually.
+    Sentry.captureException(err, { extra: { route: "/auth/help-recover-account", phase: "resend" } });
+  }
+
+  res.status(204).end();
 });
 
 router.post("/auth/refresh", async (req: Request, res: Response) => {
