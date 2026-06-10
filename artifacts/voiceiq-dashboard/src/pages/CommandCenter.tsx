@@ -39,6 +39,20 @@ import {
   ShieldAlert,
 } from "lucide-react";
 
+// Internal QA numbers that should never count toward customer-facing
+// metrics. Abdul's test phone (+12025732022) called into EZ Rentals'
+// receptionist three times on 2026-06-04 to validate the agent; those
+// calls dragged the customer's AI Score to "44 F" and front-paged a
+// scary, meaningless grade. Filter test numbers out of the scoring
+// path. Calls are still visible in the call list — only score is gated.
+const TEST_CALLER_PHONES = new Set([
+  "+12025732022",
+]);
+// Below this volume of real (non-test) calls, the score is too volatile
+// to surface — a single missed call swings the grade two letters. Show
+// a placeholder until the customer has enough signal.
+const SCORE_MIN_CALLS = 10;
+
 function calculateNeverrScore(calls: any[]) {
   const emptyFactors = [
     { name: "Answer Rate", value: 0, max: 20, pct: 0 },
@@ -428,7 +442,14 @@ export default function CommandCenter() {
   const apptsMonth = callsThisMonth.filter((c) => c.call_outcome?.includes("book") || c.call_outcome?.includes("appoint")).length;
   const openActions = calls.filter((c) => c.follow_up_required && c.status !== "completed").length;
 
-  const scoreData = calculateNeverrScore(callsLast30);
+  // Scoring uses only non-test calls. Two things change:
+  //   1. score is computed from real customer calls (no F-drag from QA).
+  //   2. the panel is gated on nonTestCallsLast30.length, not score, so
+  //      we don't keep showing a meaningless grade on tiny samples.
+  const nonTestCallsLast30 = callsLast30.filter(
+    (c) => !TEST_CALLER_PHONES.has(c.caller_number)
+  );
+  const scoreData = calculateNeverrScore(nonTestCallsLast30);
 
   const roiCallCount = callsLast30.length;
   const roiSavingsAmount = Math.round(roiCallCount * 8.35);
@@ -525,8 +546,22 @@ export default function CommandCenter() {
       )}
 
       {(() => {
-        const { score } = scoreData;
-        if (score <= 0) return null;
+        // Gate on volume of non-test calls, not on score. Below the
+        // minimum, the panel is replaced with a small placeholder so the
+        // customer knows WHY the score is missing instead of seeing a
+        // F-grade on three QA calls. The placeholder is intentionally
+        // unstyled gauge-free — no half-empty ring, no fake percentages.
+        if (nonTestCallsLast30.length < SCORE_MIN_CALLS) {
+          return (
+            <div className="bg-slate-50 border border-slate-200 rounded-xl p-4 mb-5 flex items-center gap-3">
+              <Award className="w-5 h-5 text-slate-400 shrink-0" />
+              <p className="text-xs text-slate-600 leading-relaxed">
+                Your AI Score will appear after {SCORE_MIN_CALLS}+ calls — currently {nonTestCallsLast30.length}.
+                Keep handling calls and check back soon.
+              </p>
+            </div>
+          );
+        }
         return (
           <div className={`${colors.bg} border ${colors.border} rounded-xl p-5 mb-5`}>
             <div className="flex flex-col md:flex-row items-center gap-6">
