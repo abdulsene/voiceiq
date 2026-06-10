@@ -16,6 +16,7 @@ import {
   Briefcase,
   Clapperboard,
   Shield,
+  Bot,
 } from "lucide-react";
 // Sprint 1 BUG-17 sub-step 3f: removed import of OnboardingWizard. The
 // in-sidebar "Start Setup" / "New Business" buttons used to open it and
@@ -47,6 +48,11 @@ type NavItem = {
 
 const navItems: NavItem[] = [
   { path: "/dashboard", labelKey: "nav.commandCenter", icon: LayoutDashboard },
+  // /settings/ai → AiSettingsPage (voice + prompt + history tabs). Surfaced
+  // here so customers don't have to dig through Settings to find their AI
+  // configuration. Placed directly under Command Center so it reads as a
+  // first-class daily-driver feature, not a "deep settings" item.
+  { path: "/settings/ai", labelKey: "nav.myReceptionist", icon: Bot },
   { path: "/calls", labelKey: "nav.callsLeads", icon: Phone },
   { path: "/contacts", labelKey: "nav.contacts", icon: Users },
   { path: "/appointments", labelKey: "nav.appointments", icon: Calendar },

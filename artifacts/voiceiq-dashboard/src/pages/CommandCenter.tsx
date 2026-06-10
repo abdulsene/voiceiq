@@ -1,4 +1,5 @@
 import { useEffect, useState, useCallback } from "react";
+import { Link } from "wouter";
 import { useTranslation } from "react-i18next";
 import { getCallStats, getRecentCalls, getActionItems, callOutbound, sendSms, getLocationStats, getSurveyFollowups, getProfiles } from "../lib/api";
 import UsageSummary from "../components/UsageSummary";
@@ -555,6 +556,26 @@ export default function CommandCenter() {
           </div>
         );
       })()}
+
+      {/* "Customize your receptionist" quick-action — always visible so
+          AiSettingsPage is discoverable from the dashboard regardless of
+          call volume. Matches the gradient affordance used for the
+          "Your AI receptionist is active" empty state above; uses Link
+          (not <a>) so wouter intercepts the navigation instead of doing
+          a full reload. */}
+      <Link
+        href="/settings/ai"
+        className="bg-gradient-to-r from-[#2E75B6]/5 to-emerald-50 border border-[#2E75B6]/10 rounded-xl p-5 mb-5 flex items-center gap-4 hover:shadow-md transition-shadow cursor-pointer"
+      >
+        <div className="w-12 h-12 rounded-xl bg-[#2E75B6]/10 flex items-center justify-center shrink-0">
+          <Bot className="w-6 h-6 text-[#2E75B6]" />
+        </div>
+        <div className="flex-1">
+          <h3 className="text-sm font-semibold text-gray-900">Customize your receptionist</h3>
+          <p className="text-xs text-gray-500 mt-0.5">Tune your AI's voice, prompts, and conversation style.</p>
+        </div>
+        <ArrowUpRight className="w-5 h-5 text-[#2E75B6] shrink-0" />
+      </Link>
 
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-5">
         {statCards.map((card) => {
