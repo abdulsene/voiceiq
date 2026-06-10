@@ -133,7 +133,10 @@ export default function Terms() {
 
       <footer className="bg-[#1B2537] py-8 px-6">
         <div className="max-w-4xl mx-auto flex flex-col md:flex-row items-center justify-between gap-4">
-          <img src={`${import.meta.env.BASE_URL}neverr-logo.png`} alt="Neverr" className="h-6 brightness-0 invert" />
+          {/* Text wordmark — the public PNG lacks an alpha channel so
+              brightness-0 invert turns it into a solid white block on
+              the dark footer. See Sidebar.tsx for the same fix. */}
+          <span className="text-white font-bold text-base tracking-tight">Neverr</span>
           <div className="flex items-center gap-6 text-xs text-gray-400">
             <Link href="/privacy" className="hover:text-gray-200 transition-colors">Privacy Policy</Link>
             <span className="text-gray-500">Terms of Service</span>

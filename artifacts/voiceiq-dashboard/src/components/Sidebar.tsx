@@ -127,8 +127,16 @@ export default function Sidebar() {
   return (
     <aside className="hidden md:flex w-[220px] bg-[#1B2537] min-h-screen flex-col shrink-0 fixed left-0 top-0 z-40">
         <div className="px-5 py-5 flex items-center justify-between border-b border-white/10">
-          <div className="flex items-center">
-            <img src={`${import.meta.env.BASE_URL}neverr-logo.png`} alt="Neverr" className="h-9 brightness-0 invert" />
+          <div className="flex items-center h-9">
+            {/* Text wordmark fallback. The previous render was
+                <img src="/neverr-logo.png" className="brightness-0 invert" />
+                but public/neverr-logo.png is an RGB-only PNG (no alpha
+                channel) — brightness-0 forces every pixel black, invert
+                flips it to white, and the result is a solid white
+                rectangle (the "empty white box" customers reported). A
+                text wordmark renders reliably on the #1B2537 sidebar
+                background without depending on image post-processing. */}
+            <span className="text-white font-bold text-xl tracking-tight">Neverr</span>
           </div>
         </div>
 
