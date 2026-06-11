@@ -265,6 +265,72 @@ async function main() {
         record("T6 disable preserves phone", true, "enabled=false, phone retained");
       }
     }
+
+    // ----- T7: toggle-bug PUT-shape regression (Commit 1.3) -----
+    // The redesigned TransferTab — after the customer flips the toggle ON
+    // for the first time and clicks Save — generates a PUT body of the
+    // shape below. The original bug report ("clicking the toggle does
+    // nothing") had multiple suspects; this test pins down the SERVER
+    // contract so a future refactor that regresses the body shape will
+    // fail loudly here rather than silently breaking the form again.
+    //
+    // What the new tab sends on first-enable + Save:
+    //   {
+    //     transfer_enabled: true,
+    //     transfer_to_phone: "+14105557777",   // normalized to E.164 client-side
+    //     transfer_conditions: "<seeded default>",
+    //     transfer_wait_message: "<seeded default>",
+    //     transfer_warm_message: "<seeded default>",
+    //   }
+    //
+    // Asserts: server accepts the shape, returns the canonical row with
+    // transfer_enabled === true, and the row has all four seeded fields
+    // populated (none null).
+    {
+      // Reset to a clean disabled baseline so this is genuinely the
+      // "first enable" path the redesigned UI exercises.
+      await supa.from("business_configs").update({
+        transfer_enabled: false,
+        transfer_to_phone: null,
+        transfer_conditions: null,
+        transfer_wait_message: null,
+        transfer_warm_message: null,
+      }).eq("business_id", businessId);
+
+      // Fetch defaults so the test sends what the UI would send (the UI
+      // seeds the textareas from defaults on toggle-on).
+      const beforeGet = await getTransfer();
+      const beforeBody = beforeGet.body as GetResp;
+      const defaults = beforeBody.defaults;
+      if (!defaults || !defaults.transfer_conditions) {
+        record("T7 toggle-on first-save shape", false, "no defaults from GET to seed test payload");
+      } else {
+        const put = await putTransfer({
+          transfer_enabled: true,
+          transfer_to_phone: KNOWN_DESTINATION,
+          transfer_conditions: defaults.transfer_conditions,
+          transfer_wait_message: defaults.transfer_wait_message,
+          transfer_warm_message: defaults.transfer_warm_message,
+        });
+        const ok = put.body as {
+          success: boolean;
+          transfer_enabled: boolean;
+          transfer_to_phone: string | null;
+          transfer_conditions: string | null;
+          transfer_wait_message: string | null;
+          transfer_warm_message: string | null;
+        };
+        if (put.http !== 200 || !ok.success) {
+          record("T7 toggle-on first-save shape", false, `http=${put.http} body=${put.text.slice(0, 200)}`);
+        } else if (ok.transfer_enabled !== true) {
+          record("T7 toggle-on first-save shape", false, `transfer_enabled not true: ${JSON.stringify(ok)}`);
+        } else if (!ok.transfer_to_phone || !ok.transfer_conditions || !ok.transfer_wait_message || !ok.transfer_warm_message) {
+          record("T7 toggle-on first-save shape", false, `null field on canonical row: ${JSON.stringify(ok)}`);
+        } else {
+          record("T7 toggle-on first-save shape", true, "PUT shape accepted, all 4 transfer fields populated on canonical row");
+        }
+      }
+    }
   } finally {
     // Restore the original snapshot so we don't permanently mutate the
     // test business's state.
