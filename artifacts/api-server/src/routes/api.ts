@@ -423,114 +423,197 @@ router.post("/lead", async (req: Request, res: Response) => {
 
   if (body.type === "conversation_post_call_transcription" || body.type === "post_call_transcription" || body.conversation_id || body.data?.conversation_id) {
     console.log("[Lead] Detected ElevenLabs post-call webhook format");
-    const convData = body.data || body;
-    const conversationId = convData.conversation_id || body.conversation_id;
-    const transcriptArr = convData.transcript || body.transcript || [];
-    const metadata = convData.metadata || body.metadata || {};
-    const analysis = convData.analysis || body.analysis || {};
+    // P0 incident 2026-06-10: this entire branch silently swallowed
+    // insert failures — destructured supabase `{ data, error }` was
+    // only logged to stdout (no Sentry, no retry, no 5xx). EZ Rentals
+    // (biz_1779288494109_z4z979) lost a real customer call because the
+    // polling sync raced ahead and inserted the same call_sid first;
+    // the post-call insert then 23505'd silently while the handler
+    // still returned `success: true` to ElevenLabs. Now wrapped in
+    // try/catch with Sentry + 5xx response on real errors. The UNIQUE
+    // conflict case (23505) is intercepted specifically — that means
+    // the row already exists from polling sync, so 200 OK is honest
+    // (no point asking ElevenLabs to retry data that's already there).
+    let postCallConversationId: string | null = null;
+    let postCallBusinessId: string | null = null;
+    try {
+      const convData = body.data || body;
+      const conversationId = convData.conversation_id || body.conversation_id;
+      postCallConversationId = conversationId || null;
+      const transcriptArr = convData.transcript || body.transcript || [];
+      const metadata = convData.metadata || body.metadata || {};
+      const analysis = convData.analysis || body.analysis || {};
 
-    const transcriptTextRaw = Array.isArray(transcriptArr)
-      ? transcriptArr.map((t: any) => (t.role === "agent" ? "AI" : "Caller") + ": " + (t.message || t.text || "")).join("\n")
-      : "";
+      const transcriptTextRaw = Array.isArray(transcriptArr)
+        ? transcriptArr.map((t: any) => (t.role === "agent" ? "AI" : "Caller") + ": " + (t.message || t.text || "")).join("\n")
+        : "";
 
-    // Resolve which business this conversation belongs to via the
-    // ElevenLabs agent_id. Defensive multi-path read because the
-    // payload shape has shifted historically.
-    const agentId = convData.agent_id || body.agent_id || metadata.agent_id || null;
-    const businessId = await resolveBusinessFromAgentId(supabase, agentId, "Lead");
+      // Resolve which business this conversation belongs to via the
+      // ElevenLabs agent_id. Defensive multi-path read because the
+      // payload shape has shifted historically.
+      const agentId = convData.agent_id || body.agent_id || metadata.agent_id || null;
+      const businessId = await resolveBusinessFromAgentId(supabase, agentId, "Lead");
+      postCallBusinessId = businessId;
 
-    // Pipe through PII redaction BEFORE the row is built. Operational
-    // PII columns (caller_name / caller_number below) stay raw — only
-    // the free-text transcript is redacted.
-    const piiSummary = await redactCallTranscript(transcriptTextRaw, {
-      businessId,
-      source: "lead",
-      conversationId,
-    });
-    const transcriptText = piiSummary.redactedText;
+      // Pipe through PII redaction BEFORE the row is built. Operational
+      // PII columns (caller_name / caller_number below) stay raw — only
+      // the free-text transcript is redacted.
+      const piiSummary = await redactCallTranscript(transcriptTextRaw, {
+        businessId,
+        source: "lead",
+        conversationId,
+      });
+      const transcriptText = piiSummary.redactedText;
 
-    const dataResults = analysis.data_collection_results || {};
-    const callerName = dataResults.caller_name?.value || metadata.caller_name || null;
-    // callerPhone resolution: Claude's transcript-extracted value remains
-    // primary (it's the customer's *stated* callback number, which may
-    // differ from caller-ID in spoofed-caller scenarios). New fallbacks
-    // surface the ElevenLabs caller-ID metadata when transcript
-    // extraction returns null. The legacy `metadata.phone_number` path
-    // is kept at the end of the chain — it doesn't appear in current
-    // ElevenLabs payloads but stays as defense against future shape
-    // shifts back to a flat layout.
-    const callerPhone = dataResults.caller_phone?.value
-      || convData.metadata?.phone_call?.external_number
-      || convData.user_id
-      || metadata.phone_number
-      || null;
-    const reason = dataResults.reason?.value || null;
-    const duration = metadata.call_duration_secs || convData.call_duration_secs || 0;
-    const startUnix = metadata.start_time_unix_secs;
-    const startTime = startUnix ? new Date(startUnix * 1000).toISOString() : new Date().toISOString();
+      const dataResults = analysis.data_collection_results || {};
+      const callerName = dataResults.caller_name?.value || metadata.caller_name || null;
+      // callerPhone resolution: Claude's transcript-extracted value remains
+      // primary (it's the customer's *stated* callback number, which may
+      // differ from caller-ID in spoofed-caller scenarios). New fallbacks
+      // surface the ElevenLabs caller-ID metadata when transcript
+      // extraction returns null. The legacy `metadata.phone_number` path
+      // is kept at the end of the chain — it doesn't appear in current
+      // ElevenLabs payloads but stays as defense against future shape
+      // shifts back to a flat layout.
+      const callerPhone = dataResults.caller_phone?.value
+        || convData.metadata?.phone_call?.external_number
+        || convData.user_id
+        || metadata.phone_number
+        || null;
+      const reason = dataResults.reason?.value || null;
+      const duration = metadata.call_duration_secs || convData.call_duration_secs || 0;
+      const startUnix = metadata.start_time_unix_secs;
+      const startTime = startUnix ? new Date(startUnix * 1000).toISOString() : new Date().toISOString();
 
-    let savedId: string | null = null;
+      let savedId: string | null = null;
 
-    const { data: existing } = await supabase
-      .from("calls")
-      .select("id")
-      .eq("business_id", businessId)
-      .eq("caller_number", callerPhone || "")
-      .gte("created_at", new Date(Date.now() - 5 * 60 * 1000).toISOString())
-      .order("created_at", { ascending: false })
-      .limit(1)
-      .single();
-
-    if (existing) {
-      console.log("[Lead] Found existing tool-call record:", existing.id, "— updating with transcript");
-      const { error } = await supabase
+      const { data: existing } = await supabase
         .from("calls")
-        .update({
-          call_sid: conversationId,
-          transcript: transcriptText || null,
-          duration_seconds: duration,
-          start_time: startTime,
-          lead_data: body,
-        })
-        .eq("id", existing.id);
-      savedId = existing.id;
-      console.log("[Lead] Updated:", existing.id, error?.message);
-    } else {
-      const { data: saved, error } = await supabase
-        .from("calls")
-        .insert([{
-          call_sid: conversationId,
-          business_id: businessId,
-          caller_name: callerName,
-          caller_number: callerPhone,
-          caller_intent: reason,
-          summary: reason || "Call via ElevenLabs",
-          transcript: transcriptText || null,
-          status: "completed",
-          call_outcome: "lead_captured",
-          follow_up_required: true,
-          direction: "inbound",
-          start_time: startTime,
-          end_time: new Date().toISOString(),
-          duration_seconds: duration,
-          lead_data: body,
-        }])
-        .select()
+        .select("id")
+        .eq("business_id", businessId)
+        .eq("caller_number", callerPhone || "")
+        .gte("created_at", new Date(Date.now() - 5 * 60 * 1000).toISOString())
+        .order("created_at", { ascending: false })
+        .limit(1)
         .single();
-      savedId = saved?.id || null;
-      console.log("[Lead] Post-call inserted:", saved?.id, error?.message);
+
+      if (existing) {
+        console.log("[Lead] Found existing tool-call record:", existing.id, "— updating with transcript");
+        const { error: updateErr } = await supabase
+          .from("calls")
+          .update({
+            call_sid: conversationId,
+            transcript: transcriptText || null,
+            duration_seconds: duration,
+            start_time: startTime,
+            lead_data: body,
+          })
+          .eq("id", existing.id);
+        if (updateErr) {
+          Sentry.captureMessage("lead_post_call_update_failed", {
+            level: "error",
+            extra: {
+              error_message: updateErr.message,
+              error_code: (updateErr as any).code,
+              error_details: (updateErr as any).details,
+              conversationId,
+              businessId,
+              existing_row_id: existing.id,
+            },
+          });
+          res.status(500).json({ success: false, error: "ingest_failed" });
+          return;
+        }
+        savedId = existing.id;
+        console.log("[Lead] Updated:", existing.id);
+      } else {
+        // UPSERT instead of INSERT — calls_call_sid_key UNIQUE constraint
+        // (verified via pg_indexes) means a concurrent polling-sync
+        // insert with the same conversation_id would 23505 a plain
+        // INSERT. Keying onConflict to call_sid lets the upsert harmlessly
+        // overwrite the polling-sync row with our richer post-call data
+        // (lead_data, caller_intent, summary, etc.). 23505 should NOT
+        // surface from upsert in practice; the explicit short-circuit
+        // below is belt-and-suspenders.
+        const { data: saved, error: insertErr } = await supabase
+          .from("calls")
+          .upsert([{
+            call_sid: conversationId,
+            business_id: businessId,
+            caller_name: callerName,
+            caller_number: callerPhone,
+            caller_intent: reason,
+            summary: reason || "Call via ElevenLabs",
+            transcript: transcriptText || null,
+            status: "completed",
+            call_outcome: "lead_captured",
+            follow_up_required: true,
+            direction: "inbound",
+            start_time: startTime,
+            end_time: new Date().toISOString(),
+            duration_seconds: duration,
+            lead_data: body,
+          }], { onConflict: "call_sid" })
+          .select()
+          .single();
+
+        if (insertErr) {
+          // 23505 = unique_violation. Means polling sync already wrote
+          // this conversation_id. Data IS captured — don't ask ElevenLabs
+          // to retry. Sentry breadcrumb (not error) so the rate is still
+          // observable.
+          if ((insertErr as any).code === "23505") {
+            Sentry.addBreadcrumb({
+              category: "lead.upsert",
+              level: "info",
+              message: "duplicate_call_sid_polling_sync_won",
+              data: { conversationId, businessId },
+            });
+            res.json({ success: true, duplicate: true });
+            return;
+          }
+          Sentry.captureMessage("lead_post_call_insert_failed", {
+            level: "error",
+            extra: {
+              error_message: insertErr.message,
+              error_code: (insertErr as any).code,
+              error_details: (insertErr as any).details,
+              conversationId,
+              businessId,
+              payload_keys: Object.keys(body || {}),
+              transcript_len: (transcriptText || "").length,
+            },
+          });
+          res.status(500).json({ success: false, error: "ingest_failed" });
+          return;
+        }
+        savedId = saved?.id || null;
+        console.log("[Lead] Post-call upserted:", saved?.id);
+      }
+
+      trackCallUsage(businessId, duration);
+
+      if (transcriptText && savedId) {
+        analyzeWithClaude(transcriptText, businessId)
+          .then((a) => { if (a && supabase) saveAnalysis(supabase, savedId!, a, businessId); })
+          .catch((err) => console.error("[Lead] Claude error:", err));
+      }
+
+      res.json({ success: true, callId: savedId });
+      return;
+    } catch (err: any) {
+      Sentry.captureException(err, {
+        extra: {
+          route: "/api/lead",
+          branch: "post_call",
+          conversationId: postCallConversationId,
+          businessId: postCallBusinessId,
+          payload_keys: Object.keys(body || {}),
+        },
+      });
+      res.status(500).json({ success: false, error: "ingest_failed" });
+      return;
     }
-
-    trackCallUsage(businessId, duration);
-
-    if (transcriptText && savedId) {
-      analyzeWithClaude(transcriptText, businessId)
-        .then((a) => { if (a && supabase) saveAnalysis(supabase, savedId!, a, businessId); })
-        .catch((err) => console.error("[Lead] Claude error:", err));
-    }
-
-    res.json({ success: true, callId: savedId });
-    return;
   }
 
   console.log("[Lead] Detected tool-call / direct format");
@@ -539,61 +622,114 @@ router.post("/lead", async (req: Request, res: Response) => {
     "CALL SUMMARY\n============\n\n" + summary +
     "\n\nNEXT STEPS\n==========\n" + (body.next_steps || "Follow up with caller");
 
+  // Respond to the agent immediately — keeping the original fast-ack
+  // pattern. DB write + business_id resolution + SMS happen async after
+  // the response.
   res.json({
     success: true,
     message: "Thank you " + (body.caller_name || "caller") + ", your information has been saved.",
   });
 
-  supabase
-    .from("calls")
-    .insert([{
-      business_id: "demo-business",
-      caller_name: body.caller_name,
-      caller_number: body.caller_phone,
-      caller_intent: body.reason,
-      summary: summary,
-      transcript: transcript,
-      status: "completed",
-      call_outcome: "lead_captured",
-      follow_up_required: true,
-      direction: "inbound",
-      start_time: new Date().toISOString(),
-      end_time: new Date().toISOString(),
-      duration_seconds: body.duration || 60,
-      lead_data: body,
-    }])
-    .select()
-    .single()
-    .then(({ data, error }: any) => {
-      console.log("[Lead] Tool-call saved:", data?.id, error?.message);
-      trackCallUsage("demo-business", body.duration || 60);
+  // Finishing the e21bb32 tenant-routing fix (Sprint 2.1) that the
+  // post-call branch got but this branch missed. Three changes:
+  //   1. business_id resolved from agent_id (was hardcoded
+  //      "demo-business") so post-call notifications, usage tracking,
+  //      and dashboard attribution land on the right tenant.
+  //   2. call_sid populated from body.conversation_id (or synthetic
+  //      `toolcall_` prefix) so the polling sync can dedupe. Previously
+  //      this branch inserted call_sid=NULL rows that polling sync
+  //      couldn't recognize and re-inserted moments later — the
+  //      "conversation_id=NULL partial data capture" symptom in the
+  //      P0 evidence.
+  //   3. UNIQUE conflict (23505) is now a Sentry breadcrumb, not a
+  //      silent log — matches the post-call branch posture.
+  (async () => {
+    const toolCallAgentId = body.agent_id || null;
+    const toolCallBusinessId = await resolveBusinessFromAgentId(supabase, toolCallAgentId, "Lead-ToolCall");
+    const toolCallSid = body.conversation_id
+      || body.call_sid
+      || `toolcall_${Date.now()}_${crypto.randomBytes(4).toString("hex")}`;
 
-      if (body.caller_phone && body.caller_phone !== "unknown" && data?.id) {
-        supabase
-          .from("business_configs")
-          .select("business_name, phone_number")
-          .eq("business_id", "demo-business")
-          .single()
-          .then(({ data: businessConfig }: any) => {
-            const businessName = businessConfig?.business_name || "Neverr Demo Business";
-            const businessPhone = businessConfig?.phone_number || process.env.TWILIO_PHONE_NUMBER || "";
+    const { data, error } = await supabase
+      .from("calls")
+      .insert([{
+        call_sid: toolCallSid,
+        business_id: toolCallBusinessId,
+        caller_name: body.caller_name,
+        caller_number: body.caller_phone,
+        caller_intent: body.reason,
+        summary: summary,
+        transcript: transcript,
+        status: "completed",
+        call_outcome: "lead_captured",
+        follow_up_required: true,
+        direction: "inbound",
+        start_time: new Date().toISOString(),
+        end_time: new Date().toISOString(),
+        duration_seconds: body.duration || 60,
+        lead_data: body,
+      }])
+      .select()
+      .single();
 
-            const smsBody = buildPostCallSMS({
-              callerName: body.caller_name,
-              businessName,
-              outcome: body.urgency === "urgent" ? "callback_requested" : "lead_captured",
-              phoneNumber: businessPhone,
-            });
+    if (error && (error as any).code === "23505") {
+      // Polling sync already wrote this conversation_id. Not an error.
+      Sentry.addBreadcrumb({
+        category: "lead.insert.tool_call",
+        level: "info",
+        message: "duplicate_call_sid_polling_sync_won",
+        data: { toolCallSid, toolCallBusinessId },
+      });
+      return;
+    }
+    if (error) {
+      Sentry.captureMessage("lead_tool_call_insert_failed", {
+        level: "error",
+        extra: {
+          error_message: error.message,
+          error_code: (error as any).code,
+          error_details: (error as any).details,
+          businessId: toolCallBusinessId,
+          callSid: toolCallSid,
+          agentId: toolCallAgentId,
+          payload_keys: Object.keys(body || {}),
+        },
+      });
+      return;
+    }
 
-            sendSMS(body.caller_phone, smsBody)
-              .then((sent: any) => {
-                console.log("[SMS] Post-call SMS to:", body.caller_phone, "sent:", sent);
-                if (sent) trackSmsUsage("demo-business");
-              })
-              .catch((err: any) => console.error("[SMS] Error:", err));
-          });
+    console.log("[Lead] Tool-call saved:", data?.id);
+    trackCallUsage(toolCallBusinessId, body.duration || 60);
+
+    if (body.caller_phone && body.caller_phone !== "unknown" && data?.id) {
+      const { data: businessConfig } = await supabase
+        .from("business_configs")
+        .select("business_name, phone_number")
+        .eq("business_id", toolCallBusinessId)
+        .single();
+      const businessName = businessConfig?.business_name || "Neverr Demo Business";
+      const businessPhone = businessConfig?.phone_number || process.env.TWILIO_PHONE_NUMBER || "";
+
+      const smsBody = buildPostCallSMS({
+        callerName: body.caller_name,
+        businessName,
+        outcome: body.urgency === "urgent" ? "callback_requested" : "lead_captured",
+        phoneNumber: businessPhone,
+      });
+
+      try {
+        const sent = await sendSMS(body.caller_phone, smsBody);
+        console.log("[SMS] Post-call SMS to:", body.caller_phone, "sent:", sent);
+        if (sent) trackSmsUsage(toolCallBusinessId);
+      } catch (err: any) {
+        console.error("[SMS] Error:", err);
       }
-    }, (err: any) => console.error("[Lead] DB save failed:", err.message));
+    }
+  })().catch((err: any) => {
+    Sentry.captureException(err, {
+      extra: { route: "/api/lead", branch: "tool_call", agentId: body?.agent_id },
+    });
+  });
 
   if (body.caller_phone && body.caller_phone !== "unknown") {
     updateCallerMemory({
