@@ -122,6 +122,22 @@
     "warm": "Warm",
     "cold": "Cold"
   },
+  "transfer": {
+    "title": "Operator transfer",
+    "toggleLabel": "Transfer calls to a human when the AI can't answer",
+    "toggleDescription": "When enabled, your AI will forward the call to the number below if the conditions you set are met.",
+    "phoneLabel": "Operator phone number",
+    "phoneHelpPrefix": "We'll dial this number when the AI escalates. Use a number DIFFERENT from your business line.",
+    "phoneHelpSuffix": "is forwarding calls to your AI — using it here would create a call loop.",
+    "phoneFormatError": "Enter a phone number in E.164 format (e.g. +14105551234).",
+    "conditionsLabel": "When should the AI transfer?",
+    "waitLabel": "Hold message played to the caller",
+    "warmLabel": "Context summary read to you when you pick up",
+    "warmHelpAutoInsert": "We'll automatically insert your business name — write the rest.",
+    "activeStatus": "Active. Calls will route to",
+    "save": "Save",
+    "saving": "Saving..."
+  },
   "settings": {
     "title": "Settings",
     "subtitle": "Configure your AI receptionist and business preferences",

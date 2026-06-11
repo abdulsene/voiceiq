@@ -31,9 +31,13 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 
 import VoiceTab from "./AiSettings/VoiceTab";
 import PromptEditor from "./AiSettings/PromptEditor";
+import TransferTab from "./AiSettings/TransferTab";
 import HistoryViewer from "./AiSettings/HistoryViewer";
 
-type TabKey = "voice" | "prompt" | "history";
+// Order is Voice / Prompt / Transfer / History per the operator-transfer
+// spec — Transfer is more relevant than History for daily-driver use, so
+// it sits before History but after the foundational Voice + Prompt tabs.
+type TabKey = "voice" | "prompt" | "transfer" | "history";
 
 export default function AiSettingsPage() {
   const [toast, setToast] = useState<{ text: string; kind: "ok" | "err" } | null>(null);
@@ -46,7 +50,7 @@ export default function AiSettingsPage() {
   const [tab, setTab] = useState<TabKey>(() => {
     const params = new URLSearchParams(window.location.search);
     const t = params.get("tab");
-    return t === "voice" || t === "prompt" || t === "history" ? t : "voice";
+    return t === "voice" || t === "prompt" || t === "transfer" || t === "history" ? t : "voice";
   });
 
   function showToast(text: string, kind: "ok" | "err"): void {
@@ -74,6 +78,7 @@ export default function AiSettingsPage() {
         <TabsList>
           <TabsTrigger value="voice">Voice</TabsTrigger>
           <TabsTrigger value="prompt">Prompt</TabsTrigger>
+          <TabsTrigger value="transfer">Transfer</TabsTrigger>
           <TabsTrigger value="history">History</TabsTrigger>
         </TabsList>
 
@@ -89,6 +94,13 @@ export default function AiSettingsPage() {
           className="mt-6 data-[state=active]:motion-safe:animate-in data-[state=active]:motion-safe:fade-in-0 data-[state=active]:motion-safe:duration-150 data-[state=active]:motion-safe:ease-out"
         >
           <PromptEditor onToast={showToast} />
+        </TabsContent>
+
+        <TabsContent
+          value="transfer"
+          className="mt-6 data-[state=active]:motion-safe:animate-in data-[state=active]:motion-safe:fade-in-0 data-[state=active]:motion-safe:duration-150 data-[state=active]:motion-safe:ease-out"
+        >
+          <TransferTab onToast={showToast} />
         </TabsContent>
 
         <TabsContent

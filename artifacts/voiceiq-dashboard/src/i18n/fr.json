@@ -122,6 +122,22 @@
     "warm": "Tiède",
     "cold": "Froid"
   },
+  "transfer": {
+    "title": "Transfert à un opérateur",
+    "toggleLabel": "Transférer les appels à un humain quand l'IA ne peut pas répondre",
+    "toggleDescription": "Une fois activé, votre IA redirigera l'appel vers le numéro ci-dessous si les conditions définies sont remplies.",
+    "phoneLabel": "Numéro de l'opérateur",
+    "phoneHelpPrefix": "Nous composerons ce numéro lors d'une escalade. Utilisez un numéro DIFFÉRENT de votre ligne professionnelle.",
+    "phoneHelpSuffix": "redirige les appels vers votre IA — l'utiliser ici créerait une boucle.",
+    "phoneFormatError": "Saisissez un numéro au format E.164 (ex. +14105551234).",
+    "conditionsLabel": "Quand l'IA doit-elle transférer ?",
+    "waitLabel": "Message d'attente joué à l'appelant",
+    "warmLabel": "Résumé de contexte lu lorsque vous décrochez",
+    "warmHelpAutoInsert": "Nous insérerons automatiquement le nom de votre entreprise — écrivez le reste.",
+    "activeStatus": "Activé. Les appels seront acheminés vers",
+    "save": "Enregistrer",
+    "saving": "Enregistrement..."
+  },
   "settings": {
     "title": "Paramètres",
     "subtitle": "Configurez votre réceptionniste IA et les préférences de votre entreprise",

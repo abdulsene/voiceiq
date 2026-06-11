@@ -122,6 +122,22 @@
     "warm": "Tibio",
     "cold": "Frío"
   },
+  "transfer": {
+    "title": "Transferencia a operador",
+    "toggleLabel": "Transferir llamadas a una persona cuando la IA no pueda responder",
+    "toggleDescription": "Cuando se activa, tu IA reenviará la llamada al número indicado si se cumplen las condiciones que definas.",
+    "phoneLabel": "Teléfono del operador",
+    "phoneHelpPrefix": "Llamaremos a este número cuando la IA escale. Usa un número DIFERENTE del de tu negocio.",
+    "phoneHelpSuffix": "está reenviando las llamadas a tu IA — usarlo aquí crearía un bucle.",
+    "phoneFormatError": "Introduce un número en formato E.164 (ej. +14105551234).",
+    "conditionsLabel": "¿Cuándo debe transferir la IA?",
+    "waitLabel": "Mensaje de espera reproducido al llamante",
+    "warmLabel": "Resumen de contexto que escucharás al contestar",
+    "warmHelpAutoInsert": "Insertaremos automáticamente el nombre de tu negocio — escribe el resto.",
+    "activeStatus": "Activo. Las llamadas se dirigirán a",
+    "save": "Guardar",
+    "saving": "Guardando..."
+  },
   "settings": {
     "title": "Ajustes",
     "subtitle": "Configura tu recepcionista de IA y las preferencias del negocio",
