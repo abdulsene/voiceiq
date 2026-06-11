@@ -17,6 +17,7 @@ import chatTtsRouter from "./chat-tts";
 import configRouter from "./config";
 import promptRouter from "./prompt";
 import voicesRouter from "./voices";
+import transferRouter from "./transfer";
 import adminBusinessesRouter from "./admin-businesses";
 
 const router: IRouter = Router();
@@ -73,6 +74,11 @@ router.use(promptRouter);
 // Mounted BEFORE the catch-all apiRouter so /api/voices/* and the
 // /api/business/voice path are claimed here.
 router.use(voicesRouter);
+// Operator-transfer endpoints (/api/business/transfer*,
+// /api/admin/business/:id/transfer*). Mounted alongside prompt/voices —
+// same Stage 6 customer+admin parity pattern. Mounted BEFORE the
+// catch-all apiRouter so /api/business/transfer is claimed here.
+router.use(transferRouter);
 // Stage 6 Phase 1: admin override surface — list + drill-in + admin
 // voice switch. Declares paths starting with /admin/business(es) at
 // root so it doesn't collide with the catch-all adminRouter mounted
