@@ -18,6 +18,7 @@ import configRouter from "./config";
 import promptRouter from "./prompt";
 import voicesRouter from "./voices";
 import transferRouter from "./transfer";
+import leadsRouter from "./leads";
 import adminBusinessesRouter from "./admin-businesses";
 
 const router: IRouter = Router();
@@ -79,6 +80,11 @@ router.use(voicesRouter);
 // same Stage 6 customer+admin parity pattern. Mounted BEFORE the
 // catch-all apiRouter so /api/business/transfer is claimed here.
 router.use(transferRouter);
+// Leads epic Slice 1: capture (public, Bearer-secret auth) + read
+// endpoints (/api/business/leads*, /api/admin/business/:id/leads*).
+// Mounted BEFORE the catch-all apiRouter so /api/business/leads is
+// claimed here, not by the legacy /lead tool-call handler in api.ts.
+router.use(leadsRouter);
 // Stage 6 Phase 1: admin override surface — list + drill-in + admin
 // voice switch. Declares paths starting with /admin/business(es) at
 // root so it doesn't collide with the catch-all adminRouter mounted

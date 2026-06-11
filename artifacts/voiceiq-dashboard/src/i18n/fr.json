@@ -3,6 +3,7 @@
     "commandCenter": "Centre de commande",
     "myReceptionist": "Mon réceptionniste",
     "callsLeads": "Appels et prospects",
+    "leads": "Leads",
     "contacts": "Contacts",
     "appointments": "Rendez-vous",
     "sms": "SMS et campagnes",
@@ -121,6 +122,83 @@
     "hot": "Chaud",
     "warm": "Tiède",
     "cold": "Froid"
+  },
+  "leads": {
+    "listTitle": "Leads",
+    "listSubtitle": "Rappels que l'IA a capturés pour que votre équipe en assure le suivi.",
+    "unknownCaller": "Appelant inconnu",
+    "tabs": {
+      "myOpen": "Mes ouverts",
+      "unassigned": "Non attribués",
+      "all": "Tous"
+    },
+    "empty": {
+      "noLeads": "Aucun lead pour l'instant",
+      "noLeadsHint": "Lorsque l'IA capturera une demande de rappel, elle apparaîtra ici en quelques secondes. Vous pourrez aussi escalader des appels en leads depuis la vue des appels dans une prochaine mise à jour."
+    },
+    "status": {
+      "new": "Nouveau",
+      "claimed": "Pris en charge",
+      "in_progress": "En cours",
+      "resolved": "Résolu",
+      "dismissed": "Rejeté"
+    },
+    "urgency": {
+      "low": "Faible",
+      "medium": "Moyenne",
+      "high": "Élevée",
+      "emergency": "Urgence"
+    },
+    "preferredChannelExplain": {
+      "text": "L'appelant préfère être contacté par SMS.",
+      "call": "L'appelant préfère un rappel téléphonique.",
+      "email": "L'appelant préfère être contacté par e-mail.",
+      "voice_callback": "L'appelant accepte un rappel vocal automatisé initié par l'IA."
+    },
+    "relative": {
+      "justNow": "à l'instant",
+      "minutesAgo_one": "il y a {{count}} minute",
+      "minutesAgo_other": "il y a {{count}} minutes",
+      "hoursAgo_one": "il y a {{count}} heure",
+      "hoursAgo_other": "il y a {{count}} heures",
+      "daysAgo_one": "il y a {{count}} jour",
+      "daysAgo_other": "il y a {{count}} jours",
+      "monthsAgo_one": "il y a {{count}} mois",
+      "monthsAgo_other": "il y a {{count}} mois"
+    },
+    "detail": {
+      "backToList": "Retour aux leads",
+      "leadInfo": "Informations du lead",
+      "reason": "Ce dont il/elle a besoin",
+      "preferredChannel": "Comment être contacté(e)",
+      "activity": "Activité",
+      "capturedAt": "Capturé le {{when}}",
+      "actionsComingSoon": "Actions à venir — la réponse par SMS/e-mail, la prise en charge et la résolution arriveront dans la prochaine mise à jour.",
+      "notFound": "Nous n'avons pas trouvé ce lead."
+    },
+    "activity": {
+      "actor": {
+        "ai": "Réceptionniste IA",
+        "staff": "Membre de l'équipe",
+        "system": "Système"
+      },
+      "action": {
+        "captured": "Capturé par l'IA",
+        "claimed": "Pris en charge",
+        "note_added": "Note ajoutée",
+        "sms_sent": "SMS envoyé",
+        "email_sent": "E-mail envoyé",
+        "resolved": "Résolu",
+        "dismissed": "Rejeté",
+        "reopened": "Rouvert",
+        "reassigned": "Réattribué",
+        "escalated": "Escaladé"
+      },
+      "capturedDescription": "L'IA a capturé ce lead pendant un appel en direct et l'a transmis pour suivi.",
+      "linkedCallPrefix": "Source :",
+      "viewSourceCall": "Voir l'appel source →",
+      "conversationRef": "Référence de conversation :"
+    }
   },
   "transfer": {
     "title": "Transfert à un opérateur",

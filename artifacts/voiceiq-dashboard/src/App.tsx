@@ -4,6 +4,8 @@ import { ArrowRight } from "lucide-react";
 import Sidebar from "./components/Sidebar";
 import CommandCenter from "./pages/CommandCenter";
 import CallsLeads from "./pages/CallsLeads";
+import LeadsListPage from "./pages/Leads/LeadsListPage";
+import LeadDetailPage from "./pages/Leads/LeadDetailPage";
 import Contacts from "./pages/Contacts";
 import Appointments from "./pages/Appointments";
 import SmsCampaigns from "./pages/SmsCampaigns";
@@ -609,6 +611,20 @@ function DashboardLayout() {
             <Switch>
               <Route path="/dashboard" component={CommandCenter} />
               <Route path="/calls" component={CallsLeads} />
+              {/* Leads epic Slice 1: the lead detail page deep-links to
+                  /calls/:id when a source_call_id exists. CallsLeads
+                  currently renders the list view for both /calls and
+                  /calls/:id; auto-selecting the specific call from
+                  the URL param is a follow-up. Routing it here so the
+                  link lands on a real page instead of the catch-all
+                  "page not found". */}
+              <Route path="/calls/:callId" component={CallsLeads} />
+              {/* Leads epic Slice 1: callback queue. Sits next to
+                  /calls so the leads list lives alongside the call
+                  list it escalates from. AuthGuard already wraps
+                  DashboardLayout; no extra gating needed here. */}
+              <Route path="/leads" component={LeadsListPage} />
+              <Route path="/leads/:id" component={LeadDetailPage} />
               <Route path="/contacts" component={Contacts} />
               <Route path="/appointments" component={Appointments} />
               <Route path="/sms" component={SmsCampaigns} />
@@ -775,6 +791,8 @@ function App() {
         <Route path="/reset-password" component={ResetPassword} />
         <Route path="/dashboard" component={() => <DashboardLayout />} />
         <Route path="/calls" component={() => <DashboardLayout />} />
+        <Route path="/leads" component={() => <DashboardLayout />} />
+        <Route path="/leads/:id" component={() => <DashboardLayout />} />
         <Route path="/contacts" component={() => <DashboardLayout />} />
         <Route path="/appointments" component={() => <DashboardLayout />} />
         <Route path="/sms" component={() => <DashboardLayout />} />

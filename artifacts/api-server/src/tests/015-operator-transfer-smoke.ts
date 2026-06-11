@@ -11,11 +11,11 @@
  *          }
  *   T2 — createAgentForBusiness WITHOUT transferConfig omits tools from
  *        the body (regression guard on existing onboarding flow).
- *   T3 — updateAgentTransferConfig with transfer_enabled=true issues
+ *   T3 — updateAgentTools with transfer_enabled=true issues
  *        GET then PATCH. PATCH body's
  *        conversation_config.agent.prompt.tools includes our transfer
  *        tool with the canonical shape.
- *   T4 — updateAgentTransferConfig with transfer_enabled=false strips
+ *   T4 — updateAgentTools with transfer_enabled=false strips
  *        the transfer_to_number tool from the PATCH body (filters
  *        existing tools, sends the rest).
  *   T5 — PUT /api/business/transfer with malformed (non-E.164) phone
@@ -40,7 +40,7 @@
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import crypto from "node:crypto";
 
-import { createAgentForBusiness, updateAgentTransferConfig, type TransferConfig } from "../agents";
+import { createAgentForBusiness, updateAgentTools, type TransferConfig } from "../agents";
 
 const API = process.env.TEST_API_BASE || "http://localhost:8080";
 const SUPABASE_URL = process.env.SUPABASE_URL || "";
@@ -137,11 +137,11 @@ async function runUnitTests() {
     restoreFetch();
   }
 
-  // T3 + T4 need a Supabase client because updateAgentTransferConfig reads
+  // T3 + T4 need a Supabase client because updateAgentTools reads
   // business_configs. Skip gracefully if SUPABASE env not present.
   if (!SUPABASE_URL || !SERVICE_KEY) {
-    record("T3 updateAgentTransferConfig enabled (skipped)", true, "no SUPABASE_URL/SERVICE_KEY");
-    record("T4 updateAgentTransferConfig disabled (skipped)", true, "no SUPABASE_URL/SERVICE_KEY");
+    record("T3 updateAgentTools enabled (skipped)", true, "no SUPABASE_URL/SERVICE_KEY");
+    record("T4 updateAgentTools disabled (skipped)", true, "no SUPABASE_URL/SERVICE_KEY");
     return;
   }
   const supa = createClient(SUPABASE_URL, SERVICE_KEY, { auth: { persistSession: false } });
@@ -172,7 +172,7 @@ async function runUnitTests() {
   }
 
   try {
-    // ----- T3: updateAgentTransferConfig with enabled=true -----
+    // ----- T3: updateAgentTools with enabled=true -----
     const fixturePromptText = "You are a helpful receptionist for T34 Fixture.";
     mockFetch((url, init) => {
       if (init?.method === "PATCH") return { status: 200, json: {} };
@@ -180,19 +180,19 @@ async function runUnitTests() {
       return { status: 200, json: { agent_id: fixtureAgent, conversation_config: { agent: { prompt: { prompt: fixturePromptText, tools: [] } } } } };
     });
     try {
-      const r = await updateAgentTransferConfig(supa, fixtureBiz);
+      const r = await updateAgentTools(supa, fixtureBiz);
       const patch = captured.find((c) => c.method === "PATCH" && c.url.includes(fixtureAgent));
       const promptPatched = patch?.body?.conversation_config?.agent?.prompt;
       const tools = promptPatched?.tools;
       const tool = findTransferTool(tools);
       if (!r.success) {
-        record("T3 updateAgentTransferConfig enabled", false, `returned !success: ${JSON.stringify(r)}`);
+        record("T3 updateAgentTools enabled", false, `returned !success: ${JSON.stringify(r)}`);
       } else if (!tool) {
-        record("T3 updateAgentTransferConfig enabled", false, `tool missing from PATCH: ${JSON.stringify(patch?.body).slice(0, 300)}`);
+        record("T3 updateAgentTools enabled", false, `tool missing from PATCH: ${JSON.stringify(patch?.body).slice(0, 300)}`);
       } else if (tool.params?.transfers?.[0]?.transfer_destination?.phone_number !== "+14105557777") {
-        record("T3 updateAgentTransferConfig enabled", false, `phone wrong: ${JSON.stringify(tool.params.transfers).slice(0, 200)}`);
+        record("T3 updateAgentTools enabled", false, `phone wrong: ${JSON.stringify(tool.params.transfers).slice(0, 200)}`);
       } else if (!tool.description.includes("Incoming Neverr call for T34 Fixture")) {
-        record("T3 updateAgentTransferConfig enabled (interpolation)", false, `{business_name} not interpolated: ${tool.description.slice(0, 300)}`);
+        record("T3 updateAgentTools enabled (interpolation)", false, `{business_name} not interpolated: ${tool.description.slice(0, 300)}`);
       } else if (promptPatched?.prompt !== fixturePromptText) {
         // Belt-and-suspenders: ensure the existing system prompt is echoed
         // back in the PATCH so a non-merging PATCH semantic on
@@ -229,19 +229,19 @@ async function runUnitTests() {
       };
     });
     try {
-      const r = await updateAgentTransferConfig(supa, fixtureBiz);
+      const r = await updateAgentTools(supa, fixtureBiz);
       const patch = captured.find((c) => c.method === "PATCH" && c.url.includes(fixtureAgent));
       const tools = patch?.body?.conversation_config?.agent?.prompt?.tools;
       const transferTool = findTransferTool(tools);
       const hasOther = Array.isArray(tools) && tools.some((t: any) => t?.name === "some_other_tool");
       if (!r.success) {
-        record("T4 updateAgentTransferConfig disabled", false, `returned !success: ${JSON.stringify(r)}`);
+        record("T4 updateAgentTools disabled", false, `returned !success: ${JSON.stringify(r)}`);
       } else if (transferTool) {
-        record("T4 updateAgentTransferConfig disabled", false, `transfer tool still present in PATCH: ${JSON.stringify(transferTool).slice(0, 200)}`);
+        record("T4 updateAgentTools disabled", false, `transfer tool still present in PATCH: ${JSON.stringify(transferTool).slice(0, 200)}`);
       } else if (!hasOther) {
         record("T4 preserves OTHER tools", false, `non-transfer tool got stripped: ${JSON.stringify(tools)}`);
       } else {
-        record("T4 updateAgentTransferConfig disabled + preserves others", true, "transfer tool stripped, other tools preserved");
+        record("T4 updateAgentTools disabled + preserves others", true, "transfer tool stripped, other tools preserved");
       }
     } finally {
       restoreFetch();

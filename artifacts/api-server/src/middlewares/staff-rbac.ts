@@ -44,7 +44,14 @@ export type StaffResource =
   | "users"
   | "automation"
   | "monitoring"
-  | "billing";
+  | "billing"
+  // Leads epic: first-class resource bucket. Slice 1 uses leads:read on
+  // the admin GET endpoints. Slices 2+ will use leads:write (claim,
+  // resolve, note) and leads:assign (reassign across team members).
+  // Per-user `permissions` overlays in user_roles fall through to the
+  // defaults below per-key — existing super_admin rows without an
+  // explicit `leads` entry pick up the full set automatically.
+  | "leads";
 
 export type StaffAction = "read" | "write" | "delete" | "admin";
 
@@ -71,6 +78,7 @@ const DEFAULT_PERMISSIONS: Record<StaffRole, StaffPermissionMap> = {
     automation: ["read", "write", "admin"],
     monitoring: ["read", "write", "admin"],
     billing:    ["read", "write", "admin"],
+    leads:      ["read", "write", "delete", "admin"],
   },
   admin: {
     customers:  ["read", "write", "delete"],
@@ -80,6 +88,7 @@ const DEFAULT_PERMISSIONS: Record<StaffRole, StaffPermissionMap> = {
     automation: ["read", "write"],
     monitoring: ["read", "write"],
     billing:    ["read"],
+    leads:      ["read", "write", "delete"],
   },
   manager: {
     customers:  ["read", "write"],
@@ -89,23 +98,29 @@ const DEFAULT_PERMISSIONS: Record<StaffRole, StaffPermissionMap> = {
     automation: ["read"],
     monitoring: ["read"],
     billing:    ["read"],
+    leads:      ["read", "write"],
   },
   analyst: {
     customers:  ["read"],
     analytics:  ["read", "write"],
     support:    ["read"],
     monitoring: ["read"],
+    leads:      ["read"],
   },
   support: {
     customers:  ["read", "write"],
     support:    ["read", "write"],
     monitoring: ["read"],
+    // Support staff handle inbound follow-ups end-to-end — read + write
+    // (claim, resolve, dismiss) but not delete.
+    leads:      ["read", "write"],
   },
   viewer: {
     customers:  ["read"],
     analytics:  ["read"],
     support:    ["read"],
     monitoring: ["read"],
+    leads:      ["read"],
   },
 };
 

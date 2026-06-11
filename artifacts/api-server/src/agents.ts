@@ -30,6 +30,34 @@ export type TransferConfig = {
 };
 
 const TRANSFER_TOOL_NAME = 'transfer_to_number';
+const REQUEST_CALLBACK_TOOL_NAME = 'request_callback';
+// Default capture URL. Override per environment via LEADS_CAPTURE_URL.
+// Baked into the ElevenLabs agent config at PATCH time, so changing this
+// requires re-running updateAgentTools for every agent — a one-shot
+// resync script is cheap.
+const DEFAULT_LEADS_CAPTURE_URL = 'https://voice-i-q.replit.app/api/leads/capture';
+
+// NL description shown to the LLM. Tells it WHEN to invoke and what to
+// confirm with the caller before invoking. Kept as a module constant so
+// resync scripts produce byte-identical tool configs across agents (no
+// per-call interpolation aside from the URL + business_id + secret).
+const REQUEST_CALLBACK_DESCRIPTION = `Use this tool to capture a callback request for the customer's team. Invoke this tool when:
+
+- The caller asks something you cannot answer AND warm transfer is not appropriate or has failed (e.g. after hours, team is busy, the caller specifically asks for a callback)
+- The business is closed and the caller wants follow-up
+- The caller explicitly asks for a callback, text, or email
+- A follow-up is needed but does not have to be immediate
+
+Before invoking this tool, confirm with the caller:
+1. Their full name
+2. Their phone number (in case caller-ID is different from what they want followed up at)
+3. The reason for the callback, in their own words
+4. Their preferred contact channel — ask: "Would you prefer a text, a call, or an email?"
+5. Whether it is urgent — if they sound stressed, mention an emergency, or use phrases like "right away" / "as soon as possible," set urgency to 'high' or 'emergency'
+
+Do not invoke this tool silently. Tell the caller you are capturing their request and that someone from the team will follow up shortly. After the tool returns success, confirm: "I've passed that on to the team. Someone will get back to you via {preferred_channel}."
+
+If the tool returns an error, apologize and offer to take a message verbally for the team to call back manually.`;
 
 /**
  * Build the tools-array entry for the transfer_to_number system tool.
@@ -84,6 +112,105 @@ export function buildTransferTool(cfg: TransferConfig): unknown {
         },
       ],
       enable_client_message: true,
+    },
+  };
+}
+
+/**
+ * Build the tools-array entry for the request_callback webhook tool.
+ * Shape per ElevenLabs OpenAPI components.schemas.WebhookToolConfig-Input
+ * + WebhookToolApiSchemaConfig-Input + LiteralJsonSchemaProperty.
+ *
+ * Sits in prompt.tools[] alongside (independent of) the transfer_to_number
+ * system tool. ElevenLabs picks based on the LLM's tool-call decision per
+ * turn; there's no interaction between them.
+ *
+ * The `business_id` parameter uses `constant_value` so it's baked at PATCH
+ * time and the LLM never sees it as a field to fill — avoids the
+ * roundtrip-of-reverse-lookup-via-agent_id we'd otherwise need on the
+ * capture endpoint.
+ *
+ * The Authorization header carries the shared secret as a plain Bearer
+ * string. Rotation = update env var on our side + re-run updateAgentTools
+ * for every agent (a one-shot resync script). Secret store / env-var
+ * locator variants exist in the schema but require workspace bootstrap
+ * we're not paying for in Slice 1.
+ */
+export function buildRequestCallbackTool(opts: {
+  businessId: string;
+  captureUrl: string;
+  toolSecret: string;
+}): unknown {
+  return {
+    type: 'webhook',
+    name: REQUEST_CALLBACK_TOOL_NAME,
+    description: REQUEST_CALLBACK_DESCRIPTION,
+    response_timeout_secs: 30,
+    disable_interruptions: false,
+    // Force speech BEFORE the tool fires — the LLM says e.g. "Let me get
+    // that down for you" so the caller hears a natural acknowledgment
+    // during the HTTP round-trip rather than silence.
+    pre_tool_speech: 'force',
+    // Summarized errors keep the LLM able to apologize gracefully on 5xx
+    // without leaking raw HTTP details into the caller's conversation.
+    tool_error_handling_mode: 'summarized',
+    execution_mode: 'immediate',
+    api_schema: {
+      url: opts.captureUrl,
+      method: 'POST',
+      content_type: 'application/json',
+      request_headers: {
+        Authorization: `Bearer ${opts.toolSecret}`,
+        'Content-Type': 'application/json',
+      },
+      request_body_schema: {
+        type: 'object',
+        required: [
+          'business_id',
+          'conversation_id',
+          'contact_name',
+          'contact_phone',
+          'reason',
+          'urgency',
+          'preferred_channel',
+        ],
+        properties: {
+          business_id: {
+            type: 'string',
+            constant_value: opts.businessId,
+          },
+          conversation_id: {
+            type: 'string',
+            description: 'The current ElevenLabs conversation ID. Use the value provided to you in this conversation; do not invent one.',
+          },
+          contact_name: {
+            type: 'string',
+            description: "The caller's full name as they stated it during the call. Do not guess; if the caller hasn't given a name yet, ask them first.",
+          },
+          contact_phone: {
+            type: 'string',
+            description: "The caller's callback phone number in E.164 format (e.g. +14105551234). If the caller said a 10-digit US number, prepend +1. Confirm the number back to the caller before submitting.",
+          },
+          contact_email: {
+            type: 'string',
+            description: "Optional. The caller's email address if they provided one for follow-up. Leave blank if not provided.",
+          },
+          reason: {
+            type: 'string',
+            description: "A concise summary of what the caller needs, in their own words. Two or three sentences. Do not embellish; capture only what they said they needed.",
+          },
+          urgency: {
+            type: 'string',
+            enum: ['low', 'medium', 'high', 'emergency'],
+            description: "How urgent the follow-up is. 'emergency' = something happening RIGHT NOW that requires immediate human attention (safety issue, urgent business problem, customer in distress). 'high' = same-day, time-sensitive. 'medium' = default for normal callbacks. 'low' = non-urgent informational follow-up. Pick based on the caller's tone and explicit words, not on assumption.",
+          },
+          preferred_channel: {
+            type: 'string',
+            enum: ['text', 'call', 'email', 'voice_callback'],
+            description: "How the caller wants to be reached. 'text' = SMS. 'call' = phone call from the team. 'email' = email. 'voice_callback' = an AI-initiated automated callback. Ask the caller explicitly: \"Would you prefer a text, a call, or an email?\"",
+          },
+        },
+      },
     },
   };
 }
@@ -227,25 +354,35 @@ export async function deleteAgent(agentId: string): Promise<{ success: boolean; 
 }
 
 /**
- * Idempotent sync of a business's operator-transfer config to its
- * ElevenLabs agent. Reads business_configs for `agent_id` +
- * `transfer_enabled` + the four transfer fields, then PATCHes the agent's
- * tools array:
+ * Idempotent sync of a business's full tools array to its ElevenLabs
+ * agent. Replaces the older updateAgentTransferConfig — same shape, same
+ * try/catch + Sentry posture, but now manages multiple tools end-to-end:
  *
- *   transfer_enabled = false → strip any existing `transfer_to_number`
- *                              system tool from agent.prompt.tools
- *   transfer_enabled = true  → upsert the tool (replace existing entry
- *                              of the same name, or append if missing)
+ *   transfer_to_number  → included when transfer_enabled is true AND
+ *                         transfer_to_phone + transfer_conditions are set.
+ *                         Stripped otherwise.
+ *   request_callback    → ALWAYS included. There's no per-business toggle
+ *                         in Slice 1; we'll add a callback_enabled column
+ *                         in a later slice if customers want to opt out.
+ *                         If ELEVENLABS_TOOL_SECRET is not set in the
+ *                         environment, the callback tool is SKIPPED with
+ *                         a Sentry breadcrumb — transfer still works,
+ *                         callback simply isn't registered for that
+ *                         deploy. Avoids hardcoding a fallback secret.
  *
- * Safe to call repeatedly. Failures are captured to Sentry and logged but
- * do NOT throw — the route handler that triggered this can still respond
- * 200 on the DB write; the customer's saved settings will resync via a
- * follow-up save if ElevenLabs was temporarily unreachable.
+ * Tools we don't recognize (by name) are preserved across the PATCH —
+ * defensive against future tools we might register out-of-band, or other
+ * code paths sharing the same agent.
  *
- * Returns { success, error? } for the rare caller that wants to surface
- * the sync state (e.g. an admin tool showing prompt_sync_error).
+ * The PATCH body echoes prompt.prompt back alongside prompt.tools
+ * (belt-and-suspenders against a non-merging PATCH semantic wiping the
+ * system prompt). See agents.ts:buildTransferTool comments.
+ *
+ * Safe to call repeatedly. Failures are captured to Sentry and logged
+ * but do NOT throw — the route handler that triggered this can still
+ * respond 200 on its own DB write.
  */
-export async function updateAgentTransferConfig(
+export async function updateAgentTools(
   supabase: SupabaseClient,
   businessId: string,
 ): Promise<{ success: boolean; error?: string }> {
@@ -256,7 +393,7 @@ export async function updateAgentTransferConfig(
       .eq('business_id', businessId)
       .maybeSingle();
     if (readErr) {
-      Sentry.captureMessage('update_agent_transfer_config_read_failed', {
+      Sentry.captureMessage('update_agent_tools_read_failed', {
         level: 'error',
         extra: { businessId, error: readErr.message },
       });
@@ -281,16 +418,15 @@ export async function updateAgentTransferConfig(
       return { success: true };
     }
 
-    // GET the agent so we can preserve any other tools that may exist
-    // alongside transfer_to_number (none today, but defensive). The
-    // ElevenLabs PATCH semantic on prompt.tools replaces the array
-    // wholesale.
+    // GET the agent so we can preserve any tools we don't manage
+    // (defensive against out-of-band registrations). The ElevenLabs
+    // PATCH semantic on prompt.tools replaces the array wholesale.
     const getRes = await fetch(`https://api.elevenlabs.io/v1/convai/agents/${row.agent_id}`, {
       headers: { 'xi-api-key': getApiKey() },
     });
     if (!getRes.ok) {
       const errText = await getRes.text().catch(() => '');
-      Sentry.captureMessage('update_agent_transfer_config_get_failed', {
+      Sentry.captureMessage('update_agent_tools_get_failed', {
         level: 'error',
         extra: { businessId, agentId: row.agent_id, status: getRes.status, body: errText.slice(0, 500) },
       });
@@ -300,42 +436,61 @@ export async function updateAgentTransferConfig(
     const existingTools: any[] = Array.isArray(agent?.conversation_config?.agent?.prompt?.tools)
       ? agent.conversation_config.agent.prompt.tools
       : [];
-    // Belt-and-suspenders against an ElevenLabs PATCH wiping the system
-    // prompt string when we only send prompt.tools. The OpenAPI shape
-    // says nested merge SHOULD preserve sibling fields, but we hold the
-    // current prompt text in hand from the GET above so the cost of
-    // also echoing it back in the PATCH body is one extra string in
-    // the JSON — and the upside is that a misunderstanding of the
-    // merge semantic doesn't blow away the customer's system prompt.
+    // Belt-and-suspenders against a non-merging PATCH semantic wiping
+    // the system prompt — see agents.ts:buildTransferTool comments and
+    // commit ecaa687's review notes.
     const currentPromptText: string | undefined =
-      typeof agent?.conversation_config?.agent?.prompt?.prompt === "string"
+      typeof agent?.conversation_config?.agent?.prompt?.prompt === 'string'
         ? agent.conversation_config.agent.prompt.prompt
         : undefined;
-    // Strip any existing transfer_to_number tool — we'll re-add it below
-    // if transfer_enabled is true. Identifying by name OR
-    // params.system_tool_type so renames don't leave dupes.
-    const remainingTools = existingTools.filter((t: any) =>
-      t?.name !== TRANSFER_TOOL_NAME && t?.params?.system_tool_type !== 'transfer_to_number',
-    );
 
-    let nextTools: any[] = remainingTools;
+    // Strip the tools we manage (by name OR system_tool_type). Anything
+    // else we preserve.
+    const remainingTools = existingTools.filter((t: any) => {
+      if (t?.name === TRANSFER_TOOL_NAME || t?.params?.system_tool_type === 'transfer_to_number') return false;
+      if (t?.name === REQUEST_CALLBACK_TOOL_NAME) return false;
+      return true;
+    });
+
+    const nextTools: any[] = [...remainingTools];
+
+    // Conditionally append transfer_to_number.
     if (row.transfer_enabled && row.transfer_to_phone && row.transfer_conditions) {
-      // Server-side {business_name} interpolation on the messages — we
-      // store the customer's template with the literal placeholder and
-      // resolve it here so editing the business name later doesn't
-      // require a re-save of the transfer template.
       const businessName = row.business_name || 'our team';
       const interpolate = (tpl: string | null) =>
         (tpl || '').replace(/\{business_name\}/g, businessName);
-      nextTools = [
-        ...remainingTools,
+      nextTools.push(
         buildTransferTool({
           phoneNumber: row.transfer_to_phone,
           condition: row.transfer_conditions,
           waitMessageTemplate: interpolate(row.transfer_wait_message),
           warmMessageTemplate: interpolate(row.transfer_warm_message),
         }),
-      ];
+      );
+    }
+
+    // Always append request_callback — IF we have the secret. Missing
+    // secret in dev environments shouldn't break sync; Sentry breadcrumb
+    // makes the omission visible without aborting the PATCH (which
+    // would also wipe transfer).
+    const toolSecret = process.env.ELEVENLABS_TOOL_SECRET;
+    const captureUrl = process.env.LEADS_CAPTURE_URL || DEFAULT_LEADS_CAPTURE_URL;
+    if (toolSecret) {
+      nextTools.push(
+        buildRequestCallbackTool({
+          businessId,
+          captureUrl,
+          toolSecret,
+        }),
+      );
+    } else {
+      Sentry.addBreadcrumb({
+        category: 'agents.tools',
+        level: 'warning',
+        message: 'request_callback_skipped_no_secret',
+        data: { businessId, agentId: row.agent_id },
+      });
+      console.warn('[Agents] ELEVENLABS_TOOL_SECRET not set — request_callback tool NOT registered for', businessId);
     }
 
     const promptBody: any = { tools: nextTools };
@@ -358,18 +513,40 @@ export async function updateAgentTransferConfig(
     });
     if (!patchRes.ok) {
       const errText = await patchRes.text().catch(() => '');
-      Sentry.captureMessage('update_agent_transfer_config_patch_failed', {
+      Sentry.captureMessage('update_agent_tools_patch_failed', {
         level: 'error',
-        extra: { businessId, agentId: row.agent_id, status: patchRes.status, body: errText.slice(0, 500), enabled: row.transfer_enabled },
+        extra: {
+          businessId,
+          agentId: row.agent_id,
+          status: patchRes.status,
+          body: errText.slice(0, 500),
+          transfer_enabled: row.transfer_enabled,
+          callback_registered: !!toolSecret,
+          tool_count: nextTools.length,
+        },
       });
       return { success: false, error: `agent_patch_http_${patchRes.status}` };
     }
-    console.log('[Agents] Transfer config synced:', businessId, 'enabled=', row.transfer_enabled, 'agent=', row.agent_id);
+    console.log(
+      '[Agents] Tools synced:',
+      businessId,
+      'transfer_enabled=', row.transfer_enabled,
+      'callback_registered=', !!toolSecret,
+      'agent=', row.agent_id,
+    );
     return { success: true };
   } catch (err: any) {
-    Sentry.captureException(err, { extra: { route: 'updateAgentTransferConfig', businessId } });
+    Sentry.captureException(err, { extra: { route: 'updateAgentTools', businessId } });
     return { success: false, error: err?.message || String(err) };
   }
 }
 
-export default { createAgentForBusiness, updateAgentPrompt, getAgent, deleteAgent, updateAgentTransferConfig, buildTransferTool };
+export default {
+  createAgentForBusiness,
+  updateAgentPrompt,
+  getAgent,
+  deleteAgent,
+  updateAgentTools,
+  buildTransferTool,
+  buildRequestCallbackTool,
+};

@@ -120,6 +120,12 @@ app.use("/api/auth/reset-password", authLimiter);
 // with. Throttled because (a) it fans out to Resend on every submission
 // and (b) the form is otherwise an anonymous spam vector.
 app.use("/api/auth/help-recover-account", authLimiter);
+// /api/leads/capture is anonymous (Bearer-secret only) and triggers a
+// DB insert + audit log per call. Throttle to the same 10/15min/IP
+// envelope as the other public anon endpoints — defends against a
+// leaked-secret spam scenario without throttling legitimate AI
+// conversations (one capture per conversation = nowhere near the limit).
+app.use("/api/leads/capture", authLimiter);
 // Activation is unauthenticated and creates a Supabase Auth user — apply
 // the strict authLimiter to throttle brute-force on invite tokens and DoS
 // on the upstream auth provider.
@@ -151,6 +157,10 @@ const AUTH_BYPASS_PATTERNS = [
   // NOT public (requireAuth — must be a logged-in user requesting a
   // resend for their own account).
   /^\/api\/auth\/(login|signup|refresh|verify-email|forgot-password|reset-password|help-recover-account)$/,
+  // Leads epic Slice 1: /api/leads/capture is the request_callback tool
+  // endpoint ElevenLabs's agent POSTs to mid-conversation. The token in
+  // the Authorization header (ELEVENLABS_TOOL_SECRET) IS the credential.
+  /^\/api\/leads\/capture$/,
   /^\/api\/auth\/google/,
   /^\/api\/auth\/microsoft/,
   /^\/api\/twilio\//,

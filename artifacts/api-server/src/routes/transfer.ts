@@ -18,7 +18,7 @@
  *   3. Apply defaults for empty optional fields when enabling for the
  *      first time
  *   4. Write to business_configs
- *   5. Call updateAgentTransferConfig — GET → strip/insert tool → PATCH
+ *   5. Call updateAgentTools — GET → strip/insert tool → PATCH
  *      the ElevenLabs agent. Sentry-wrapped; never bubbles
  *   6. Audit-log the change (source='customer' vs 'admin_raw' depending
  *      on which surface called)
@@ -35,7 +35,7 @@ import * as Sentry from "@sentry/node";
 import { requireAuth, requirePermission } from "../middlewares/auth";
 import { requireStaffPermission } from "../middlewares/staff-rbac";
 import { auditLog, extractRequestMeta } from "../middlewares/audit";
-import { updateAgentTransferConfig } from "../agents";
+import { updateAgentTools } from "../agents";
 
 const router = Router();
 
@@ -51,7 +51,7 @@ const WARM_MESSAGE_MAX = 1000;
 
 // Defaults seeded the FIRST time a customer enables transfer with blank
 // fields. Customer can edit afterward. {business_name} interpolation
-// happens server-side in updateAgentTransferConfig at PATCH time.
+// happens server-side in updateAgentTools at PATCH time.
 const DEFAULT_CONDITIONS =
   "When the caller asks something the AI cannot answer, requests to speak " +
   "to a human, reports an emergency or breakdown, asks for the manager or " +
@@ -244,7 +244,7 @@ async function handleTransferSave(opts: {
   // respond 200 — the DB is the source of truth, and a retry of save
   // will re-sync. Surface the sync error in the response so the
   // dashboard can show an actionable retry hint.
-  const sync = await updateAgentTransferConfig(supabase, businessId);
+  const sync = await updateAgentTools(supabase, businessId);
 
   // Audit. customer surface uses source='customer'; admin override uses
   // 'admin_raw' to match the prompt-edit convention so audit_logs

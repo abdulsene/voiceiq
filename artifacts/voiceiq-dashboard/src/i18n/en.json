@@ -3,6 +3,7 @@
     "commandCenter": "Command Center",
     "myReceptionist": "My Receptionist",
     "callsLeads": "Calls & Leads",
+    "leads": "Leads",
     "contacts": "Contacts",
     "appointments": "Appointments",
     "sms": "SMS & Campaigns",
@@ -121,6 +122,83 @@
     "hot": "Hot",
     "warm": "Warm",
     "cold": "Cold"
+  },
+  "leads": {
+    "listTitle": "Leads",
+    "listSubtitle": "Callbacks the AI captured for your team to follow up on.",
+    "unknownCaller": "Unknown caller",
+    "tabs": {
+      "myOpen": "My open",
+      "unassigned": "Unassigned",
+      "all": "All"
+    },
+    "empty": {
+      "noLeads": "No leads yet",
+      "noLeadsHint": "When the AI captures a callback request, it'll appear here within seconds. You can also escalate calls into leads from the calls view in a later update."
+    },
+    "status": {
+      "new": "New",
+      "claimed": "Claimed",
+      "in_progress": "In progress",
+      "resolved": "Resolved",
+      "dismissed": "Dismissed"
+    },
+    "urgency": {
+      "low": "Low",
+      "medium": "Medium",
+      "high": "High",
+      "emergency": "Emergency"
+    },
+    "preferredChannelExplain": {
+      "text": "Caller prefers to be reached by text message.",
+      "call": "Caller prefers a phone call back.",
+      "email": "Caller prefers to be reached by email.",
+      "voice_callback": "Caller is open to an AI-initiated automated callback."
+    },
+    "relative": {
+      "justNow": "just now",
+      "minutesAgo_one": "{{count}} minute ago",
+      "minutesAgo_other": "{{count}} minutes ago",
+      "hoursAgo_one": "{{count}} hour ago",
+      "hoursAgo_other": "{{count}} hours ago",
+      "daysAgo_one": "{{count}} day ago",
+      "daysAgo_other": "{{count}} days ago",
+      "monthsAgo_one": "{{count}} month ago",
+      "monthsAgo_other": "{{count}} months ago"
+    },
+    "detail": {
+      "backToList": "Back to leads",
+      "leadInfo": "Lead info",
+      "reason": "What they need",
+      "preferredChannel": "How they'd like to be reached",
+      "activity": "Activity",
+      "capturedAt": "Captured {{when}}",
+      "actionsComingSoon": "Actions coming soon — text/email response, claim, and resolve will land in the next update.",
+      "notFound": "We couldn't find that lead."
+    },
+    "activity": {
+      "actor": {
+        "ai": "AI receptionist",
+        "staff": "Team member",
+        "system": "System"
+      },
+      "action": {
+        "captured": "Captured by AI",
+        "claimed": "Claimed",
+        "note_added": "Note added",
+        "sms_sent": "SMS sent",
+        "email_sent": "Email sent",
+        "resolved": "Resolved",
+        "dismissed": "Dismissed",
+        "reopened": "Reopened",
+        "reassigned": "Reassigned",
+        "escalated": "Escalated"
+      },
+      "capturedDescription": "The AI captured this lead during a live call and passed it on for follow-up.",
+      "linkedCallPrefix": "Source:",
+      "viewSourceCall": "View the source call →",
+      "conversationRef": "Conversation reference:"
+    }
   },
   "transfer": {
     "title": "Operator transfer",
