@@ -125,9 +125,9 @@
   "transfer": {
     "title": "Transferencia a operador",
     "toggleLabel": "Transferir llamadas a una persona cuando la IA no pueda responder",
-    "toggleDescription": "Cuando se activa, tu IA reenviará la llamada al número indicado si se cumplen las condiciones que definas.",
+    "toggleDescription": "Cuando la IA no pueda atender una consulta, conectará al llamante con una persona en el número de abajo. Combínalo con 'reenviar si está ocupado o no contesta' en tu línea principal para un flujo más limpio.",
     "phoneLabel": "Teléfono del operador",
-    "phoneHelpPrefix": "Llamaremos a este número cuando la IA escale. Usa un número DIFERENTE del de tu negocio.",
+    "phoneHelpPrefix": "Llamaremos a este número cuando la IA no pueda atender la llamada. Suele ser tu número principal de negocio, donde un miembro del equipo pueda contestar. Asegúrate de que tu línea principal reenvíe a la IA solo cuando esté ocupada o no conteste (no 'reenviar siempre'); de lo contrario, las llamadas transferidas pueden hacer bucle.",
     "phoneHelpSuffix": "está reenviando las llamadas a tu IA — usarlo aquí crearía un bucle.",
     "phoneFormatError": "Introduce un número en formato E.164 (ej. +14105551234).",
     "conditionsLabel": "¿Cuándo debe transferir la IA?",

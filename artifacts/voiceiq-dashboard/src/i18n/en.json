@@ -125,9 +125,9 @@
   "transfer": {
     "title": "Operator transfer",
     "toggleLabel": "Transfer calls to a human when the AI can't answer",
-    "toggleDescription": "When enabled, your AI will forward the call to the number below if the conditions you set are met.",
+    "toggleDescription": "When the AI can't handle a question, it'll bridge the caller to a human at the number below. Pair this with 'forward on busy/no-answer' on your main line for the cleanest flow.",
     "phoneLabel": "Operator phone number",
-    "phoneHelpPrefix": "We'll dial this number when the AI escalates. Use a number DIFFERENT from your business line.",
+    "phoneHelpPrefix": "We'll dial this number when the AI can't handle a call. This is usually your main business number — where a teammate can pick up. Make sure your main line is set to forward to the AI only on busy or no-answer (not 'always forward'), otherwise transferred calls can loop.",
     "phoneHelpSuffix": "is forwarding calls to your AI — using it here would create a call loop.",
     "phoneFormatError": "Enter a phone number in E.164 format (e.g. +14105551234).",
     "conditionsLabel": "When should the AI transfer?",
