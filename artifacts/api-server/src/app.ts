@@ -161,6 +161,14 @@ const AUTH_BYPASS_PATTERNS = [
   // endpoint ElevenLabs's agent POSTs to mid-conversation. The token in
   // the Authorization header (ELEVENLABS_TOOL_SECRET) IS the credential.
   /^\/api\/leads\/capture$/,
+  // Slice 2A: Twilio-facing webhooks for the lead-bridge flow. Each
+  // verifies X-Twilio-Signature inside the handler. The disclosure
+  // audio endpoint is public-by-design (Twilio's <Play> fetches it
+  // without signing); rate-limited via generalLimiter.
+  /^\/api\/twilio\/voice\/lead-bridge$/,
+  /^\/api\/twilio\/recording-status$/,
+  /^\/api\/twilio\/call-status$/,
+  /^\/api\/business\/disclosure-audio\/[^/]+\/(staff|customer)$/,
   /^\/api\/auth\/google/,
   /^\/api\/auth\/microsoft/,
   /^\/api\/twilio\//,

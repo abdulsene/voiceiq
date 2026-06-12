@@ -174,6 +174,7 @@
       "activity": "Actividad",
       "capturedAt": "Capturado el {{when}}",
       "actionsComingSoon": "Acciones próximamente: respuesta por texto/correo, reclamar y resolver llegarán en la próxima actualización.",
+      "moreActionsComingSoon": "Respuesta por texto/correo, reclamar y resolver llegarán en la próxima actualización.",
       "notFound": "No pudimos encontrar ese lead."
     },
     "activity": {
@@ -192,12 +193,87 @@
         "dismissed": "Descartado",
         "reopened": "Reabierto",
         "reassigned": "Reasignado",
-        "escalated": "Escalado"
+        "escalated": "Escalado",
+        "call_initiated": "Llamada iniciada",
+        "call_completed": "Llamada completada",
+        "call_failed": "La llamada no se conectó"
       },
       "capturedDescription": "La IA capturó este lead durante una llamada en vivo y lo pasó para seguimiento.",
       "linkedCallPrefix": "Origen:",
       "viewSourceCall": "Ver la llamada de origen →",
       "conversationRef": "Referencia de conversación:"
+    },
+    "call": {
+      "button": {
+        "callCustomer": "Llamar al cliente",
+        "willRing": "Te llamaremos primero al {{number}} y luego te conectaremos con el cliente."
+      },
+      "ringBanner": {
+        "title": "Configura primero tu número de devolución",
+        "hint": "Necesitamos saber a qué teléfono llamar cuando hagas clic en Llamar al cliente.",
+        "cta": "Ir a Ajustes"
+      },
+      "modal": {
+        "title": "Llamar a este cliente",
+        "description": "Primero llamaremos a tu teléfono. Cuando contestes, te conectaremos con {{customerName}} y se reproducirá un breve aviso de grabación en ambas líneas.",
+        "ringNumberLabel": "Te llamaremos a",
+        "customerLabel": "Luego te conectaremos con",
+        "disclosureNote": "Ambas partes escucharán un breve aviso de que la llamada puede ser grabada antes de la conexión.",
+        "cancel": "Cancelar",
+        "callNow": "Llamar ahora",
+        "connecting": "Conectando..."
+      },
+      "live": {
+        "starting": "Iniciando la llamada...",
+        "ringing": "Llamando a tu teléfono...",
+        "connected": "Conectado — hablando ahora.",
+        "ended": "Llamada finalizada ({{duration}}).",
+        "failed": {
+          "no-answer": "El cliente no contestó.",
+          "busy": "La línea del cliente estaba ocupada.",
+          "failed": "No se pudo realizar la llamada.",
+          "canceled": "La llamada fue cancelada.",
+          "unknown": "La llamada no se completó."
+        }
+      },
+      "activity": {
+        "initiated": "Llamando a tu teléfono al {{ring}}, luego conectando con {{customer}}.",
+        "completedDescription": "Conexión exitosa. Grabación, transcripción y resumen abajo.",
+        "durationLabel": "Duración:",
+        "summaryLabel": "Resumen de la IA",
+        "transcribing": "Transcribiendo la grabación...",
+        "transcriptionFailed": "La transcripción falló. La grabación sigue disponible.",
+        "loadRecording": "Cargar grabación",
+        "loadingRecording": "Cargando grabación...",
+        "viewTranscript": "Ver transcripción",
+        "failed": {
+          "no-answer": "El cliente no contestó.",
+          "busy": "La línea del cliente estaba ocupada.",
+          "failed": "Twilio no pudo realizar la llamada.",
+          "canceled": "La llamada fue cancelada antes de conectar.",
+          "unknown": "La llamada no se conectó."
+        }
+      },
+      "transcriptModal": {
+        "title": "Transcripción de la llamada",
+        "close": "Cerrar",
+        "empty": "No se capturó transcripción."
+      }
+    },
+    "callback": {
+      "title": "Número para devoluciones de llamada",
+      "subtitle": "Cuando hagas clic en Llamar al cliente desde un lead, llamaremos primero a este teléfono y luego te conectaremos con el cliente.",
+      "backToSettings": "Volver a Ajustes",
+      "section": {
+        "ringNumber": "Tu número de llamada",
+        "description": "Usa un teléfono que realmente contestes — tu móvil suele ser lo mejor. Llamaremos a este número cada vez que inicies una devolución desde /leads.",
+        "phoneLabel": "Número de teléfono",
+        "formatError": "Introduce un número válido (agregaremos +1 para EE. UU.).",
+        "help": "Guardado por negocio. Si perteneces a varios negocios puedes establecer un número diferente para cada uno."
+      },
+      "save": "Guardar",
+      "saving": "Guardando...",
+      "savedToast": "Guardado. Llamaremos a este número en tu próxima devolución."
     }
   },
   "transfer": {

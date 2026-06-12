@@ -6,6 +6,7 @@ import CommandCenter from "./pages/CommandCenter";
 import CallsLeads from "./pages/CallsLeads";
 import LeadsListPage from "./pages/Leads/LeadsListPage";
 import LeadDetailPage from "./pages/Leads/LeadDetailPage";
+import CallbackSettingsPage from "./pages/Leads/CallbackSettingsPage";
 import Contacts from "./pages/Contacts";
 import Appointments from "./pages/Appointments";
 import SmsCampaigns from "./pages/SmsCampaigns";
@@ -648,6 +649,10 @@ function DashboardLayout() {
               <Route path="/settings" component={SettingsPage} />
               {/* Sprint 3 Stage 5 / Phase 3: AI receptionist voice picker. */}
               <Route path="/settings/ai" component={AiSettingsPage} />
+              {/* Slice 2A leads epic: user's "ring me at" preference
+                  for the lead-bridge feature. Deep-linked from the
+                  LeadDetailPage banner when the preference is missing. */}
+              <Route path="/settings/callback" component={CallbackSettingsPage} />
               <Route>
                 <div className="flex items-center justify-center h-64">
                   <p className="text-gray-500">Page not found</p>
@@ -799,6 +804,7 @@ function App() {
         <Route path="/analytics" component={() => <DashboardLayout />} />
         <Route path="/benchmarks" component={() => <DashboardLayout />} />
         <Route path="/settings" component={() => <DashboardLayout />} />
+        <Route path="/settings/callback" component={() => <DashboardLayout />} />
         <Route><DashboardLayout /></Route>
       </Switch>
       {/* Sprint 5 Alex Phase 2: mounted OUTSIDE <Switch> so the widget's

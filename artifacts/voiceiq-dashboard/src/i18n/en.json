@@ -174,6 +174,7 @@
       "activity": "Activity",
       "capturedAt": "Captured {{when}}",
       "actionsComingSoon": "Actions coming soon — text/email response, claim, and resolve will land in the next update.",
+      "moreActionsComingSoon": "Text/email response, claim, and resolve will land in the next update.",
       "notFound": "We couldn't find that lead."
     },
     "activity": {
@@ -192,12 +193,87 @@
         "dismissed": "Dismissed",
         "reopened": "Reopened",
         "reassigned": "Reassigned",
-        "escalated": "Escalated"
+        "escalated": "Escalated",
+        "call_initiated": "Call started",
+        "call_completed": "Call completed",
+        "call_failed": "Call didn't connect"
       },
       "capturedDescription": "The AI captured this lead during a live call and passed it on for follow-up.",
       "linkedCallPrefix": "Source:",
       "viewSourceCall": "View the source call →",
       "conversationRef": "Conversation reference:"
+    },
+    "call": {
+      "button": {
+        "callCustomer": "Call customer",
+        "willRing": "We'll ring you at {{number}} first, then bridge to the customer."
+      },
+      "ringBanner": {
+        "title": "Set your callback number first",
+        "hint": "We need to know which phone to ring when you click Call customer.",
+        "cta": "Go to Settings"
+      },
+      "modal": {
+        "title": "Call this customer",
+        "description": "We'll ring your phone first. Once you answer, we'll bridge you to {{customerName}} with a quick recording disclosure played on both ends.",
+        "ringNumberLabel": "We'll ring",
+        "customerLabel": "Then bridge to",
+        "disclosureNote": "Both sides hear a brief 'this call may be recorded' notice before the bridge connects.",
+        "cancel": "Cancel",
+        "callNow": "Call now",
+        "connecting": "Connecting..."
+      },
+      "live": {
+        "starting": "Starting the call...",
+        "ringing": "Ringing your phone...",
+        "connected": "Connected — talking now.",
+        "ended": "Call ended ({{duration}}).",
+        "failed": {
+          "no-answer": "No answer from the customer.",
+          "busy": "The customer's line was busy.",
+          "failed": "The call couldn't be placed.",
+          "canceled": "The call was canceled.",
+          "unknown": "The call didn't complete."
+        }
+      },
+      "activity": {
+        "initiated": "Ringing your phone at {{ring}}, then bridging to {{customer}}.",
+        "completedDescription": "Bridged successfully. Recording, transcript, and summary below.",
+        "durationLabel": "Duration:",
+        "summaryLabel": "AI summary",
+        "transcribing": "Transcribing the recording…",
+        "transcriptionFailed": "Transcription failed. Recording is still available.",
+        "loadRecording": "Load recording",
+        "loadingRecording": "Loading recording...",
+        "viewTranscript": "View transcript",
+        "failed": {
+          "no-answer": "The customer didn't answer.",
+          "busy": "The customer's line was busy.",
+          "failed": "Twilio couldn't place the call.",
+          "canceled": "The call was canceled before connecting.",
+          "unknown": "The call didn't connect."
+        }
+      },
+      "transcriptModal": {
+        "title": "Call transcript",
+        "close": "Close",
+        "empty": "No transcript captured."
+      }
+    },
+    "callback": {
+      "title": "Callback ring number",
+      "subtitle": "When you click Call customer on a lead, we'll ring this phone first, then bridge you to the customer.",
+      "backToSettings": "Back to Settings",
+      "section": {
+        "ringNumber": "Your ring number",
+        "description": "Use a phone you'll actually answer — your cell is usually best. We dial this number whenever you initiate a callback from /leads.",
+        "phoneLabel": "Phone number",
+        "formatError": "Enter a valid phone number (we'll add +1 for US numbers).",
+        "help": "Saved per business. If you belong to multiple businesses you can set a different number for each."
+      },
+      "save": "Save",
+      "saving": "Saving...",
+      "savedToast": "Saved. We'll ring this number on your next callback."
     }
   },
   "transfer": {

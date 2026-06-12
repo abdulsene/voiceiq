@@ -19,6 +19,8 @@ import promptRouter from "./prompt";
 import voicesRouter from "./voices";
 import transferRouter from "./transfer";
 import leadsRouter from "./leads";
+import leadCallsRouter from "./lead-calls";
+import twilioCallbacksRouter from "./twilio-callbacks";
 import adminBusinessesRouter from "./admin-businesses";
 
 const router: IRouter = Router();
@@ -85,6 +87,14 @@ router.use(transferRouter);
 // Mounted BEFORE the catch-all apiRouter so /api/business/leads is
 // claimed here, not by the legacy /lead tool-call handler in api.ts.
 router.use(leadsRouter);
+// Slice 2A: lead-bridge initiation + status (customer + admin parity).
+// Mounted before the catch-all so /api/business/leads/:id/call is
+// claimed here, not by the legacy /lead handler in api.ts.
+router.use(leadCallsRouter);
+// Slice 2A: Twilio-facing webhooks (recording-status, call-status,
+// bridge TwiML) + public disclosure audio. All bypass-listed in
+// app.ts via signature-verify or public-by-design (disclosure audio).
+router.use(twilioCallbacksRouter);
 // Stage 6 Phase 1: admin override surface — list + drill-in + admin
 // voice switch. Declares paths starting with /admin/business(es) at
 // root so it doesn't collide with the catch-all adminRouter mounted
