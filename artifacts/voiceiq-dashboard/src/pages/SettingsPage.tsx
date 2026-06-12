@@ -1,4 +1,6 @@
 import { useEffect, useState } from "react";
+import { Link } from "wouter";
+import { useTranslation } from "react-i18next";
 import {
   Bot, Building2, Bell, Phone, Shield, CreditCard, Save, CheckCircle,
   AlertTriangle, Globe, ShieldCheck, ShieldOff, Loader2, Lock, Eye,
@@ -2059,6 +2061,7 @@ function WebsiteTab({ businessId }: { businessId: string }) {
 }
 
 export default function SettingsPage() {
+  const { t } = useTranslation();
   const [tab, setTab] = useState("business");
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -2279,6 +2282,7 @@ export default function SettingsPage() {
   const tabs = [
     { id: "business", label: "Business Profile", icon: Building2 },
     { id: "ai", label: "AI Receptionist", icon: Bot },
+    { id: "callback", label: t("nav.callbackNumber"), icon: PhoneCall },
     { id: "website", label: "Website", icon: Globe },
     { id: "phone", label: "Phone Setup", icon: Phone },
     { id: "locations", label: "Locations", icon: MapPin },
@@ -2829,6 +2833,24 @@ export default function SettingsPage() {
               <Save className="w-4 h-4" /> {saving ? "Saving..." : "Save AI Settings"}
             </button>
           </div>
+        )}
+
+        {tab === "callback" && (
+          <Link
+            href="/settings/callback"
+            className="flex items-center gap-4 p-5 border border-gray-200 rounded-2xl hover:border-[#2E75B6]/40 hover:bg-[#2E75B6]/5 transition-all group"
+          >
+            <div className="w-12 h-12 rounded-xl bg-[#2E75B6]/10 flex items-center justify-center flex-shrink-0">
+              <PhoneCall className="w-5 h-5 text-[#2E75B6]" />
+            </div>
+            <div className="flex-1 min-w-0">
+              <h3 className="text-base font-semibold text-gray-900 mb-0.5">{t("nav.callbackNumber")}</h3>
+              <p className="text-sm text-gray-500">
+                Set which phone rings when a staff member clicks <span className="font-medium text-gray-700">Call customer</span> on a lead.
+              </p>
+            </div>
+            <ChevronRight className="w-5 h-5 text-gray-400 group-hover:text-[#2E75B6] flex-shrink-0" />
+          </Link>
         )}
 
         {tab === "phone" && <PhoneSetupTab neverrPhone={neverrPhone} />}

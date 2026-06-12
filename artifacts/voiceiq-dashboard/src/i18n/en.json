@@ -2,6 +2,7 @@
   "nav": {
     "commandCenter": "Command Center",
     "myReceptionist": "My Receptionist",
+    "callbackNumber": "Callback ring number",
     "callsLeads": "Calls & Leads",
     "leads": "Leads",
     "contacts": "Contacts",
