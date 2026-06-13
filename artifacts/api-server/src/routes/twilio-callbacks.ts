@@ -186,10 +186,10 @@ router.post("/twilio/recording-status", async (req: Request, res: Response) => {
   try {
     const { data: callRow } = await supabase
       .from("lead_calls")
-      .select("id, lead_id")
+      .select("id, lead_id, recording_sid")
       .eq("call_sid", callSid)
       .maybeSingle();
-    const row = callRow as { id: string; lead_id: string } | null;
+    const row = callRow as { id: string; lead_id: string; recording_sid: string | null } | null;
     if (!row) {
       // Possible race — Twilio retries before the lead_calls UPDATE
       // landed our CallSid. Twilio retries automatically; ack 200 so it
@@ -207,6 +207,30 @@ router.post("/twilio/recording-status", async (req: Request, res: Response) => {
     const leadCallId = row.id;
     const leadId = row.lead_id;
 
+    // Dedupe: Twilio occasionally re-delivers the 'completed' callback
+    // (network blip, our 5xx, or retry policy). lead_calls.recording_sid
+    // is set on the first successful processing; if it already equals
+    // this recordingSid, every downstream side effect — the activity
+    // row, the lead_calls UPDATE, and the fire-and-forget Deepgram +
+    // Claude run — has already happened. Ack 200 + return so we don't
+    // double-insert the timeline row or burn duplicate transcription
+    // credits.
+    //
+    // Why not ON CONFLICT on lead_activities: there's no UNIQUE
+    // constraint on (lead_id, action, metadata->lead_call_id) and
+    // adding one mid-slice opens a migration. The recording_sid
+    // check upstream is the source-of-truth signal anyway.
+    if (row.recording_sid === recordingSid) {
+      Sentry.addBreadcrumb({
+        category: "twilio.recording-status",
+        level: "info",
+        message: "duplicate_completed_callback_ignored",
+        data: { callSid, recordingSid, leadCallId },
+      });
+      res.status(200).type("text/xml").send('<?xml version="1.0" encoding="UTF-8"?><Response/>');
+      return;
+    }
+
     await supabase
       .from("lead_calls")
       .update({
@@ -222,12 +246,19 @@ router.post("/twilio/recording-status", async (req: Request, res: Response) => {
     // Insert the call_completed timeline row immediately so the UI shows
     // the call as completed even before the transcript lands. The UI
     // polls / subscribes for the transcript_status flip.
+    //
+    // call_sid is now part of metadata so LeadDetailPage's
+    // CallCompletedEntry can dereference it to hit
+    // GET /api/business/leads/:id/calls/:callSid/status — the gateway
+    // to the Slice 2A playback chain (recording + transcript + summary).
+    // Without it the entire playback UI was invisible in production.
     await supabase.from("lead_activities").insert({
       lead_id: leadId,
       actor_type: "system",
       action: "call_completed",
       metadata: {
         lead_call_id: leadCallId,
+        call_sid: callSid,
         recording_available: true,
         recording_duration_secs: recordingDurationSecs,
         transcript_pending: true,
