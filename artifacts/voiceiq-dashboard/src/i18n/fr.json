@@ -135,7 +135,13 @@
     },
     "empty": {
       "noLeads": "Aucun lead pour l'instant",
-      "noLeadsHint": "Lorsque l'IA capturera une demande de rappel, elle apparaîtra ici en quelques secondes. Vous pourrez aussi escalader des appels en leads depuis la vue des appels dans une prochaine mise à jour."
+      "noLeadsHint": "Lorsque l'IA capturera une demande de rappel, elle apparaîtra ici en quelques secondes. Vous pourrez aussi escalader des appels en leads depuis la vue des appels dans une prochaine mise à jour.",
+      "myOpenButOtherHas_one": "Aucun lead ne vous est assigné — {{count}} lead attend dans Non assignés.",
+      "myOpenButOtherHas_other": "Aucun lead ne vous est assigné — {{count}} leads attendent dans Non assignés.",
+      "viewUnassigned": "Voir non assignés →",
+      "unassignedAllClaimed_one": "Aucun lead non assigné — {{count}} vous est déjà assigné.",
+      "unassignedAllClaimed_other": "Aucun lead non assigné — {{count}} vous sont déjà assignés.",
+      "viewMyOpen": "Voir mes ouverts →"
     },
     "status": {
       "new": "Nouveau",

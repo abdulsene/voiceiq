@@ -134,11 +134,17 @@ function channelIcon(channel: string | null) {
 export default function LeadsListPage() {
   const apiBase = "business";
   const { t } = useTranslation();
-  const [tab, setTab] = useState<TabKey>(() => {
+  // Initial tab from ?tab= query param. When unset, `tab` stays null until
+  // the counts fetch resolves so smartDefault() can pick the most useful
+  // bucket — avoids the "1 lead invisible on landing because owner is
+  // staring at My open" failure mode.
+  const explicitTab = useMemo<TabKey | null>(() => {
     const params = new URLSearchParams(window.location.search);
     const ti = params.get("tab");
-    return ti === "myOpen" || ti === "unassigned" || ti === "all" ? ti : "myOpen";
-  });
+    return ti === "myOpen" || ti === "unassigned" || ti === "all" ? ti : null;
+  }, []);
+  const [tab, setTab] = useState<TabKey | null>(explicitTab);
+  const [counts, setCounts] = useState<{ myOpen: number; unassigned: number; all: number } | null>(null);
   const [leads, setLeads] = useState<Lead[]>([]);
   const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(true);
@@ -150,6 +156,7 @@ export default function LeadsListPage() {
   // since the server's status param is single-value. Slice 1 acceptable;
   // tighten on the server when Slices 2+ make this a hot list.
   const queryString = useMemo(() => {
+    if (!tab) return null;
     const p = new URLSearchParams();
     p.set("limit", "200");
     if (tab === "myOpen") p.set("assigned_to_me", "true");
@@ -157,7 +164,47 @@ export default function LeadsListPage() {
     return p.toString();
   }, [tab]);
 
+  // One-shot counts fetch on mount. Three parallel requests; myOpen
+  // uses limit=200 because we have to post-filter resolved/dismissed
+  // client-side (same as visibleLeads) — total alone is inaccurate.
+  // After counts resolve, pick smart default unless ?tab= pinned one.
   useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const [myOpenResp, unassignedResp, allResp] = await Promise.all([
+          fetchApi(`/${apiBase}/leads?assigned_to_me=true&limit=200`) as Promise<LeadsListResponse>,
+          fetchApi(`/${apiBase}/leads?status=new&limit=1`) as Promise<LeadsListResponse>,
+          fetchApi(`/${apiBase}/leads?limit=1`) as Promise<LeadsListResponse>,
+        ]);
+        if (cancelled) return;
+        const myOpenCount = (myOpenResp.leads || []).filter(
+          (l) => l.status !== "resolved" && l.status !== "dismissed",
+        ).length;
+        const next = {
+          myOpen: myOpenCount,
+          unassigned: unassignedResp.total ?? 0,
+          all: allResp.total ?? 0,
+        };
+        setCounts(next);
+        if (!explicitTab) {
+          if (next.myOpen > 0) setTab("myOpen");
+          else if (next.unassigned > 0) setTab("unassigned");
+          else if (next.all > 0) setTab("all");
+          else setTab("myOpen");
+        }
+      } catch {
+        // Counts failed — fall through to default tab so the page still
+        // renders. Badges stay hidden.
+        if (cancelled) return;
+        if (!explicitTab) setTab("myOpen");
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [apiBase, explicitTab]);
+
+  useEffect(() => {
+    if (!queryString) return;
     let cancelled = false;
     setLoading(true);
     setLoadError(null);
@@ -185,10 +232,26 @@ export default function LeadsListPage() {
     return leads.filter((l) => l.status !== "resolved" && l.status !== "dismissed");
   }, [leads, tab]);
 
+  // Count source: counts state (fetched once on mount) for ALL tabs so the
+  // badges stay consistent. For the active tab we prefer the live
+  // visibleLeads.length / total because it reflects in-session mutations
+  // once the per-tab fetch resolves; falls back to counts otherwise.
   const tabs: { key: TabKey; labelKey: string; count: number }[] = [
-    { key: "myOpen", labelKey: "leads.tabs.myOpen", count: tab === "myOpen" ? visibleLeads.length : 0 },
-    { key: "unassigned", labelKey: "leads.tabs.unassigned", count: tab === "unassigned" ? visibleLeads.length : 0 },
-    { key: "all", labelKey: "leads.tabs.all", count: tab === "all" ? total : 0 },
+    {
+      key: "myOpen",
+      labelKey: "leads.tabs.myOpen",
+      count: tab === "myOpen" && !loading ? visibleLeads.length : counts?.myOpen ?? 0,
+    },
+    {
+      key: "unassigned",
+      labelKey: "leads.tabs.unassigned",
+      count: tab === "unassigned" && !loading ? visibleLeads.length : counts?.unassigned ?? 0,
+    },
+    {
+      key: "all",
+      labelKey: "leads.tabs.all",
+      count: tab === "all" && !loading ? total : counts?.all ?? 0,
+    },
   ];
 
   return (
@@ -217,7 +280,7 @@ export default function LeadsListPage() {
               }`}
             >
               {t(tabDef.labelKey)}
-              {tab === tabDef.key && tabDef.count > 0 && (
+              {tabDef.count > 0 && (
                 <span className="ml-1.5 inline-flex items-center px-1.5 py-0.5 rounded-full text-[10px] font-semibold bg-gray-100 text-gray-600 tabular-nums">
                   {tabDef.count}
                 </span>
@@ -227,7 +290,7 @@ export default function LeadsListPage() {
         </div>
       </div>
 
-      {loading && (
+      {(tab === null || loading) && (
         <div className="space-y-3">
           {[0, 1, 2].map((i) => (
             <div key={i} className="h-20 rounded-xl border border-gray-200 bg-gray-50 animate-pulse" />
@@ -242,17 +305,58 @@ export default function LeadsListPage() {
         </div>
       )}
 
-      {!loading && !loadError && visibleLeads.length === 0 && (
-        <div className="rounded-2xl border border-dashed border-gray-200 bg-gray-50 px-6 py-12 text-center">
-          <Inbox className="h-10 w-10 text-gray-300 mx-auto mb-3" />
-          <p className="text-sm font-medium text-gray-700">{t("leads.empty.noLeads")}</p>
-          <p className="text-xs text-gray-500 mt-1 max-w-md mx-auto">
-            {t("leads.empty.noLeadsHint")}
-          </p>
-        </div>
-      )}
+      {!loading && !loadError && tab !== null && visibleLeads.length === 0 && (() => {
+        // Count-aware empty state: if the active tab is empty but a
+        // sibling bucket has leads, route the owner there explicitly so
+        // a captured lead doesn't read as "nothing happened."
+        const showMyOpenRedirect = tab === "myOpen" && (counts?.unassigned ?? 0) > 0;
+        const showUnassignedRedirect = tab === "unassigned" && (counts?.myOpen ?? 0) > 0;
+        if (showMyOpenRedirect) {
+          return (
+            <div className="rounded-2xl border border-dashed border-gray-200 bg-gray-50 px-6 py-12 text-center">
+              <Inbox className="h-10 w-10 text-gray-300 mx-auto mb-3" />
+              <p className="text-sm font-medium text-gray-700">
+                {t("leads.empty.myOpenButOtherHas", { count: counts!.unassigned })}
+              </p>
+              <button
+                type="button"
+                onClick={() => setTab("unassigned")}
+                className="mt-3 inline-flex items-center text-sm font-medium text-[#2E75B6] hover:underline"
+              >
+                {t("leads.empty.viewUnassigned")}
+              </button>
+            </div>
+          );
+        }
+        if (showUnassignedRedirect) {
+          return (
+            <div className="rounded-2xl border border-dashed border-gray-200 bg-gray-50 px-6 py-12 text-center">
+              <Inbox className="h-10 w-10 text-gray-300 mx-auto mb-3" />
+              <p className="text-sm font-medium text-gray-700">
+                {t("leads.empty.unassignedAllClaimed", { count: counts!.myOpen })}
+              </p>
+              <button
+                type="button"
+                onClick={() => setTab("myOpen")}
+                className="mt-3 inline-flex items-center text-sm font-medium text-[#2E75B6] hover:underline"
+              >
+                {t("leads.empty.viewMyOpen")}
+              </button>
+            </div>
+          );
+        }
+        return (
+          <div className="rounded-2xl border border-dashed border-gray-200 bg-gray-50 px-6 py-12 text-center">
+            <Inbox className="h-10 w-10 text-gray-300 mx-auto mb-3" />
+            <p className="text-sm font-medium text-gray-700">{t("leads.empty.noLeads")}</p>
+            <p className="text-xs text-gray-500 mt-1 max-w-md mx-auto">
+              {t("leads.empty.noLeadsHint")}
+            </p>
+          </div>
+        );
+      })()}
 
-      {!loading && !loadError && visibleLeads.length > 0 && (
+      {!loading && !loadError && tab !== null && visibleLeads.length > 0 && (
         <div className="space-y-2">
           {visibleLeads.map((lead) => {
             const u = urgencyStyle(lead.urgency);

@@ -135,7 +135,13 @@
     },
     "empty": {
       "noLeads": "Aún no hay leads",
-      "noLeadsHint": "Cuando la IA capture una solicitud de devolución de llamada, aparecerá aquí en segundos. También podrás escalar llamadas a leads desde la vista de llamadas en una próxima actualización."
+      "noLeadsHint": "Cuando la IA capture una solicitud de devolución de llamada, aparecerá aquí en segundos. También podrás escalar llamadas a leads desde la vista de llamadas en una próxima actualización.",
+      "myOpenButOtherHas_one": "Aún no tienes leads asignados — {{count}} lead te espera en No asignados.",
+      "myOpenButOtherHas_other": "Aún no tienes leads asignados — {{count}} leads te esperan en No asignados.",
+      "viewUnassigned": "Ver no asignados →",
+      "unassignedAllClaimed_one": "No hay leads sin asignar — {{count}} ya está asignado a ti.",
+      "unassignedAllClaimed_other": "No hay leads sin asignar — {{count}} ya están asignados a ti.",
+      "viewMyOpen": "Ver mis abiertos →"
     },
     "status": {
       "new": "Nuevo",

@@ -135,7 +135,13 @@
     },
     "empty": {
       "noLeads": "No leads yet",
-      "noLeadsHint": "When the AI captures a callback request, it'll appear here within seconds. You can also escalate calls into leads from the calls view in a later update."
+      "noLeadsHint": "When the AI captures a callback request, it'll appear here within seconds. You can also escalate calls into leads from the calls view in a later update.",
+      "myOpenButOtherHas_one": "No leads assigned to you yet — {{count}} lead is waiting in Unassigned.",
+      "myOpenButOtherHas_other": "No leads assigned to you yet — {{count}} leads are waiting in Unassigned.",
+      "viewUnassigned": "View unassigned →",
+      "unassignedAllClaimed_one": "No unassigned leads — {{count}} is already assigned to you.",
+      "unassignedAllClaimed_other": "No unassigned leads — {{count}} are already assigned to you.",
+      "viewMyOpen": "View my open →"
     },
     "status": {
       "new": "New",
