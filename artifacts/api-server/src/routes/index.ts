@@ -20,7 +20,10 @@ import voicesRouter from "./voices";
 import transferRouter from "./transfer";
 import leadsRouter from "./leads";
 import leadCallsRouter from "./lead-calls";
+import leadOutcomesRouter from "./lead-outcomes";
+import publicLeadRouter from "./public-lead";
 import twilioCallbacksRouter from "./twilio-callbacks";
+import twilioSmsInboundRouter from "./twilio-sms-inbound";
 import adminBusinessesRouter from "./admin-businesses";
 
 const router: IRouter = Router();
@@ -91,10 +94,24 @@ router.use(leadsRouter);
 // Mounted before the catch-all so /api/business/leads/:id/call is
 // claimed here, not by the legacy /lead handler in api.ts.
 router.use(leadCallsRouter);
+// Slice 3A pillar 1: outcome capture per lead-call.
+//   POST /api/business/leads/:id/calls/:callSid/outcome
+// Mounted alongside leadCallsRouter — both deal with the same
+// business/lead/call resource tree.
+router.use(leadOutcomesRouter);
+// Slice 3A pillar 3: customer trust portal — public, no-auth.
+//   GET  /api/public/lead/:token
+//   POST /api/public/lead/:token/action
+// Bypass-listed in app.ts; token is the credential.
+router.use(publicLeadRouter);
 // Slice 2A: Twilio-facing webhooks (recording-status, call-status,
 // bridge TwiML) + public disclosure audio. All bypass-listed in
 // app.ts via signature-verify or public-by-design (disclosure audio).
 router.use(twilioCallbacksRouter);
+// Slice 3A pillar 2: Twilio inbound SMS webhook for STOP / START /
+// HELP handling. Already covered by the /^\/api\/twilio\// AUTH_BYPASS
+// pattern; signature verification is enforced inside the handler.
+router.use(twilioSmsInboundRouter);
 // Stage 6 Phase 1: admin override surface — list + drill-in + admin
 // voice switch. Declares paths starting with /admin/business(es) at
 // root so it doesn't collide with the catch-all adminRouter mounted

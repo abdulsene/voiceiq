@@ -161,6 +161,11 @@ const AUTH_BYPASS_PATTERNS = [
   // endpoint ElevenLabs's agent POSTs to mid-conversation. The token in
   // the Authorization header (ELEVENLABS_TOOL_SECRET) IS the credential.
   /^\/api\/leads\/capture$/,
+  // Slice 3A pillar 3: customer trust portal. GET /api/public/lead/:token
+  // and POST /api/public/lead/:token/action. Token IS the credential
+  // (HS256-signed by lib/trust-portal-token.ts). Tight regex so future
+  // /api/public/* routes don't inherit no-auth.
+  /^\/api\/public\/lead\/[^/]+(\/action)?$/,
   // Slice 2A: Twilio-facing webhooks for the lead-bridge flow. Each
   // verifies X-Twilio-Signature inside the handler. The disclosure
   // audio endpoint is public-by-design (Twilio's <Play> fetches it
