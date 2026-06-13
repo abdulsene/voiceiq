@@ -8,7 +8,7 @@ import { google } from "googleapis";
 import { getAvailableSlots, bookAppointment } from "../calendar";
 import { getMicrosoftAuthUrl, getMicrosoftTokens, getOutlookAvailableSlots, bookOutlookAppointment } from "../outlook";
 import { OBJECTION_TEMPLATES } from "../objectionTemplates";
-import { createAgentForBusiness, updateAgentPrompt, deleteAgent } from "../agents";
+import { createAgentForBusiness, updateAgentPrompt, deleteAgent, updateAgentTools } from "../agents";
 import {
   renderFirstMessage,
   renderPreviewFirstMessage,
@@ -1867,6 +1867,22 @@ router.post("/onboard", costlyLimiter, requireAuth, async (req: Request, res: Re
       }).eq("business_id", businessId);
 
       console.log("[Onboard] Agent", agentResult.agentId, "assigned to", businessId);
+
+      // Wire request_callback (+ transfer_to_number if enabled) into
+      // prompt.tools so the agent has the capture tool registered from
+      // birth — without this, customers had to hit Save on the Transfer
+      // tab before request_callback got registered, which is the
+      // original Slice 1 bug. Failure logs loud but does NOT roll back
+      // the agent creation: an agent without tools is better than no
+      // agent, and ops can re-sync via resync-agent-prompt.ts.
+      const toolsSync = await updateAgentTools(supabase, businessId);
+      if (!toolsSync.success) {
+        console.error("[Onboard] updateAgentTools failed for", businessId, ":", toolsSync.error);
+        Sentry.captureMessage("onboard_tools_sync_failed", {
+          level: "error",
+          extra: { businessId, agentId: agentResult.agentId, error: toolsSync.error },
+        });
+      }
     }
 
     console.log("[Onboard] New business created:", businessId, business_name);
@@ -2044,6 +2060,11 @@ router.post("/preview/generate", async (req: Request, res: Response) => {
     const demoBusinessId = `demo_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
     const expiresAt = new Date(Date.now() + PREVIEW_TTL_MS);
 
+    // Preview demos write to preview_demos, NOT business_configs, so
+    // updateAgentTools (which reads from business_configs) is NOT
+    // wired here. Demo agents intentionally have no request_callback
+    // registered — a 24h preview has no staff to follow up and the
+    // capture webhook would dead-letter on the demo_business_id.
     const agentResult = await createAgentForBusiness({
       businessId: demoBusinessId,
       businessName: `[DEMO] ${business_name}`,

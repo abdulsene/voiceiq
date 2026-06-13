@@ -469,29 +469,29 @@ export async function updateAgentTools(
       );
     }
 
-    // Always append request_callback — IF we have the secret. Missing
-    // secret in dev environments shouldn't break sync; Sentry breadcrumb
-    // makes the omission visible without aborting the PATCH (which
-    // would also wipe transfer).
+    // Always append request_callback. As of the Slice 1 leads-capture
+    // repair, missing ELEVENLABS_TOOL_SECRET is a HARD ERROR — silent
+    // skip was the original Slice 1 bug (agents shipped without the
+    // capture tool and ops had no signal). Production deploys must
+    // have the secret set or onboarding fails loudly.
     const toolSecret = process.env.ELEVENLABS_TOOL_SECRET;
     const captureUrl = process.env.LEADS_CAPTURE_URL || DEFAULT_LEADS_CAPTURE_URL;
-    if (toolSecret) {
-      nextTools.push(
-        buildRequestCallbackTool({
-          businessId,
-          captureUrl,
-          toolSecret,
-        }),
-      );
-    } else {
-      Sentry.addBreadcrumb({
-        category: 'agents.tools',
-        level: 'warning',
-        message: 'request_callback_skipped_no_secret',
-        data: { businessId, agentId: row.agent_id },
+    if (!toolSecret) {
+      const msg = 'ELEVENLABS_TOOL_SECRET not set — request_callback cannot be registered. Refusing to PATCH a partial tool set that would silently drop callback capture.';
+      Sentry.captureException(new Error(msg), {
+        level: 'error',
+        extra: { businessId, agentId: row.agent_id, route: 'updateAgentTools' },
       });
-      console.warn('[Agents] ELEVENLABS_TOOL_SECRET not set — request_callback tool NOT registered for', businessId);
+      console.error('[Agents]', msg, businessId);
+      return { success: false, error: 'tool_secret_missing' };
     }
+    nextTools.push(
+      buildRequestCallbackTool({
+        businessId,
+        captureUrl,
+        toolSecret,
+      }),
+    );
 
     const promptBody: any = { tools: nextTools };
     if (typeof currentPromptText === 'string') {

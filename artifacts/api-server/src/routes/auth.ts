@@ -3,7 +3,7 @@ import { createClient } from "@supabase/supabase-js";
 import pg from "pg";
 import * as Sentry from "@sentry/node";
 import { requireAuth } from "../middlewares/auth";
-import { createAgentForBusiness } from "../agents";
+import { createAgentForBusiness, updateAgentTools } from "../agents";
 import { sendSMS } from "../sms";
 import { auditLog, extractRequestMeta } from "../middlewares/audit";
 import { validate, authLoginSchema, authSignupSchema, authForgotPasswordSchema, authResetPasswordSchema, helpRecoverAccountSchema } from "../middlewares/validate";
@@ -683,6 +683,21 @@ router.post("/auth/complete-onboarding", requireAuth, async (req: Request, res: 
         onboarding_complete: true,
       }).eq("business_id", businessId);
       console.log("[Onboarding] Agent created:", agentResult.agentId, "for", businessId);
+
+      // Wire request_callback (+ transfer_to_number if enabled) into
+      // prompt.tools at signup so new businesses are leads-capable
+      // from birth — closes the Slice 1 gap where tools only got
+      // registered once the customer hit Save on the Transfer tab.
+      // Failure logs loud but does NOT roll back signup; resync via
+      // src/scripts/resync-agent-prompt.ts is idempotent.
+      const toolsSync = await updateAgentTools(supabase, businessId);
+      if (!toolsSync.success) {
+        console.error("[Onboarding] updateAgentTools failed for", businessId, ":", toolsSync.error);
+        Sentry.captureMessage("onboarding_tools_sync_failed", {
+          level: "error",
+          extra: { businessId, agentId: agentResult.agentId, error: toolsSync.error },
+        });
+      }
     } else {
       await supabase.from("business_configs").update({
         onboarding_complete: true,

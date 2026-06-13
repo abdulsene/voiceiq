@@ -45,7 +45,9 @@ import { requireStaffPermission } from "../middlewares/staff-rbac";
 
 import { renderPromptFromHelpers } from "../lib/prompt-renderer";
 import { updateAgentPrompt, type UpdateAgentResult } from "../lib/elevenlabs-agent";
+import { updateAgentTools } from "../agents";
 import { fetchIndustryTemplate, fetchObjectionHandlers } from "./api";
+import * as Sentry from "@sentry/node";
 
 // ───────────────────────────────────────────────────────────────────────
 // Constants
@@ -403,6 +405,25 @@ async function performSaveAndSync(ctx: SaveSyncCtx): Promise<SaveSyncResult> {
   }
 
   if (syncResult.ok) {
+    // After a successful prompt PATCH, also resync the tools array so
+    // any subsequent change to the tool registry (e.g. new request_callback
+    // wiring) lands without waiting for a Transfer-tab save. Failure here
+    // does NOT downgrade the prompt-save success — log to Sentry so ops
+    // can re-emit via src/scripts/resync-agent-prompt.ts if needed.
+    const toolsSync = await updateAgentTools(ctx.supabase, ctx.businessId);
+    if (!toolsSync.success) {
+      console.error(
+        `[prompt] post-save updateAgentTools failed for ${ctx.businessId}: ${toolsSync.error}`,
+      );
+      Sentry.captureMessage("prompt_save_tools_sync_failed", {
+        level: "error",
+        extra: {
+          businessId: ctx.businessId,
+          agentId: ctx.agentId,
+          error: toolsSync.error,
+        },
+      });
+    }
     return {
       ok: true,
       charsWritten: syncResult.charsWritten,

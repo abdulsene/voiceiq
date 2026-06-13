@@ -6815,6 +6815,12 @@ router.post("/demos", requireAuth, requireStaffPermission("customers", "write"),
     const demoBusinessId = `salesdemo_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
     const expiresAt = new Date(Date.now() + expires_in_days * 24 * 60 * 60 * 1000);
 
+    // Sales demos write to preview_demos, NOT business_configs, so
+    // updateAgentTools (which reads from business_configs) is NOT
+    // wired here. The salesdemo agent intentionally has no
+    // request_callback registered — there are no staff to follow up
+    // on captures and the webhook would dead-letter on the
+    // salesdemo_ prefix.
     const agentResult = await createAgentForBusiness({
       businessId: demoBusinessId,
       businessName: `[SALES DEMO] ${business_name}`,
