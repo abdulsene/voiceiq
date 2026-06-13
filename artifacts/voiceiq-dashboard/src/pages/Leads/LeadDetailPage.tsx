@@ -1071,6 +1071,47 @@ export default function LeadDetailPage() {
     return map;
   }, [data]);
 
+  // Slice 3A: derive the header status from the latest outcome across
+  // all call_completed rows. Falls back to lead.status when there's
+  // no outcome yet, preserving Slice 2A behaviour for fresh leads.
+  //
+  // MUST sit above the loading/error early returns — React requires
+  // hooks called in the same order on every render. Putting useMemo
+  // after `if (loading) return …` triggers error #310 on the
+  // first→loaded transition.
+  const latestOverallOutcome = useMemo<ExistingOutcome | null>(() => {
+    if (!data) return null;
+    const allOutcomeRows = data.activities
+      .filter((a) => a.action === "outcome_recorded")
+      .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+    if (allOutcomeRows.length === 0) return null;
+    const m = allOutcomeRows[0];
+    return {
+      outcome: ((m.metadata?.outcome as Outcome | undefined) ?? "other"),
+      reason_code: ((m.metadata?.reason_code as ReasonCode | null | undefined) ?? null),
+      reason_note: m.note,
+      recorded_at: m.created_at,
+    };
+  }, [data]);
+
+  // Slice 3A: surface SMS delivery failures inline so staff knows the
+  // customer didn't get the message. Looks at sms_sent activity rows
+  // whose metadata.status === 'failed' (written by lib/sms-service.ts).
+  // Inert until Commit C wires the SMS pipeline; harmless before then.
+  // Same hooks-before-early-returns rule as latestOverallOutcome above.
+  const smsFailure = useMemo<{ to: string; at: string } | null>(() => {
+    if (!data) return null;
+    const failed = data.activities
+      .filter((a) => a.action === "sms_sent" && a.metadata?.status === "failed")
+      .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+    if (failed.length === 0) return null;
+    const f = failed[0];
+    return {
+      to: (f.metadata?.to_phone as string | undefined) || "the customer",
+      at: f.created_at,
+    };
+  }, [data]);
+
   async function handleConfirmCall() {
     if (!ringPreference || !data) return;
     setCallSaving(true);
@@ -1141,40 +1182,10 @@ export default function LeadDetailPage() {
   const ChannelIcon = channelIcon(lead.preferred_channel);
   const canCall = !!lead.contact_phone;
   const showRingBanner = ringPrefLoaded && !ringPreference && canCall;
-
-  // Slice 3A: derive the header status from the latest outcome across
-  // all call_completed rows. Falls back to lead.status when there's
-  // no outcome yet, preserving Slice 2A behaviour for fresh leads.
-  const latestOverallOutcome = useMemo<ExistingOutcome | null>(() => {
-    const allOutcomeRows = activities
-      .filter((a) => a.action === "outcome_recorded")
-      .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
-    if (allOutcomeRows.length === 0) return null;
-    const m = allOutcomeRows[0];
-    return {
-      outcome: ((m.metadata?.outcome as Outcome | undefined) ?? "other"),
-      reason_code: ((m.metadata?.reason_code as ReasonCode | null | undefined) ?? null),
-      reason_note: m.note,
-      recorded_at: m.created_at,
-    };
-  }, [activities]);
+  // headerStatus is a plain function call, not a hook — safe to
+  // compute below the early returns. The useMemo it consumes
+  // (latestOverallOutcome) is hoisted above per React's rules-of-hooks.
   const headerStatus = deriveHeaderStatus(lead, latestOverallOutcome);
-
-  // Slice 3A: surface SMS delivery failures inline so staff knows the
-  // customer didn't get the message. Looks at sms_sent activity rows
-  // whose metadata.status === 'failed' (written by lib/sms-service.ts).
-  // Inert until Commit C wires the SMS pipeline; harmless before then.
-  const smsFailure = useMemo<{ to: string; at: string } | null>(() => {
-    const failed = activities
-      .filter((a) => a.action === "sms_sent" && a.metadata?.status === "failed")
-      .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
-    if (failed.length === 0) return null;
-    const f = failed[0];
-    return {
-      to: (f.metadata?.to_phone as string | undefined) || "the customer",
-      at: f.created_at,
-    };
-  }, [activities]);
 
   return (
     <div className="max-w-3xl mx-auto p-4 md:p-6 space-y-6 pb-12">
