@@ -321,6 +321,117 @@
       "lost": "Lost",
       "other": "Other"
     },
+    "portal": {
+      "headerLabel": "Your request to",
+      "callBusiness": "Call us",
+      "requestSummaryLabel": "What you asked about",
+      "actionsLabel": "Anything else?",
+      "timelineLabel": "What's happened so far",
+      "capturedAt": "Submitted {{when}}",
+      "notFound": "We couldn't find this request",
+      "notFoundHint": "The link may be expired, or the team may have removed access. Try calling the business directly.",
+      "networkError": "We couldn't reach the team right now — try again in a moment.",
+      "actionError": "Something went wrong. Try again.",
+      "confirmCancel": "Cancel this request? The team will be notified.",
+      "confirmMarkUrgent": "Bump this to higher priority? The team will be notified right away.",
+      "fallbackStaffName": "Your team",
+      "footer": "Powered by Neverr",
+      "status": {
+        "default": {
+          "title": "We got your request",
+          "body": "Someone from {{business_name}} will follow up shortly."
+        },
+        "captured_awaiting_assignment": {
+          "title": "We got your request",
+          "body": "{{business_name}} is routing your callback to the right person. You'll hear back soon."
+        },
+        "assigned": {
+          "title": "{{staff_first_name}} is on it",
+          "body": "{{staff_first_name}} from {{business_name}} will be in touch — expected by {{window_latest}}."
+        },
+        "staff_acknowledged": {
+          "title": "{{staff_first_name}} is preparing your callback",
+          "body": "Just a few minutes — they'll call you shortly."
+        },
+        "on_call": {
+          "title": "On the phone with {{staff_first_name}} now",
+          "body": "If you missed the call, we'll try again automatically."
+        },
+        "resolved": {
+          "title": "Resolved by {{staff_first_name}}",
+          "body": "Glad we could help. If this didn't fully resolve your need, you can rate it below or reach out again."
+        },
+        "booked": {
+          "title": "You're booked!",
+          "body": "{{staff_first_name}} confirmed your appointment with {{business_name}}. We'll send a reminder before."
+        },
+        "follow_up_scheduled": {
+          "title": "Follow-up scheduled",
+          "body": "{{staff_first_name}} will reach out at the scheduled time. Need it sooner? Use Mark urgent below."
+        },
+        "no_answer": {
+          "title": "We tried to reach you",
+          "body": "{{business_name}} called but we couldn't connect. Reply with a better time using Reschedule below."
+        },
+        "cancelled": {
+          "title": "Request cancelled",
+          "body": "You cancelled this request. Need to start over? Call {{business_name}} directly."
+        }
+      },
+      "timeline": {
+        "captured": "We received your request",
+        "assigned": "{{staff_first_name}} took ownership",
+        "staff_acknowledged": "{{staff_first_name}} acknowledged your request",
+        "callback_started": "{{staff_first_name}} started the call",
+        "callback_completed": "Call completed with {{staff_first_name}}",
+        "callback_failed": "Call attempt didn't connect",
+        "sms_sent": "We sent you a text update",
+        "outcome_recorded": "Latest update: {{outcome}}",
+        "customer_rated": "You rated this experience",
+        "customer_rescheduled": "You requested a reschedule",
+        "customer_cancelled": "You cancelled this request",
+        "customer_marked_urgent": "You marked this urgent"
+      },
+      "outcomeLabel": {
+        "resolved": "Resolved",
+        "booked": "Booked",
+        "follow_up_needed": "Follow-up scheduled",
+        "no_answer": "Couldn't reach you",
+        "wrong_number": "Wrong number",
+        "declined": "Declined",
+        "lost": "Closed",
+        "other": "Updated"
+      },
+      "actions": {
+        "rate": "Rate your experience",
+        "rated": "Thanks for rating!",
+        "reschedule": "Reschedule",
+        "markUrgent": "Mark urgent",
+        "cancel": "Cancel request"
+      },
+      "rate": {
+        "title": "How was the experience?",
+        "subtitle": "Your rating goes straight to the team.",
+        "commentPlaceholder": "Optional — tell us anything they should know.",
+        "cancel": "Not now",
+        "submit": "Submit"
+      },
+      "reschedule": {
+        "title": "Pick a better time",
+        "subtitle": "The team will be notified of your new preferred time.",
+        "cancel": "Cancel",
+        "submit": "Send"
+      },
+      "relative": {
+        "justNow": "just now",
+        "minutesAgo_one": "{{count}} minute ago",
+        "minutesAgo_other": "{{count}} minutes ago",
+        "hoursAgo_one": "{{count}} hour ago",
+        "hoursAgo_other": "{{count}} hours ago",
+        "daysAgo_one": "{{count}} day ago",
+        "daysAgo_other": "{{count}} days ago"
+      }
+    },
     "callback": {
       "title": "Callback ring number",
       "subtitle": "When you click Call customer on a lead, we'll ring this phone first, then bridge you to the customer.",

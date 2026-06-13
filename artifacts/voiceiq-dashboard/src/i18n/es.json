@@ -321,6 +321,117 @@
       "lost": "Perdido",
       "other": "Otro"
     },
+    "portal": {
+      "headerLabel": "Tu solicitud para",
+      "callBusiness": "Llamar",
+      "requestSummaryLabel": "Lo que pediste",
+      "actionsLabel": "¿Algo más?",
+      "timelineLabel": "Qué ha pasado",
+      "capturedAt": "Enviado {{when}}",
+      "notFound": "No encontramos esta solicitud",
+      "notFoundHint": "El enlace puede haber expirado o el equipo lo retiró. Intenta llamar al negocio directamente.",
+      "networkError": "No pudimos contactar al equipo — intenta de nuevo en un momento.",
+      "actionError": "Algo salió mal. Inténtalo de nuevo.",
+      "confirmCancel": "¿Cancelar esta solicitud? El equipo será notificado.",
+      "confirmMarkUrgent": "¿Aumentar prioridad? El equipo recibirá un aviso inmediato.",
+      "fallbackStaffName": "El equipo",
+      "footer": "Con tecnología de Neverr",
+      "status": {
+        "default": {
+          "title": "Recibimos tu solicitud",
+          "body": "Alguien de {{business_name}} te contactará en breve."
+        },
+        "captured_awaiting_assignment": {
+          "title": "Recibimos tu solicitud",
+          "body": "{{business_name}} está asignando tu devolución a la persona adecuada. Te contactaremos pronto."
+        },
+        "assigned": {
+          "title": "{{staff_first_name}} se está encargando",
+          "body": "{{staff_first_name}} de {{business_name}} te contactará — esperado antes de {{window_latest}}."
+        },
+        "staff_acknowledged": {
+          "title": "{{staff_first_name}} está preparando tu llamada",
+          "body": "Unos minutos — te llamará en breve."
+        },
+        "on_call": {
+          "title": "Hablando con {{staff_first_name}} ahora",
+          "body": "Si perdiste la llamada, lo intentaremos de nuevo."
+        },
+        "resolved": {
+          "title": "Resuelto por {{staff_first_name}}",
+          "body": "Nos alegra haberte ayudado. Si no resolvió tu necesidad, califica abajo o contáctanos de nuevo."
+        },
+        "booked": {
+          "title": "¡Reservado!",
+          "body": "{{staff_first_name}} confirmó tu cita con {{business_name}}. Te enviaremos un recordatorio."
+        },
+        "follow_up_scheduled": {
+          "title": "Seguimiento programado",
+          "body": "{{staff_first_name}} te contactará a la hora programada. ¿Necesitas antes? Usa Marcar urgente."
+        },
+        "no_answer": {
+          "title": "Intentamos contactarte",
+          "body": "{{business_name}} llamó pero no logramos conectar. Programa una mejor hora con Reprogramar."
+        },
+        "cancelled": {
+          "title": "Solicitud cancelada",
+          "body": "Cancelaste esta solicitud. ¿Necesitas empezar de nuevo? Llama a {{business_name}} directamente."
+        }
+      },
+      "timeline": {
+        "captured": "Recibimos tu solicitud",
+        "assigned": "{{staff_first_name}} tomó el caso",
+        "staff_acknowledged": "{{staff_first_name}} confirmó tu solicitud",
+        "callback_started": "{{staff_first_name}} inició la llamada",
+        "callback_completed": "Llamada completada con {{staff_first_name}}",
+        "callback_failed": "El intento de llamada no se conectó",
+        "sms_sent": "Te enviamos una actualización por SMS",
+        "outcome_recorded": "Última actualización: {{outcome}}",
+        "customer_rated": "Calificaste esta experiencia",
+        "customer_rescheduled": "Pediste reprogramar",
+        "customer_cancelled": "Cancelaste esta solicitud",
+        "customer_marked_urgent": "Marcaste esta solicitud como urgente"
+      },
+      "outcomeLabel": {
+        "resolved": "Resuelto",
+        "booked": "Reservado",
+        "follow_up_needed": "Seguimiento programado",
+        "no_answer": "No te alcanzamos",
+        "wrong_number": "Número equivocado",
+        "declined": "Rechazado",
+        "lost": "Cerrado",
+        "other": "Actualizado"
+      },
+      "actions": {
+        "rate": "Califica tu experiencia",
+        "rated": "¡Gracias por calificar!",
+        "reschedule": "Reprogramar",
+        "markUrgent": "Marcar urgente",
+        "cancel": "Cancelar solicitud"
+      },
+      "rate": {
+        "title": "¿Cómo estuvo?",
+        "subtitle": "Tu calificación llega directo al equipo.",
+        "commentPlaceholder": "Opcional — cuéntanos lo que deban saber.",
+        "cancel": "Ahora no",
+        "submit": "Enviar"
+      },
+      "reschedule": {
+        "title": "Elige una mejor hora",
+        "subtitle": "El equipo será notificado de tu nueva hora preferida.",
+        "cancel": "Cancelar",
+        "submit": "Enviar"
+      },
+      "relative": {
+        "justNow": "ahora mismo",
+        "minutesAgo_one": "hace {{count}} minuto",
+        "minutesAgo_other": "hace {{count}} minutos",
+        "hoursAgo_one": "hace {{count}} hora",
+        "hoursAgo_other": "hace {{count}} horas",
+        "daysAgo_one": "hace {{count}} día",
+        "daysAgo_other": "hace {{count}} días"
+      }
+    },
     "callback": {
       "title": "Número para devoluciones de llamada",
       "subtitle": "Cuando hagas clic en Llamar al cliente desde un lead, llamaremos primero a este teléfono y luego te conectaremos con el cliente.",

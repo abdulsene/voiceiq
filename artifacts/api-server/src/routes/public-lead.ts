@@ -56,13 +56,54 @@ function getSupabase(): SupabaseClient | null {
   return createClient(url, key, { auth: { persistSession: false } });
 }
 
-function firstNameFromMeta(meta: unknown): string | null {
-  if (!meta || typeof meta !== "object") return null;
-  const m = meta as Record<string, unknown>;
-  const full = (m.full_name ?? m.name) as string | undefined;
-  if (!full || typeof full !== "string") return null;
-  const trimmed = full.trim().split(/\s+/)[0];
+function firstChunk(s: string): string | null {
+  const trimmed = s.trim().split(/\s+/)[0];
   return trimmed || null;
+}
+
+/**
+ * Extract a customer-presentable first name from a Supabase Auth user.
+ *
+ * Tries, in order, the field shapes we've actually observed in
+ * production:
+ *   1. user_metadata.first_name          — explicit field (preferred)
+ *   2. user_metadata.given_name          — OAuth-style (Google IdP)
+ *   3. user_metadata.full_name           — split on whitespace, take [0]
+ *   4. user_metadata.name                — same split
+ *   5. user.email local-part             — humanize (strip dots/digits)
+ *
+ * Returns null when none are usable so the caller can fall back to a
+ * neutral label ("Your team"). Order matters: an OAuth signup may
+ * have both given_name and full_name; given_name is more accurate.
+ */
+function firstNameFromUser(
+  user: { email?: string | null; user_metadata?: unknown } | null | undefined,
+): string | null {
+  if (!user) return null;
+  const meta = user.user_metadata;
+  if (meta && typeof meta === "object") {
+    const m = meta as Record<string, unknown>;
+    for (const field of ["first_name", "given_name"]) {
+      const v = m[field];
+      if (typeof v === "string" && v.trim()) return firstChunk(v);
+    }
+    for (const field of ["full_name", "name", "display_name"]) {
+      const v = m[field];
+      if (typeof v === "string" && v.trim()) return firstChunk(v);
+    }
+  }
+  // Last-ditch: email local-part. "anna.smith+work@x.com" → "Anna".
+  // Better than the generic fallback because at least it's specific to
+  // the staff member.
+  if (typeof user.email === "string" && user.email.includes("@")) {
+    const local = user.email.split("@")[0].replace(/\+.*/, "");
+    const cleaned = local.replace(/[._-]+/g, " ").replace(/\d+/g, " ").trim();
+    if (cleaned) {
+      const first = firstChunk(cleaned);
+      if (first) return first.charAt(0).toUpperCase() + first.slice(1).toLowerCase();
+    }
+  }
+  return null;
 }
 
 /**
@@ -82,7 +123,7 @@ async function resolveStaffFirstNames(
         out.set(uid, "Your team");
         continue;
       }
-      out.set(uid, firstNameFromMeta(data.user.user_metadata) || "Your team");
+      out.set(uid, firstNameFromUser(data.user) || "Your team");
     } catch {
       out.set(uid, "Your team");
     }
@@ -118,6 +159,7 @@ interface LeadRow {
   status: string;
   preferred_channel: string | null;
   created_at: string;
+  first_response_at: string | null;
   trust_portal_disabled: boolean | null;
   outcome_booked: boolean | null;
 }
@@ -159,7 +201,7 @@ async function loadPortalState(
   const { data: leadRaw } = await supabase
     .from("leads")
     .select(
-      "id, business_id, contact_name, contact_phone, reason, urgency, status, preferred_channel, created_at, trust_portal_disabled, outcome_booked",
+      "id, business_id, contact_name, contact_phone, reason, urgency, status, preferred_channel, created_at, first_response_at, trust_portal_disabled, outcome_booked",
     )
     .eq("id", leadId)
     .maybeSingle();
@@ -278,19 +320,42 @@ function buildSanitizedTimeline(
   return events;
 }
 
+/**
+ * Derive the customer-visible status string from lead + calls + outcome.
+ * Returns one of the 9 documented Slice 3A states:
+ *   captured_awaiting_assignment | assigned | staff_acknowledged |
+ *   on_call | resolved | booked | follow_up_scheduled | no_answer |
+ *   cancelled
+ *
+ * Precedence (each branch wins over those below):
+ *   1. cancelled — terminal
+ *   2. resolved / booked — terminal
+ *   3. follow_up_scheduled — staff explicitly scheduled a follow-up
+ *   4. no_answer — last call attempt failed to reach the customer
+ *   5. on_call — a call is currently ringing or in progress
+ *   6. staff_acknowledged — lead.first_response_at is set, no active
+ *      call, not yet resolved. Distinct from `assigned` because the
+ *      customer wants to know the team has SEEN the request, not just
+ *      that someone owns it.
+ *   7. assigned — lead.status is claimed/in_progress
+ *   8. captured_awaiting_assignment — default for fresh leads
+ */
 function statusForCustomer(
   lead: LeadRow,
   calls: LeadCallRow[],
   latestOutcome: { outcome: string } | null,
 ): string {
+  if (lead.status === "cancelled") return "cancelled";
   if (lead.status === "resolved") {
     return latestOutcome?.outcome === "booked" ? "booked" : "resolved";
   }
-  if (lead.status === "cancelled") return "cancelled";
+  if (latestOutcome?.outcome === "follow_up_needed") return "follow_up_scheduled";
+  if (latestOutcome?.outcome === "no_answer") return "no_answer";
   const onCall = calls.find(
     (c) => c.status === "in_progress" || c.status === "ringing" || c.status === "initiated",
   );
   if (onCall) return "on_call";
+  if (lead.first_response_at) return "staff_acknowledged";
   if (lead.status === "claimed" || lead.status === "in_progress") return "assigned";
   return "captured_awaiting_assignment";
 }

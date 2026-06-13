@@ -7,6 +7,7 @@ import CallsLeads from "./pages/CallsLeads";
 import LeadsListPage from "./pages/Leads/LeadsListPage";
 import LeadDetailPage from "./pages/Leads/LeadDetailPage";
 import CallbackSettingsPage from "./pages/Leads/CallbackSettingsPage";
+import TrustPortalPage from "./pages/Public/TrustPortalPage";
 import Contacts from "./pages/Contacts";
 import Appointments from "./pages/Appointments";
 import SmsCampaigns from "./pages/SmsCampaigns";
@@ -794,6 +795,12 @@ function App() {
             Sits OUTSIDE DashboardLayout so a logged-out user landing
             here doesn't bounce off AuthGuard. */}
         <Route path="/reset-password" component={ResetPassword} />
+        {/* Slice 3A pillar 3: customer trust portal. Token is HS256-
+            signed by the api-server (lib/trust-portal-token.ts) and IS
+            the credential — no auth wrap. Sits OUTSIDE DashboardLayout
+            so an unauthenticated customer landing here doesn't bounce
+            off AuthGuard. Mobile-first by design. */}
+        <Route path="/r/:token" component={TrustPortalPage} />
         <Route path="/dashboard" component={() => <DashboardLayout />} />
         <Route path="/calls" component={() => <DashboardLayout />} />
         <Route path="/leads" component={() => <DashboardLayout />} />
