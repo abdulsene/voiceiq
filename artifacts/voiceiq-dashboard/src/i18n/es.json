@@ -267,6 +267,59 @@
         "empty": "No se capturó transcripción."
       }
     },
+    "outcome": {
+      "cardTitle": "¿Qué pasó?",
+      "save": "Guardar resultado",
+      "saving": "Guardando…",
+      "cancel": "Cancelar",
+      "change": "Cambiar",
+      "recordedAt": "Registrado {{time}}",
+      "noteLabel": "Añade una nota (opcional)",
+      "notePlaceholder": "Cualquier cosa que el equipo debería saber antes del seguimiento.",
+      "followUpLabel": "¿Cuándo retomamos contacto?",
+      "label": {
+        "resolved": "Resuelto",
+        "booked": "Reservado",
+        "follow_up_needed": "Requiere seguimiento",
+        "no_answer": "Sin respuesta",
+        "wrong_number": "Número equivocado",
+        "declined": "Rechazado",
+        "lost": "Perdido",
+        "other": "Otro"
+      },
+      "reasonPrompt": {
+        "declined": "¿Por qué rechazó?",
+        "lost": "¿Por qué lo perdimos?"
+      },
+      "reasonCode": {
+        "price": "Precio",
+        "timing": "Tiempo",
+        "competitor": "Competencia",
+        "not_qualified": "No calificado",
+        "changed_mind": "Cambió de opinión",
+        "other": "Otro"
+      },
+      "errors": {
+        "reasonRequired": "Elige un motivo.",
+        "followUpRequired": "Elige una hora para el seguimiento.",
+        "saveFailed": "No se pudo guardar el resultado. Inténtalo de nuevo.",
+        "network": "Error de red — inténtalo de nuevo."
+      },
+      "smsFailureToast": {
+        "title": "No pudimos enviar el SMS al cliente.",
+        "body": "El mensaje a {{phone}} no se envió — contáctalo manualmente."
+      }
+    },
+    "headerStatus": {
+      "resolved": "Resuelto",
+      "booked": "Reservado",
+      "follow_up_needed": "Requiere seguimiento",
+      "no_answer": "Sin respuesta",
+      "wrong_number": "Número equivocado",
+      "declined": "Rechazado",
+      "lost": "Perdido",
+      "other": "Otro"
+    },
     "callback": {
       "title": "Número para devoluciones de llamada",
       "subtitle": "Cuando hagas clic en Llamar al cliente desde un lead, llamaremos primero a este teléfono y luego te conectaremos con el cliente.",

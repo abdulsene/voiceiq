@@ -267,6 +267,59 @@
         "empty": "Aucune transcription capturée."
       }
     },
+    "outcome": {
+      "cardTitle": "Que s'est-il passé ?",
+      "save": "Enregistrer le résultat",
+      "saving": "Enregistrement…",
+      "cancel": "Annuler",
+      "change": "Modifier",
+      "recordedAt": "Enregistré {{time}}",
+      "noteLabel": "Ajouter une note (facultatif)",
+      "notePlaceholder": "Tout ce que l'équipe devrait savoir avant le suivi.",
+      "followUpLabel": "Quand reprendre contact ?",
+      "label": {
+        "resolved": "Résolu",
+        "booked": "Réservé",
+        "follow_up_needed": "Suivi requis",
+        "no_answer": "Pas de réponse",
+        "wrong_number": "Mauvais numéro",
+        "declined": "Refusé",
+        "lost": "Perdu",
+        "other": "Autre"
+      },
+      "reasonPrompt": {
+        "declined": "Pourquoi a-t-il refusé ?",
+        "lost": "Pourquoi l'avons-nous perdu ?"
+      },
+      "reasonCode": {
+        "price": "Prix",
+        "timing": "Timing",
+        "competitor": "Concurrence",
+        "not_qualified": "Non qualifié",
+        "changed_mind": "A changé d'avis",
+        "other": "Autre"
+      },
+      "errors": {
+        "reasonRequired": "Choisissez un motif.",
+        "followUpRequired": "Choisissez une heure de suivi.",
+        "saveFailed": "Impossible d'enregistrer le résultat. Réessayez.",
+        "network": "Erreur réseau — réessayez."
+      },
+      "smsFailureToast": {
+        "title": "Le SMS au client n'a pas pu être envoyé.",
+        "body": "Le message à {{phone}} a échoué — contactez-le manuellement."
+      }
+    },
+    "headerStatus": {
+      "resolved": "Résolu",
+      "booked": "Réservé",
+      "follow_up_needed": "Suivi requis",
+      "no_answer": "Pas de réponse",
+      "wrong_number": "Mauvais numéro",
+      "declined": "Refusé",
+      "lost": "Perdu",
+      "other": "Autre"
+    },
     "callback": {
       "title": "Numéro de rappel",
       "subtitle": "Quand vous cliquez sur Appeler le client depuis un lead, nous appelons d'abord ce téléphone puis nous vous mettons en relation avec le client.",

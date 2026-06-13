@@ -31,6 +31,7 @@ import {
   ArrowLeft,
   Bot,
   Check,
+  Clock,
   CornerDownRight,
   Cog,
   FileText,
@@ -499,6 +500,373 @@ function CallLiveStatus({
   );
 }
 
+// ── Slice 3A pillar 1: outcome capture ────────────────────────────────
+
+type Outcome =
+  | "resolved"
+  | "booked"
+  | "follow_up_needed"
+  | "no_answer"
+  | "wrong_number"
+  | "declined"
+  | "lost"
+  | "other";
+
+type ReasonCode =
+  | "price"
+  | "timing"
+  | "competitor"
+  | "not_qualified"
+  | "changed_mind"
+  | "other";
+
+const OUTCOMES: Outcome[] = [
+  "resolved",
+  "booked",
+  "follow_up_needed",
+  "no_answer",
+  "wrong_number",
+  "declined",
+  "lost",
+  "other",
+];
+
+const REASON_CODES: ReasonCode[] = [
+  "price",
+  "timing",
+  "competitor",
+  "not_qualified",
+  "changed_mind",
+  "other",
+];
+
+const REASON_REQUIRED_OUTCOMES = new Set<Outcome>(["declined", "lost"]);
+const FOLLOW_UP_REQUIRED_OUTCOMES = new Set<Outcome>(["follow_up_needed"]);
+
+function outcomePillStyle(outcome: Outcome): string {
+  switch (outcome) {
+    case "resolved":
+    case "booked":
+      return "bg-emerald-50 text-emerald-700 border-emerald-200";
+    case "follow_up_needed":
+      return "bg-amber-50 text-amber-700 border-amber-200";
+    case "no_answer":
+      return "bg-orange-50 text-orange-700 border-orange-200";
+    case "lost":
+      return "bg-red-50 text-red-700 border-red-200";
+    case "wrong_number":
+    case "declined":
+      return "bg-gray-100 text-gray-600 border-gray-200";
+    default:
+      return "bg-gray-50 text-gray-600 border-gray-200";
+  }
+}
+
+function outcomeIcon(outcome: Outcome) {
+  switch (outcome) {
+    case "resolved":
+    case "booked":
+      return <Check className="h-3.5 w-3.5" aria-hidden="true" />;
+    case "follow_up_needed":
+      return <Clock className="h-3.5 w-3.5" aria-hidden="true" />;
+    case "no_answer":
+    case "wrong_number":
+      return <PhoneOff className="h-3.5 w-3.5" aria-hidden="true" />;
+    case "lost":
+      return <XCircle className="h-3.5 w-3.5" aria-hidden="true" />;
+    case "declined":
+      return <X className="h-3.5 w-3.5" aria-hidden="true" />;
+    default:
+      return <CornerDownRight className="h-3.5 w-3.5" aria-hidden="true" />;
+  }
+}
+
+interface ExistingOutcome {
+  outcome: Outcome;
+  reason_code: ReasonCode | null;
+  reason_note: string | null;
+  recorded_at: string;
+}
+
+/**
+ * Derive the latest outcome for a given call_sid from the activity
+ * timeline. The backend writes one outcome_recorded activity per
+ * outcome submission; we surface the most-recent one. The DB has a
+ * UNIQUE constraint on lead_call_outcomes(lead_call_id), but a
+ * customer who re-records via UPSERT WILL produce multiple activity
+ * rows — pick the latest.
+ */
+function latestOutcomeForCall(
+  activities: Activity[],
+  callSid: string | undefined,
+): ExistingOutcome | null {
+  if (!callSid) return null;
+  const matches = activities
+    .filter((a) => a.action === "outcome_recorded" && a.metadata?.call_sid === callSid)
+    .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+  if (matches.length === 0) return null;
+  const m = matches[0];
+  return {
+    outcome: ((m.metadata?.outcome as Outcome | undefined) ?? "other"),
+    reason_code: ((m.metadata?.reason_code as ReasonCode | null | undefined) ?? null),
+    reason_note: m.note,
+    recorded_at: m.created_at,
+  };
+}
+
+/**
+ * Derive the headline status pill shown at the top of the page. Mixes
+ * lead.status with the latest outcome so a booked lead shows "Booked"
+ * (green) and a follow-up shows "Follow-up needed" (amber) instead of
+ * the generic 'new' / 'claimed' / 'in_progress' labels.
+ */
+function deriveHeaderStatus(
+  lead: Lead,
+  latestOutcome: ExistingOutcome | null,
+): { key: string; pill: string } {
+  if (lead.status === "resolved") {
+    const isBooked = latestOutcome?.outcome === "booked";
+    return {
+      key: isBooked ? "booked" : "resolved",
+      pill: "bg-emerald-50 text-emerald-700 border-emerald-200",
+    };
+  }
+  if (latestOutcome) {
+    return {
+      key: latestOutcome.outcome,
+      pill: outcomePillStyle(latestOutcome.outcome),
+    };
+  }
+  return { key: lead.status, pill: statusStyle(lead.status) };
+}
+
+function OutcomeCard({
+  apiBase,
+  leadId,
+  callSid,
+  existingOutcome,
+  onSubmitted,
+  t,
+}: {
+  apiBase: string;
+  leadId: string;
+  callSid: string;
+  existingOutcome: ExistingOutcome | null;
+  onSubmitted: () => void;
+  t: (k: string, opts?: Record<string, unknown>) => string;
+}) {
+  const [outcome, setOutcome] = useState<Outcome | null>(null);
+  const [reasonCode, setReasonCode] = useState<ReasonCode | null>(null);
+  const [reasonNote, setReasonNote] = useState("");
+  const [followUpAt, setFollowUpAt] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const [submitError, setSubmitError] = useState<string | null>(null);
+  const [expanded, setExpanded] = useState(false);
+
+  // Already-recorded outcome and not expanded → show read-only badge.
+  if (existingOutcome && !expanded) {
+    return (
+      <div className="mt-3 flex flex-wrap items-center gap-2">
+        <span
+          className={`inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-semibold rounded-full border ${outcomePillStyle(existingOutcome.outcome)}`}
+        >
+          {outcomeIcon(existingOutcome.outcome)}
+          {t(`leads.outcome.label.${existingOutcome.outcome}`)}
+        </span>
+        <span className="text-xs text-gray-500">
+          {t("leads.outcome.recordedAt", { time: formatTimestamp(existingOutcome.recorded_at) })}
+        </span>
+        <button
+          type="button"
+          onClick={() => {
+            setOutcome(existingOutcome.outcome);
+            setReasonCode(existingOutcome.reason_code);
+            setReasonNote(existingOutcome.reason_note || "");
+            setExpanded(true);
+          }}
+          className="text-xs text-gray-500 hover:text-gray-700 hover:underline"
+        >
+          {t("leads.outcome.change")}
+        </button>
+      </div>
+    );
+  }
+
+  async function submit() {
+    if (!outcome) return;
+    if (REASON_REQUIRED_OUTCOMES.has(outcome) && !reasonCode) {
+      setSubmitError(t("leads.outcome.errors.reasonRequired"));
+      return;
+    }
+    if (FOLLOW_UP_REQUIRED_OUTCOMES.has(outcome) && !followUpAt) {
+      setSubmitError(t("leads.outcome.errors.followUpRequired"));
+      return;
+    }
+    setSubmitting(true);
+    setSubmitError(null);
+    try {
+      const body = {
+        outcome,
+        reason_code: reasonCode || null,
+        reason_note: reasonNote.trim() || null,
+        follow_up_at: followUpAt ? new Date(followUpAt).toISOString() : null,
+      };
+      const r = await fetch(
+        `/api/${apiBase}/leads/${leadId}/calls/${callSid}/outcome`,
+        {
+          method: "POST",
+          headers: { ...getAuthHeaders(), "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        },
+      );
+      const respBody = (await r.json().catch(() => ({}))) as { error?: string };
+      if (!r.ok) {
+        setSubmitError(respBody.error || t("leads.outcome.errors.saveFailed"));
+        return;
+      }
+      setExpanded(false);
+      onSubmitted();
+    } catch (e: any) {
+      setSubmitError(e?.message || t("leads.outcome.errors.network"));
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  return (
+    <div className="mt-3 rounded-xl border border-gray-200 bg-white p-4 space-y-3">
+      <p className="text-sm font-semibold text-gray-900">{t("leads.outcome.cardTitle")}</p>
+
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+        {OUTCOMES.map((o) => {
+          const selected = outcome === o;
+          return (
+            <button
+              key={o}
+              type="button"
+              onClick={() => {
+                setOutcome(o);
+                setSubmitError(null);
+                // Reset conditional fields when leaving outcomes that
+                // required them so a stale value isn't sent.
+                if (!REASON_REQUIRED_OUTCOMES.has(o)) setReasonCode(null);
+                if (!FOLLOW_UP_REQUIRED_OUTCOMES.has(o)) setFollowUpAt("");
+              }}
+              className={`flex items-center gap-1.5 px-2.5 py-2 text-xs font-medium rounded-lg border transition-colors ${
+                selected
+                  ? "border-[#2E75B6] bg-[#2E75B6]/5 text-[#2E75B6]"
+                  : "border-gray-200 bg-gray-50 text-gray-700 hover:bg-gray-100"
+              }`}
+            >
+              {outcomeIcon(o)}
+              <span>{t(`leads.outcome.label.${o}`)}</span>
+            </button>
+          );
+        })}
+      </div>
+
+      {outcome && REASON_REQUIRED_OUTCOMES.has(outcome) && (
+        <div className="space-y-1.5">
+          <p className="text-xs font-medium text-gray-700">
+            {t(`leads.outcome.reasonPrompt.${outcome}`)}
+          </p>
+          <div className="grid grid-cols-2 sm:grid-cols-3 gap-1.5">
+            {REASON_CODES.map((rc) => {
+              const selected = reasonCode === rc;
+              return (
+                <button
+                  key={rc}
+                  type="button"
+                  onClick={() => { setReasonCode(rc); setSubmitError(null); }}
+                  className={`px-2.5 py-1.5 text-xs font-medium rounded-md border transition-colors ${
+                    selected
+                      ? "border-[#2E75B6] bg-[#2E75B6]/5 text-[#2E75B6]"
+                      : "border-gray-200 bg-gray-50 text-gray-700 hover:bg-gray-100"
+                  }`}
+                >
+                  {t(`leads.outcome.reasonCode.${rc}`)}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {outcome && FOLLOW_UP_REQUIRED_OUTCOMES.has(outcome) && (
+        <div className="space-y-1">
+          <label className="block text-xs font-medium text-gray-700">
+            {t("leads.outcome.followUpLabel")}
+          </label>
+          <input
+            type="datetime-local"
+            value={followUpAt}
+            onChange={(e) => { setFollowUpAt(e.target.value); setSubmitError(null); }}
+            className="w-full px-2.5 py-1.5 text-xs border border-gray-200 rounded-md focus:outline-none focus:ring-2 focus:ring-[#2E75B6]/30"
+          />
+        </div>
+      )}
+
+      {outcome && (
+        <div className="space-y-1">
+          <label className="block text-xs font-medium text-gray-700">
+            {t("leads.outcome.noteLabel")}
+          </label>
+          <textarea
+            value={reasonNote}
+            onChange={(e) => setReasonNote(e.target.value)}
+            rows={2}
+            maxLength={2000}
+            placeholder={t("leads.outcome.notePlaceholder")}
+            className="w-full px-2.5 py-1.5 text-xs border border-gray-200 rounded-md focus:outline-none focus:ring-2 focus:ring-[#2E75B6]/30 resize-none"
+          />
+        </div>
+      )}
+
+      {submitError && (
+        <div className="rounded-md border border-red-200 bg-red-50 px-2.5 py-1.5 text-xs text-red-700 inline-flex items-center gap-1.5">
+          <AlertCircle className="h-3 w-3 shrink-0" />
+          <span>{submitError}</span>
+        </div>
+      )}
+
+      <div className="flex items-center justify-end gap-2">
+        {existingOutcome && (
+          <button
+            type="button"
+            onClick={() => {
+              setExpanded(false);
+              setOutcome(null);
+              setReasonCode(null);
+              setReasonNote("");
+              setFollowUpAt("");
+              setSubmitError(null);
+            }}
+            disabled={submitting}
+            className="px-3 py-1.5 text-xs text-gray-600 rounded-md hover:bg-gray-100 disabled:opacity-50"
+          >
+            {t("leads.outcome.cancel")}
+          </button>
+        )}
+        <button
+          type="button"
+          onClick={() => { void submit(); }}
+          disabled={!outcome || submitting}
+          className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold bg-[#2E75B6] text-white rounded-md hover:bg-[#2563a0] disabled:opacity-50 disabled:cursor-not-allowed"
+        >
+          {submitting ? (
+            <>
+              <Loader2 className="h-3 w-3 animate-spin" />
+              {t("leads.outcome.saving")}
+            </>
+          ) : (
+            t("leads.outcome.save")
+          )}
+        </button>
+      </div>
+    </div>
+  );
+}
+
 // Rich call_completed timeline entry. Renders header line + stats +
 // summary inline + audio player + transcript modal trigger. Per spec,
 // everything visible at first glance — no extra clicks.
@@ -507,12 +875,16 @@ function CallCompletedEntry({
   leadId,
   activity,
   callRow,
+  existingOutcome,
+  onOutcomeRecorded,
   t,
 }: {
   apiBase: string;
   leadId: string;
   activity: Activity;
   callRow: LeadCallStatus | null;
+  existingOutcome: ExistingOutcome | null;
+  onOutcomeRecorded: () => void;
   t: (k: string, opts?: Record<string, unknown>) => string;
 }) {
   const [showTranscript, setShowTranscript] = useState(false);
@@ -600,6 +972,19 @@ function CallCompletedEntry({
       </div>
       {showTranscript && transcript && (
         <TranscriptModal transcript={transcript} onClose={() => setShowTranscript(false)} />
+      )}
+      {/* Slice 3A — outcome capture card. Only renders when we have a
+          callSid (Twilio CallSid) to link the outcome to. Collapses
+          into a read-only badge once submitted. */}
+      {(activity.metadata?.call_sid || callRow?.call_sid) && (
+        <OutcomeCard
+          apiBase={apiBase}
+          leadId={leadId}
+          callSid={String(activity.metadata?.call_sid || callRow?.call_sid)}
+          existingOutcome={existingOutcome}
+          onSubmitted={onOutcomeRecorded}
+          t={t}
+        />
       )}
     </div>
   );
@@ -757,6 +1142,40 @@ export default function LeadDetailPage() {
   const canCall = !!lead.contact_phone;
   const showRingBanner = ringPrefLoaded && !ringPreference && canCall;
 
+  // Slice 3A: derive the header status from the latest outcome across
+  // all call_completed rows. Falls back to lead.status when there's
+  // no outcome yet, preserving Slice 2A behaviour for fresh leads.
+  const latestOverallOutcome = useMemo<ExistingOutcome | null>(() => {
+    const allOutcomeRows = activities
+      .filter((a) => a.action === "outcome_recorded")
+      .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+    if (allOutcomeRows.length === 0) return null;
+    const m = allOutcomeRows[0];
+    return {
+      outcome: ((m.metadata?.outcome as Outcome | undefined) ?? "other"),
+      reason_code: ((m.metadata?.reason_code as ReasonCode | null | undefined) ?? null),
+      reason_note: m.note,
+      recorded_at: m.created_at,
+    };
+  }, [activities]);
+  const headerStatus = deriveHeaderStatus(lead, latestOverallOutcome);
+
+  // Slice 3A: surface SMS delivery failures inline so staff knows the
+  // customer didn't get the message. Looks at sms_sent activity rows
+  // whose metadata.status === 'failed' (written by lib/sms-service.ts).
+  // Inert until Commit C wires the SMS pipeline; harmless before then.
+  const smsFailure = useMemo<{ to: string; at: string } | null>(() => {
+    const failed = activities
+      .filter((a) => a.action === "sms_sent" && a.metadata?.status === "failed")
+      .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+    if (failed.length === 0) return null;
+    const f = failed[0];
+    return {
+      to: (f.metadata?.to_phone as string | undefined) || "the customer",
+      at: f.created_at,
+    };
+  }, [activities]);
+
   return (
     <div className="max-w-3xl mx-auto p-4 md:p-6 space-y-6 pb-12">
       <div>
@@ -810,8 +1229,14 @@ export default function LeadDetailPage() {
             <span className={`inline-flex items-center px-2.5 py-1 text-xs font-semibold rounded-full border ${u.pill}`}>
               {t(`leads.urgency.${lead.urgency}`)}
             </span>
-            <span className={`inline-flex items-center px-2.5 py-1 text-xs font-semibold rounded-full border ${statusStyle(lead.status)}`}>
-              {t(`leads.status.${lead.status}`)}
+            <span className={`inline-flex items-center px-2.5 py-1 text-xs font-semibold rounded-full border ${headerStatus.pill}`}>
+              {t(`leads.headerStatus.${headerStatus.key}`, {
+                defaultValue: t(`leads.status.${headerStatus.key}`, {
+                  defaultValue: t(`leads.outcome.label.${headerStatus.key}`, {
+                    defaultValue: headerStatus.key,
+                  }),
+                }),
+              })}
             </span>
           </div>
         </div>
@@ -850,6 +1275,22 @@ export default function LeadDetailPage() {
           >
             {t("leads.call.ringBanner.cta")} →
           </Link>
+        </div>
+      )}
+
+      {smsFailure && (
+        <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 flex items-start gap-2 text-sm text-amber-900" role="status" aria-live="polite">
+          <AlertTriangle className="h-4 w-4 shrink-0 mt-0.5" />
+          <div className="flex-1">
+            <p className="font-medium">
+              {t("leads.outcome.smsFailureToast.title")}
+            </p>
+            <p className="text-xs mt-0.5">
+              {t("leads.outcome.smsFailureToast.body", {
+                phone: formatPhoneForDisplay(smsFailure.to) || smsFailure.to,
+              })}
+            </p>
+          </div>
         </div>
       )}
 
@@ -947,7 +1388,8 @@ export default function LeadDetailPage() {
                 )}
 
                 {/* Slice 2A — call_completed rich rendering (per spec: no
-                    extra clicks; everything visible at first glance) */}
+                    extra clicks; everything visible at first glance).
+                    Slice 3A adds the inline outcome capture card. */}
                 {a.action === "call_completed" && (
                   <div className="mt-2">
                     <CallCompletedEntry
@@ -955,6 +1397,11 @@ export default function LeadDetailPage() {
                       leadId={leadId}
                       activity={a}
                       callRow={callRowsByActivity[a.id] || null}
+                      existingOutcome={latestOutcomeForCall(
+                        activities,
+                        (a.metadata?.call_sid || callRowsByActivity[a.id]?.call_sid) as string | undefined,
+                      )}
+                      onOutcomeRecorded={() => { void refreshDetail(); }}
                       t={t}
                     />
                   </div>

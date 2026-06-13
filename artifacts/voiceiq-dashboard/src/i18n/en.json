@@ -267,6 +267,59 @@
         "empty": "No transcript captured."
       }
     },
+    "outcome": {
+      "cardTitle": "What happened?",
+      "save": "Save outcome",
+      "saving": "Saving…",
+      "cancel": "Cancel",
+      "change": "Change",
+      "recordedAt": "Recorded {{time}}",
+      "noteLabel": "Add a note (optional)",
+      "notePlaceholder": "Anything the team should know before following up.",
+      "followUpLabel": "When should we follow up?",
+      "label": {
+        "resolved": "Resolved",
+        "booked": "Booked",
+        "follow_up_needed": "Follow-up needed",
+        "no_answer": "No answer",
+        "wrong_number": "Wrong number",
+        "declined": "Declined",
+        "lost": "Lost",
+        "other": "Other"
+      },
+      "reasonPrompt": {
+        "declined": "Why did they decline?",
+        "lost": "Why did we lose it?"
+      },
+      "reasonCode": {
+        "price": "Price",
+        "timing": "Timing",
+        "competitor": "Competitor",
+        "not_qualified": "Not qualified",
+        "changed_mind": "Changed their mind",
+        "other": "Other"
+      },
+      "errors": {
+        "reasonRequired": "Please pick a reason.",
+        "followUpRequired": "Please pick a follow-up time.",
+        "saveFailed": "Couldn't save outcome. Try again.",
+        "network": "Network error — try again."
+      },
+      "smsFailureToast": {
+        "title": "We couldn't text the customer.",
+        "body": "The message to {{phone}} failed to send — please reach out manually."
+      }
+    },
+    "headerStatus": {
+      "resolved": "Resolved",
+      "booked": "Booked",
+      "follow_up_needed": "Follow-up needed",
+      "no_answer": "No answer",
+      "wrong_number": "Wrong number",
+      "declined": "Declined",
+      "lost": "Lost",
+      "other": "Other"
+    },
     "callback": {
       "title": "Callback ring number",
       "subtitle": "When you click Call customer on a lead, we'll ring this phone first, then bridge you to the customer.",
