@@ -203,7 +203,8 @@
         "escalated": "Escalated",
         "call_initiated": "Call started",
         "call_completed": "Call completed",
-        "call_failed": "Call didn't connect"
+        "call_failed": "Call didn't connect",
+        "outcome_recorded": "Outcome recorded"
       },
       "capturedDescription": "The AI captured this lead during a live call and passed it on for follow-up.",
       "linkedCallPrefix": "Source:",

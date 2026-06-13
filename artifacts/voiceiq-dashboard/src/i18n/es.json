@@ -203,7 +203,8 @@
         "escalated": "Escalado",
         "call_initiated": "Llamada iniciada",
         "call_completed": "Llamada completada",
-        "call_failed": "La llamada no se conectó"
+        "call_failed": "La llamada no se conectó",
+        "outcome_recorded": "Resultado registrado"
       },
       "capturedDescription": "La IA capturó este lead durante una llamada en vivo y lo pasó para seguimiento.",
       "linkedCallPrefix": "Origen:",

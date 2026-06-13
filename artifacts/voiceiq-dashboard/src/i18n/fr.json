@@ -203,7 +203,8 @@
         "escalated": "Escaladé",
         "call_initiated": "Appel démarré",
         "call_completed": "Appel terminé",
-        "call_failed": "L'appel n'a pas abouti"
+        "call_failed": "L'appel n'a pas abouti",
+        "outcome_recorded": "Résultat enregistré"
       },
       "capturedDescription": "L'IA a capturé ce lead pendant un appel en direct et l'a transmis pour suivi.",
       "linkedCallPrefix": "Source :",
