@@ -34,6 +34,7 @@ import {
   Clock,
   CornerDownRight,
   Cog,
+  Edit2,
   FileText,
   Headphones,
   Loader2,
@@ -684,8 +685,9 @@ function OutcomeCard({
             setReasonNote(existingOutcome.reason_note || "");
             setExpanded(true);
           }}
-          className="text-xs text-gray-500 hover:text-gray-700 hover:underline"
+          className="inline-flex items-center gap-1 text-xs font-medium text-[#2E75B6] hover:underline"
         >
+          <Edit2 className="h-3.5 w-3.5" aria-hidden="true" />
           {t("leads.outcome.change")}
         </button>
       </div>
