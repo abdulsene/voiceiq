@@ -211,7 +211,13 @@ export async function sendLeadSms(
   }
   const smsMessageId = (queued as { id?: string } | null)?.id;
 
-  // Send via Twilio.
+  // Send via Twilio. statusCallback wires Twilio's async delivery
+  // tracker to our handler at /api/twilio/sms-status — the synchronous
+  // API response is just "queued" / "sent" (we accepted the message);
+  // the actual delivered / undelivered / failed signal arrives on a
+  // separate POST from Twilio minutes later when carrier filters /
+  // 10DLC enforcement / blocked-number lookups complete.
+  const publicBase = (process.env.PUBLIC_API_URL || "https://voice-i-q.replit.app").replace(/\/+$/, "");
   let twilioSid: string | undefined;
   let twilioError: string | undefined;
   try {
@@ -220,6 +226,7 @@ export async function sendLeadSms(
       body,
       from: fromPhone,
       to: normalizedTo,
+      statusCallback: `${publicBase}/api/twilio/sms-status`,
     });
     twilioSid = result.sid;
   } catch (err: any) {

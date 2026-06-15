@@ -586,6 +586,153 @@ async function runT7_T10_pipeline(supabase: SupabaseClient) {
   }
 }
 
+async function runT11_smsStatusCallback(supabase: SupabaseClient) {
+  // T11 — Twilio delivery-status webhook flips sms_messages.status to
+  // 'undelivered' AND writes a NEW lead_activities row with
+  // metadata.status='failed' so LeadDetailPage's failure-toast lights up.
+  // Bypasses signature verification via TWILIO_WEBHOOK_VERIFY=0 (same
+  // pattern as test 021).
+  process.env.TWILIO_WEBHOOK_VERIFY = "0";
+
+  // Import the router AFTER setting the env so any module-load reads
+  // of TWILIO_WEBHOOK_VERIFY pick up the bypass.
+  const { default: twilioSmsStatusRouter } = await import("../routes/twilio-sms-status");
+  const app = express();
+  app.use(express.urlencoded({ extended: false }));
+  app.use(express.json());
+  app.use(twilioSmsStatusRouter);
+
+  const suffix = crypto.randomBytes(4).toString("hex");
+  const fixtureBiz = `biz_test_3a_t11_${Date.now()}_${suffix}`;
+  await supabase.from("business_configs").insert({
+    business_id: fixtureBiz,
+    business_name: "T11 Biz",
+    industry: "general",
+    phone_number: "+19785550000",
+    email: `t11-${suffix}@neverr.test`,
+    timezone: "America/New_York",
+    business_hours: "Monday-Friday 9AM-5PM",
+    status: "active",
+    subscription_status: "trialing",
+    twilio_phone_number: "+14155559999",
+    created_at: new Date().toISOString(),
+  });
+  const { data: leadIns } = await supabase
+    .from("leads")
+    .insert({
+      business_id: fixtureBiz,
+      source: "ai_callback",
+      contact_name: "T11 Customer",
+      contact_phone: "+12025550011",
+      reason: "T11 smoke",
+      urgency: "medium",
+    })
+    .select("id")
+    .maybeSingle();
+  if (!leadIns) {
+    record("T11 fixture lead", false, "insert failed");
+    return;
+  }
+  const leadId = (leadIns as { id: string }).id;
+
+  // Pre-populate sms_messages with a "sent" row mirroring what
+  // sms-service.ts would have written.
+  const twilioSid = `SMtest1234567890_${suffix}`;
+  const { data: smsIns } = await supabase
+    .from("sms_messages")
+    .insert({
+      business_id: fixtureBiz,
+      lead_id: leadId,
+      direction: "outbound",
+      to_phone: "+12025550011",
+      from_phone: "+14155559999",
+      body: "T11 test body",
+      template: "lead_captured",
+      template_locale: "en",
+      twilio_sid: twilioSid,
+      status: "sent",
+    })
+    .select("id")
+    .maybeSingle();
+  if (!smsIns) {
+    record("T11 fixture sms_messages", false, "insert failed");
+    return;
+  }
+
+  try {
+    // Dispatch the webhook in-process. Twilio posts form-encoded data
+    // but the router's express.urlencoded() parser populates req.body
+    // the same as production.
+    const res = await new Promise<{ status: number }>((resolve) => {
+      const req: any = {
+        method: "POST",
+        url: "/twilio/sms-status",
+        originalUrl: "/twilio/sms-status",
+        headers: {
+          "content-type": "application/x-www-form-urlencoded",
+          "x-twilio-signature": "stub-bypassed-by-env",
+        },
+        body: {
+          MessageSid: twilioSid,
+          MessageStatus: "undelivered",
+          ErrorCode: "30034",
+        },
+        header(name: string) { return this.headers[name.toLowerCase()]; },
+        query: {},
+      };
+      const r: any = {
+        statusCode: 200,
+        status(code: number) { this.statusCode = code; return this; },
+        json() { resolve({ status: this.statusCode }); },
+        send() { resolve({ status: this.statusCode }); },
+        setHeader() {},
+        type() { return this; },
+      };
+      (app as any).handle(req, r, () => resolve({ status: 404 }));
+    });
+
+    if (res.status !== 200) {
+      record("T11 webhook ack", false, `status=${res.status}`);
+    } else {
+      // Verify sms_messages row updated.
+      const { data: smsRow } = await supabase
+        .from("sms_messages")
+        .select("status, error_message")
+        .eq("twilio_sid", twilioSid)
+        .maybeSingle();
+      const { data: actRow } = await supabase
+        .from("lead_activities")
+        .select("metadata")
+        .eq("lead_id", leadId)
+        .eq("action", "sms_sent")
+        .filter("metadata->>status", "eq", "failed")
+        .maybeSingle();
+      const status = (smsRow as any)?.status;
+      const errMsg = (smsRow as any)?.error_message;
+      const meta = (actRow as any)?.metadata as Record<string, unknown> | undefined;
+      const failures: string[] = [];
+      if (status !== "undelivered") failures.push(`status=${status}`);
+      if (errMsg !== "30034") failures.push(`error_message=${errMsg}`);
+      if (!meta) failures.push("no failure activity row");
+      else {
+        if (meta.error_message !== "30034") failures.push(`activity error_message=${meta.error_message}`);
+        if (meta.to_phone !== "+12025550011") failures.push(`activity to_phone=${meta.to_phone}`);
+        if (meta.template !== "lead_captured") failures.push(`activity template=${meta.template}`);
+      }
+      if (failures.length > 0) {
+        record("T11 status callback end-to-end", false, failures.join("; "));
+      } else {
+        record("T11 status callback flips status + writes failure activity", true, "sms_messages.status=undelivered, error_message=30034, activity present with metadata");
+      }
+    }
+  } finally {
+    await supabase.from("sms_messages").delete().eq("business_id", fixtureBiz);
+    await supabase.from("lead_activities").delete().eq("lead_id", leadId);
+    await supabase.from("leads").delete().eq("id", leadId);
+    await supabase.from("business_configs").delete().eq("business_id", fixtureBiz);
+  }
+}
+
 async function main() {
   if (!SUPABASE_URL || !SERVICE_KEY) {
     console.log("SKIP: SUPABASE_URL / SUPABASE_SERVICE_KEY required for 020.");
@@ -598,6 +745,7 @@ async function main() {
   await runT1_T2_smsService(supabase);
   await runT3_T6_routes(supabase);
   await runT7_T10_pipeline(supabase);
+  await runT11_smsStatusCallback(supabase);
 
   const fails = results.filter((r) => !r.pass);
   console.log(`\n${results.length - fails.length}/${results.length} passed`);

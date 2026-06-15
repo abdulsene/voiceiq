@@ -256,3 +256,45 @@ The `opted_out` short-circuit is its own status value — Twilio is
 never called, `sms_messages.status='opted_out'`, and no activity row
 is written (staff seeing "we suppressed an SMS the customer asked
 not to receive" would be noise).
+
+### Twilio delivery-status callback — closes the async loop
+
+Twilio's `messages.create()` API is two-phase. The synchronous
+response we get at call time is just "queued" / "sent" — Twilio
+accepted the bytes. The real carrier outcome (delivered /
+undelivered / failed) lands asynchronously when carrier filters /
+A2P 10DLC enforcement / blocked-number lookups complete, typically
+seconds to minutes later.
+
+Without the second phase wired up, `sms_messages.status` stayed
+stuck at 'sent' even when the carrier ultimately rejected. Confirmed
+in production 2026-06-15: test SID `SMa65f8160f2a12c7fd3b4851c424d1e33`
+returned status `undelivered` (error 30034 — A2P 10DLC compliance)
+in the Twilio Console while our DB still showed `sent`.
+
+**Handler URL:** `https://voice-i-q.replit.app/api/twilio/sms-status`
+
+**Configuration:** API-driven. `lib/sms-service.ts` passes
+`statusCallback` as a parameter on every `messages.create()` call —
+**NOT** a per-number Twilio Console config. So no additional ops
+setup beyond the existing inbound-webhook URL config in
+[Twilio Console: inbound webhook URL](#twilio-console-inbound-webhook-url-per-tenant).
+A single deploy of this handler covers all future sends.
+
+**What it does on receipt:**
+
+1. Verifies `X-Twilio-Signature` (same handler chain as other webhooks).
+2. Reads `MessageSid`, `MessageStatus`, optional `ErrorCode`.
+3. `UPDATE sms_messages SET status = MessageStatus, error_message = ErrorCode WHERE twilio_sid = MessageSid`. Adds `delivered_at` when the new status is `delivered`.
+4. If `MessageStatus IN ('failed', 'undelivered')`: INSERT a NEW
+   `lead_activities` row (`action='sms_sent'`,
+   `metadata.status='failed'`, `metadata.to_phone`,
+   `metadata.template`, `metadata.error_message`,
+   `metadata.carrier_status`). The original `sent` activity row stays
+   intact — the send genuinely happened; the failure is a separate
+   event in the timeline.
+
+`sms_messages.status` is now the source of truth for carrier
+delivery, not just Twilio's synchronous API response. The
+LeadDetailPage failure-toast (Commit B) activates when the new
+activity row lands.
