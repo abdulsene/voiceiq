@@ -45,6 +45,7 @@ import { verifyTwilioSignature } from "../lib/twilio-signature";
 import { transcribeRecording } from "../lib/transcription";
 import { summarizeCallTranscript } from "../lib/call-summary";
 import { getOrGenerateDisclosure, type DisclosureLeg } from "../lib/disclosure-tts";
+import { getPublicApiBase } from "../lib/public-url";
 
 const router = Router();
 
@@ -56,7 +57,7 @@ function getSupabase(): SupabaseClient | null {
 }
 
 function publicBase(): string {
-  return (process.env.PUBLIC_API_URL || "https://voice-i-q.replit.app").replace(/\/+$/, "");
+  return getPublicApiBase();
 }
 
 /**

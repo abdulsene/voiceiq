@@ -37,6 +37,7 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 import * as Sentry from "@sentry/node";
 import { getTwilioClient } from "../sms";
+import { getPublicApiBase } from "./public-url";
 import {
   renderSmsTemplate,
   type SmsLocale,
@@ -217,7 +218,7 @@ export async function sendLeadSms(
   // the actual delivered / undelivered / failed signal arrives on a
   // separate POST from Twilio minutes later when carrier filters /
   // 10DLC enforcement / blocked-number lookups complete.
-  const publicBase = (process.env.PUBLIC_API_URL || "https://voice-i-q.replit.app").replace(/\/+$/, "");
+  const publicBase = getPublicApiBase();
   let twilioSid: string | undefined;
   let twilioError: string | undefined;
   try {

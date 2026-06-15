@@ -43,6 +43,7 @@ import { getTwilioClient } from "../sms";
 import { resolveOutboundCallerId } from "../lib/twilio-caller-id";
 import { sendLeadSms } from "../lib/sms-service";
 import { briefReason } from "../lib/sms-templates";
+import { getPublicApiBase } from "../lib/public-url";
 
 const router = Router();
 
@@ -180,7 +181,7 @@ async function handleInitiateCall(opts: {
   // status callbacks. Same env resolution as the signature verifier
   // (PUBLIC_API_URL with documented fallback) — must match the URL
   // Twilio sees so our signature verify can rebuild.
-  const publicBase = (process.env.PUBLIC_API_URL || "https://voice-i-q.replit.app").replace(/\/+$/, "");
+  const publicBase = getPublicApiBase();
   const bridgeTwimlUrl = `${publicBase}/api/twilio/voice/lead-bridge?lead_call_id=${encodeURIComponent(leadCallId)}`;
   const recordingStatusUrl = `${publicBase}/api/twilio/recording-status`;
   const callStatusUrl = `${publicBase}/api/twilio/call-status?lead_call_id=${encodeURIComponent(leadCallId)}`;

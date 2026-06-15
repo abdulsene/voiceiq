@@ -17,6 +17,8 @@
  * during testing.
  */
 
+import { getPublicApiBase } from "./public-url";
+
 export type SmsTemplate =
   | "lead_captured"
   | "callback_starting"
@@ -83,7 +85,7 @@ export function briefReason(reason: string, maxChars = 80): string {
  * sites don't drift.
  */
 export function portalUrlFromToken(token: string): string {
-  const base = (process.env.PUBLIC_API_URL || "https://voice-i-q.replit.app").replace(/\/+$/, "");
+  const base = getPublicApiBase();
   return `${base}/r/${token}`;
 }
 
