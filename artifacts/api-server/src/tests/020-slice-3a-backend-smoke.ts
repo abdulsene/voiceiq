@@ -31,8 +31,10 @@ import express, { type Express } from "express";
 
 import { sendLeadSms, recordOptOut } from "../lib/sms-service";
 import { signTrustToken } from "../lib/trust-portal-token";
+import { renderSmsTemplate } from "../lib/sms-templates";
 import leadOutcomesRouter from "../routes/lead-outcomes";
 import publicLeadRouter from "../routes/public-lead";
+import leadsRouter from "../routes/leads";
 
 const SUPABASE_URL = process.env.SUPABASE_URL || "";
 const SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY || "";
@@ -83,6 +85,7 @@ function buildTestApp(): Express {
   });
   app.use(leadOutcomesRouter);
   app.use(publicLeadRouter);
+  app.use(leadsRouter);
   return app;
 }
 
@@ -423,6 +426,166 @@ async function runT3_T6_routes(supabase: SupabaseClient) {
   }
 }
 
+async function runT7_T10_pipeline(supabase: SupabaseClient) {
+  // T7 + T10 dispatch the capture endpoint. The capture route auths
+  // via verifyToolSecret (Bearer ELEVENLABS_TOOL_SECRET), NOT requireAuth,
+  // so route-level dispatch works without a real Supabase JWT.
+  //
+  // T8 + T9 verify the template/context contract for the two SMS sends
+  // that DO sit behind requireAuth + requirePermission (lead-bridge and
+  // outcome). We exercise sendLeadSms directly with the realistic
+  // context those routes build so a future template drift is caught
+  // here even if route-level dispatch isn't running in this environment.
+
+  process.env.TRUST_PORTAL_SIGNING_SECRET =
+    process.env.TRUST_PORTAL_SIGNING_SECRET || crypto.randomBytes(32).toString("hex");
+  process.env.ELEVENLABS_TOOL_SECRET =
+    process.env.ELEVENLABS_TOOL_SECRET || crypto.randomBytes(16).toString("hex");
+  const toolSecret = process.env.ELEVENLABS_TOOL_SECRET;
+
+  const app = buildTestApp();
+  const suffix = crypto.randomBytes(4).toString("hex");
+  const fixtureBiz = `biz_test_3a_pipe_${Date.now()}_${suffix}`;
+  const tenantPhone = "+14155557777";
+
+  await supabase.from("business_configs").insert({
+    business_id: fixtureBiz,
+    business_name: "T7-T10 Biz",
+    industry: "general",
+    phone_number: "+19785550000",
+    email: `t7-${suffix}@neverr.test`,
+    timezone: "America/New_York",
+    business_hours: "Monday-Friday 9AM-5PM",
+    status: "active",
+    subscription_status: "trialing",
+    twilio_phone_number: tenantPhone,
+    created_at: new Date().toISOString(),
+  });
+
+  try {
+    // ── T7: capture route fires lead_captured SMS ─────────────────────
+    twilioCalls.length = 0;
+    const r7 = await dispatch(app, "POST", "/leads/capture", {
+      headers: { authorization: `Bearer ${toolSecret}` },
+      body: {
+        business_id: fixtureBiz,
+        conversation_id: `conv_${suffix}`,
+        contact_name: "T7 Customer",
+        contact_phone: "+12025557777",
+        reason: "I'd like a callback about renting a car this weekend please",
+        urgency: "medium",
+        preferred_channel: "call",
+      },
+    });
+    if (r7.status !== 200 || !r7.body?.lead_id) {
+      record("T7 capture route", false, `status=${r7.status} body=${JSON.stringify(r7.body).slice(0, 200)}`);
+    } else {
+      // SMS is fire-and-forget; give it a moment to land in the DB.
+      await new Promise((r) => setTimeout(r, 300));
+      const leadId7 = r7.body.lead_id;
+      const { data: smsRow } = await supabase
+        .from("sms_messages")
+        .select("template, status, body")
+        .eq("lead_id", leadId7)
+        .eq("template", "lead_captured")
+        .maybeSingle();
+      const { data: actRow } = await supabase
+        .from("lead_activities")
+        .select("metadata")
+        .eq("lead_id", leadId7)
+        .eq("action", "sms_sent")
+        .maybeSingle();
+      const portalInBody = typeof (smsRow as any)?.body === "string" && ((smsRow as any).body as string).includes("/r/");
+      if (!smsRow || (smsRow as any).template !== "lead_captured") {
+        record("T7 lead_captured sms row", false, `row=${JSON.stringify(smsRow)}`);
+      } else if (!portalInBody) {
+        record("T7 portal_url in body", false, `body=${JSON.stringify((smsRow as any).body).slice(0, 200)}`);
+      } else if (!actRow) {
+        record("T7 sms_sent activity row", false, "missing");
+      } else {
+        record("T7 capture → lead_captured SMS end-to-end", true, "template=lead_captured, portal_url present, activity row present");
+      }
+      await supabase.from("sms_messages").delete().eq("lead_id", leadId7);
+      await supabase.from("lead_activities").delete().eq("lead_id", leadId7);
+      await supabase.from("leads").delete().eq("id", leadId7);
+    }
+
+    // ── T8: callback_starting template contract ───────────────────────
+    const renderedStarting = renderSmsTemplate("callback_starting", "en", {
+      business_name: "T7-T10 Biz",
+      brief_reason: "renting a car this weekend",
+      from_phone: tenantPhone,
+    });
+    const startingHas = ["T7-T10 Biz", "30 seconds", "renting a car this weekend", tenantPhone, "Reply STOP"].every((s) =>
+      renderedStarting.includes(s),
+    );
+    if (!startingHas) {
+      record("T8 callback_starting render", false, `rendered=${renderedStarting.slice(0, 200)}`);
+    } else {
+      record("T8 callback_starting template contract", true, "business + reason + from_phone + STOP all present");
+    }
+
+    // ── T9: callback_resolved template contract ───────────────────────
+    const renderedResolved = renderSmsTemplate("callback_resolved", "en", {
+      business_name: "T7-T10 Biz",
+      staff_name: "Abdul",
+      portal_url: "https://voice-i-q.replit.app/r/test-token",
+    });
+    const resolvedHas = ["T7-T10 Biz", "Abdul", "https://voice-i-q.replit.app/r/test-token", "Reply STOP"].every((s) =>
+      renderedResolved.includes(s),
+    );
+    if (!resolvedHas) {
+      record("T9 callback_resolved render", false, `rendered=${renderedResolved.slice(0, 200)}`);
+    } else {
+      record("T9 callback_resolved template contract", true, "business + staff + portal + STOP all present");
+    }
+
+    // ── T10: capture route on opted-out phone short-circuits ──────────
+    twilioCalls.length = 0;
+    const optedPhone = "+12025558888";
+    await recordOptOut({ supabase, businessId: fixtureBiz, phone: optedPhone });
+    const r10 = await dispatch(app, "POST", "/leads/capture", {
+      headers: { authorization: `Bearer ${toolSecret}` },
+      body: {
+        business_id: fixtureBiz,
+        conversation_id: `conv10_${suffix}`,
+        contact_name: "T10 Customer",
+        contact_phone: optedPhone,
+        reason: "test opt-out short-circuit",
+        urgency: "medium",
+        preferred_channel: "call",
+      },
+    });
+    if (r10.status !== 200 || !r10.body?.lead_id) {
+      record("T10 capture route on opted-out", false, `status=${r10.status} body=${JSON.stringify(r10.body).slice(0, 200)}`);
+    } else {
+      await new Promise((r) => setTimeout(r, 300));
+      const leadId10 = r10.body.lead_id;
+      const { data: smsRow } = await supabase
+        .from("sms_messages")
+        .select("status")
+        .eq("lead_id", leadId10)
+        .eq("template", "lead_captured")
+        .maybeSingle();
+      // Twilio must NOT have been called for this lead's send.
+      const twilioCallForT10 = twilioCalls.find((c) => c.to === optedPhone);
+      if (!smsRow || (smsRow as any).status !== "opted_out") {
+        record("T10 sms_messages status=opted_out", false, `row=${JSON.stringify(smsRow)}`);
+      } else if (twilioCallForT10) {
+        record("T10 no Twilio call", false, "Twilio was called despite opt-out");
+      } else {
+        record("T10 capture → opted-out short-circuit", true, "status=opted_out, no Twilio call");
+      }
+      await supabase.from("sms_messages").delete().eq("lead_id", leadId10);
+      await supabase.from("lead_activities").delete().eq("lead_id", leadId10);
+      await supabase.from("leads").delete().eq("id", leadId10);
+    }
+  } finally {
+    await supabase.from("sms_opt_outs").delete().eq("business_id", fixtureBiz);
+    await supabase.from("business_configs").delete().eq("business_id", fixtureBiz);
+  }
+}
+
 async function main() {
   if (!SUPABASE_URL || !SERVICE_KEY) {
     console.log("SKIP: SUPABASE_URL / SUPABASE_SERVICE_KEY required for 020.");
@@ -434,6 +597,7 @@ async function main() {
 
   await runT1_T2_smsService(supabase);
   await runT3_T6_routes(supabase);
+  await runT7_T10_pipeline(supabase);
 
   const fails = results.filter((r) => !r.pass);
   console.log(`\n${results.length - fails.length}/${results.length} passed`);

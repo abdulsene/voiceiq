@@ -38,6 +38,9 @@ import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import * as Sentry from "@sentry/node";
 
 import { requireAuth, requirePermission } from "../middlewares/auth";
+import { sendLeadSms } from "../lib/sms-service";
+import { portalUrlFromToken } from "../lib/sms-templates";
+import { signTrustToken } from "../lib/trust-portal-token";
 
 const router = Router();
 
@@ -270,6 +273,58 @@ router.post(
           extra: { leadId, outcome, error: leadUpdErr.message },
         });
       }
+    }
+
+    // Slice 3A pillar 2: fire callback_resolved SMS on terminal-win
+    // outcomes. Skip for follow_up_needed / no_answer / wrong_number /
+    // declined / lost / other — those don't represent a successful
+    // close, so prompting a rating would be off-tone. Fire-and-forget
+    // so SMS failure doesn't roll back the outcome write.
+    if (outcome === "resolved" || outcome === "booked") {
+      (async () => {
+        try {
+          const [{ data: bizRow }, { data: leadFullRow }, { data: staffData }] = await Promise.all([
+            supabase
+              .from("business_configs")
+              .select("business_name")
+              .eq("business_id", businessId)
+              .maybeSingle(),
+            supabase
+              .from("leads")
+              .select("contact_phone")
+              .eq("id", leadId)
+              .maybeSingle(),
+            supabase.auth.admin.getUserById(userId),
+          ]);
+          const businessName = (bizRow as { business_name?: string } | null)?.business_name || "the team";
+          const customerPhone = (leadFullRow as { contact_phone?: string } | null)?.contact_phone || "";
+          const meta = (staffData?.user?.user_metadata || {}) as Record<string, unknown>;
+          const staffName =
+            (typeof meta.first_name === "string" && meta.first_name) ||
+            (typeof meta.given_name === "string" && meta.given_name) ||
+            (typeof meta.full_name === "string" && (meta.full_name as string).split(/\s+/)[0]) ||
+            (typeof meta.name === "string" && (meta.name as string).split(/\s+/)[0]) ||
+            "the team";
+          const token = signTrustToken(leadId, businessId);
+          await sendLeadSms({
+            supabase,
+            businessId,
+            leadId,
+            to: customerPhone,
+            template: "callback_resolved",
+            context: {
+              business_name: businessName,
+              staff_name: staffName as string,
+              portal_url: portalUrlFromToken(token),
+            },
+            locale: "en",
+          });
+        } catch (smsErr: any) {
+          Sentry.captureException(smsErr, {
+            extra: { route: "lead-outcomes callback_resolved sms", leadId, leadCallId },
+          });
+        }
+      })().catch(() => { /* outer safety net */ });
     }
 
     // Activity timeline row. Best-effort.

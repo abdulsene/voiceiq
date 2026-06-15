@@ -239,9 +239,11 @@ export async function sendLeadSms(
     })
     .eq("id", smsMessageId ?? "");
 
-  if (finalStatus === "sent" && leadId) {
-    // Activity timeline entry. Best-effort — failure is logged but
-    // doesn't downgrade the send result.
+  if (leadId) {
+    // Activity timeline entry written for BOTH sent and failed sends.
+    // The status field on the metadata is what LeadDetailPage's
+    // smsFailureToast (Slice 3A Commit B) scans for. Without writing
+    // failed rows, the toast never activates.
     const { error: actErr } = await supabase.from("lead_activities").insert({
       lead_id: leadId,
       actor_id: null,
@@ -254,6 +256,8 @@ export async function sendLeadSms(
         from_phone: fromPhone,
         twilio_sid: twilioSid,
         sms_message_id: smsMessageId,
+        status: finalStatus,
+        error_message: twilioError ?? null,
       },
     });
     if (actErr) {

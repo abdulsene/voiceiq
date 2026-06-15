@@ -41,6 +41,8 @@ import { requireStaffPermission } from "../middlewares/staff-rbac";
 import { auditLog, extractRequestMeta } from "../middlewares/audit";
 import { getTwilioClient } from "../sms";
 import { resolveOutboundCallerId } from "../lib/twilio-caller-id";
+import { sendLeadSms } from "../lib/sms-service";
+import { briefReason } from "../lib/sms-templates";
 
 const router = Router();
 
@@ -104,7 +106,7 @@ async function handleInitiateCall(opts: {
   // Validate the lead belongs to this business — cross-tenant guard.
   const { data: lead, error: leadErr } = await supabase
     .from("leads")
-    .select("id, business_id, contact_name, contact_phone")
+    .select("id, business_id, contact_name, contact_phone, reason")
     .eq("id", leadId)
     .eq("business_id", businessId)
     .maybeSingle();
@@ -116,7 +118,13 @@ async function handleInitiateCall(opts: {
     res.status(500).json({ error: "Database error" });
     return;
   }
-  const leadRow = lead as { id: string; business_id: string; contact_name: string | null; contact_phone: string | null } | null;
+  const leadRow = lead as {
+    id: string;
+    business_id: string;
+    contact_name: string | null;
+    contact_phone: string | null;
+    reason: string;
+  } | null;
   if (!leadRow) {
     res.status(404).json({ error: "Lead not found" });
     return;
@@ -268,6 +276,40 @@ async function handleInitiateCall(opts: {
       from_caller_id: callerId.from,
     },
   });
+
+  // Slice 3A pillar 2: fire the callback_starting SMS. Twilio just
+  // accepted the call; the customer's phone will ring in ~5–15s
+  // (staff has to answer first + recording disclosure plays). Sending
+  // now gives a heads-up close enough to "30 sec before bridge" to be
+  // useful. Fire-and-forget so an SMS failure doesn't break the
+  // bridge — the call is more important than the SMS.
+  (async () => {
+    try {
+      const { data: bizRow } = await supabase
+        .from("business_configs")
+        .select("business_name")
+        .eq("business_id", businessId)
+        .maybeSingle();
+      const businessName = (bizRow as { business_name?: string } | null)?.business_name || "the team";
+      await sendLeadSms({
+        supabase,
+        businessId,
+        leadId,
+        to: leadRow.contact_phone || "",
+        template: "callback_starting",
+        context: {
+          business_name: businessName,
+          brief_reason: briefReason(leadRow.reason),
+          from_phone: callerId.from,
+        },
+        locale: "en",
+      });
+    } catch (smsErr: any) {
+      Sentry.captureException(smsErr, {
+        extra: { route: "lead-calls callback_starting sms", leadId, leadCallId },
+      });
+    }
+  })().catch(() => { /* outer safety net */ });
 
   const meta = extractRequestMeta(req);
   await auditLog({

@@ -203,3 +203,56 @@ Either alone is the failure that took out Slice 1.
 A smoke test (`src/tests/019-leads-capture-tools-smoke.ts`) locks in
 the request_callback wiring against the signup chain — extend that
 test (don't replace it) when you add new tools.
+
+## Slice 3A — SMS pipeline operations
+
+Slice 3A activates outbound SMS at three points in the lead lifecycle
+(POST `/api/leads/capture` → `lead_captured`; lead-bridge initiate →
+`callback_starting`; outcome capture `resolved` / `booked` →
+`callback_resolved`) and consumes inbound STOP / START / HELP via
+`routes/twilio-sms-inbound.ts`.
+
+### Required environment (Replit Secrets)
+
+| Variable | Used by | If missing |
+|---|---|---|
+| `TRUST_PORTAL_SIGNING_SECRET` | `lib/trust-portal-token.ts` | All 3 SMS sends skip token mint; the `lead_captured` / `callback_resolved` interpolations log to Sentry and the SMS still ships **without** a `portal_url` block. Set to ≥32 chars: `openssl rand -hex 32`. |
+| `TWILIO_PHONE_NUMBER` (master) | `lib/sms-service.ts` fallback | Sends from per-tenant `business_configs.twilio_phone_number` when set; falls back to this with a Sentry warning. |
+| `PUBLIC_API_URL` | `lib/sms-templates.ts:portalUrlFromToken` | Falls back to the canonical Replit host. |
+
+### Twilio Console: inbound webhook URL (per-tenant)
+
+Each tenant's `business_configs.twilio_phone_number` must have its
+inbound-SMS webhook pointed at the api-server so STOP / START / HELP
+are processed. There is no provisioning script — set this manually on
+provisioning OR document for the customer:
+
+1. Twilio Console → Phone Numbers → Manage → Active numbers
+2. Click the tenant's number
+3. Under **Messaging Configuration → A MESSAGE COMES IN**:
+   - Webhook: `https://voice-i-q.replit.app/api/twilio/sms-inbound`
+   - HTTP method: `POST`
+4. Save.
+
+Without this, STOP replies hit Twilio's default behavior (suppress
+future messages from the same number tenant-side, but our
+`sms_opt_outs` table stays empty → our pre-send opt-out check still
+allows sends → Twilio rejects them with error 21610 and customer
+hears nothing). The route at `/api/twilio/sms-inbound` writes the
+opt-out and returns a TwiML confirmation per CTIA requirements.
+
+### Failure modes for SMS sends
+
+The 3 integration sites all fire-and-forget — SMS failure must not
+break lead capture, bridge initiation, or outcome saves. Failures
+land in two places:
+
+1. `sms_messages.status = 'failed'` with `error_message`
+2. `lead_activities` row with `action='sms_sent'` AND
+   `metadata.status='failed'` — picked up by LeadDetailPage's
+   `smsFailureToast` so staff sees the warning inline.
+
+The `opted_out` short-circuit is its own status value — Twilio is
+never called, `sms_messages.status='opted_out'`, and no activity row
+is written (staff seeing "we suppressed an SMS the customer asked
+not to receive" would be noise).

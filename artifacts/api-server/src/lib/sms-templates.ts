@@ -64,6 +64,30 @@ const STRINGS: Record<SmsLocale, LocaleStrings> = {
 };
 
 /**
+ * Truncate a lead's free-text reason to a short SMS-friendly version.
+ * Tries to cut at a word boundary above 40 chars; ellipsizes otherwise.
+ */
+export function briefReason(reason: string, maxChars = 80): string {
+  const trimmed = (reason || "").trim().replace(/\s+/g, " ");
+  if (trimmed.length <= maxChars) return trimmed;
+  const cut = trimmed.slice(0, maxChars);
+  const lastSpace = cut.lastIndexOf(" ");
+  const base = lastSpace > 40 ? cut.slice(0, lastSpace) : cut;
+  return base.trim() + "…";
+}
+
+/**
+ * Build the customer-facing trust portal URL for a token. Uses
+ * PUBLIC_API_URL when set (Replit prod) and falls back to the
+ * canonical host. Single source of truth so the 3 SMS integration
+ * sites don't drift.
+ */
+export function portalUrlFromToken(token: string): string {
+  const base = (process.env.PUBLIC_API_URL || "https://voice-i-q.replit.app").replace(/\/+$/, "");
+  return `${base}/r/${token}`;
+}
+
+/**
  * Render a template against the context. Unresolved placeholders log
  * a warning and are replaced with the empty string so the SMS still
  * sends (better than a literal `{{contact_name}}` reaching a customer).

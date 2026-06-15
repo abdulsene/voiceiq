@@ -40,6 +40,10 @@ import * as Sentry from "@sentry/node";
 import { requireAuth, requirePermission } from "../middlewares/auth";
 import { requireStaffPermission } from "../middlewares/staff-rbac";
 import { auditLog, extractRequestMeta } from "../middlewares/audit";
+import { sendLeadSms } from "../lib/sms-service";
+import { signTrustToken } from "../lib/trust-portal-token";
+import { briefReason, portalUrlFromToken } from "../lib/sms-templates";
+import { normalizeUrgency, slaLabel } from "../lib/lead-sla";
 
 const router = Router();
 
@@ -198,7 +202,7 @@ router.post("/leads/capture", async (req: Request, res: Response) => {
     // tool_error_handling_mode='summarized' setting.
     const { data: biz, error: bizErr } = await supabase
       .from("business_configs")
-      .select("business_id")
+      .select("business_id, business_name, sla_overrides")
       .eq("business_id", parsed.business_id)
       .maybeSingle();
     if (bizErr) {
@@ -213,6 +217,11 @@ router.post("/leads/capture", async (req: Request, res: Response) => {
       res.status(404).json({ error: "Business not found" });
       return;
     }
+    const bizRow = biz as {
+      business_id: string;
+      business_name: string | null;
+      sla_overrides: Record<string, unknown> | null;
+    };
 
     // Try to link to the source call. Best-effort — if no calls row
     // exists yet for this conversation (the post-call sync hasn't
@@ -304,6 +313,49 @@ router.post("/leads/capture", async (req: Request, res: Response) => {
         preferred_channel: parsed.preferred_channel,
       },
     });
+
+    // Slice 3A pillar 2: fire the lead_captured SMS. Fire-and-forget —
+    // an SMS failure must not break lead capture. Token is signed for
+    // this lead so the URL is unique-per-customer; SLA window is
+    // computed via lib/lead-sla.ts respecting any per-tenant override.
+    // Locale defaults to 'en' (Slice 3A has no per-lead locale field;
+    // a future slice can resolve from caller language or business
+    // languages array).
+    const urgency = normalizeUrgency(parsed.urgency);
+    const trustToken = (() => {
+      try {
+        return signTrustToken(lead.id, parsed.business_id);
+      } catch (signErr: any) {
+        Sentry.captureMessage("leads_capture_trust_token_sign_failed", {
+          level: "warning",
+          extra: { leadId: lead.id, error: signErr?.message },
+        });
+        return null;
+      }
+    })();
+    if (trustToken) {
+      void sendLeadSms({
+        supabase,
+        businessId: parsed.business_id,
+        leadId: lead.id,
+        to: parsed.contact_phone,
+        template: "lead_captured",
+        context: {
+          contact_name: parsed.contact_name,
+          business_name: bizRow.business_name || "the team",
+          brief_reason: briefReason(parsed.reason),
+          sla_window: slaLabel(urgency, "en", bizRow.sla_overrides),
+          portal_url: portalUrlFromToken(trustToken),
+        },
+        locale: "en",
+      }).catch((smsErr: any) => {
+        // sendLeadSms swallows its own errors; this catch covers the
+        // truly unexpected (e.g. supabase pool blown up). Sentry only.
+        Sentry.captureException(smsErr, {
+          extra: { route: "/api/leads/capture sms", leadId: lead.id },
+        });
+      });
+    }
 
     res.json({ success: true, lead_id: lead.id });
   } catch (err: any) {
