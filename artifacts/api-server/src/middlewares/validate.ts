@@ -58,10 +58,27 @@ export const helpRecoverAccountSchema = z.object({
   details: z.string().max(500).optional(),
 });
 
+// Slice 3: first_name + last_name persisted into auth.users.user_metadata
+// so the trust portal can render real staff names instead of "Your team".
+// Regex permits Unicode letters (accents like Sene), apostrophes (O'Brien),
+// hyphens (Jean-Luc), and spaces (Maria Elena). The /u flag is required for
+// the \p{L} class.
+const PERSON_NAME_RE = /^[\p{L}'\-\s]+$/u;
+const PERSON_NAME_MAX = 50;
+
 export const authSignupSchema = z.object({
   email: z.string().email().max(255),
   password: z.string().min(8).max(128),
+  // Required as of Slice 3 polish. Existing accounts that signed up before
+  // this change have no name in user_metadata; the resolver in
+  // routes/public-lead.ts gracefully falls back to "Your team". A short
+  // backfill script can migrate the (small) legacy user set out-of-band.
+  first_name: z.string().min(1).max(PERSON_NAME_MAX).regex(PERSON_NAME_RE),
+  last_name: z.string().min(1).max(PERSON_NAME_MAX).regex(PERSON_NAME_RE),
   business_name: z.string().min(1).max(100).optional(),
+  // DEPRECATED: never set by any production caller (confirmed by grep).
+  // Kept on the schema as `.optional()` so an old client posting it doesn't
+  // 400 during deploy; remove in a future cleanup commit.
   full_name: z.string().max(100).optional(),
   phone_number: z.string().max(20).optional(),
   industry: z.string().max(50).optional(),

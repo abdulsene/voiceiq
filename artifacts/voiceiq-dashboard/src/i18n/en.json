@@ -491,6 +491,16 @@
     "languages": "Languages",
     "enabled": "enabled"
   },
+  "auth": {
+    "firstNameLabel": "First name",
+    "lastNameLabel": "Last name",
+    "firstNamePlaceholder": "Jamie",
+    "lastNamePlaceholder": "Chen",
+    "firstNameRequired": "First name is required",
+    "lastNameRequired": "Last name is required",
+    "nameTooLong": "Name is too long (max 50 characters)",
+    "nameInvalidChars": "Letters, hyphens, apostrophes, spaces only"
+  },
   "common": {
     "loading": "Loading...",
     "error": "Something went wrong",

@@ -491,6 +491,16 @@
     "languages": "Langues",
     "enabled": "activé"
   },
+  "auth": {
+    "firstNameLabel": "Prénom",
+    "lastNameLabel": "Nom",
+    "firstNamePlaceholder": "Jamie",
+    "lastNamePlaceholder": "Chen",
+    "firstNameRequired": "Le prénom est requis",
+    "lastNameRequired": "Le nom est requis",
+    "nameTooLong": "Nom trop long (max 50 caractères)",
+    "nameInvalidChars": "Lettres, traits d'union, apostrophes et espaces uniquement"
+  },
   "common": {
     "loading": "Chargement…",
     "error": "Une erreur est survenue",

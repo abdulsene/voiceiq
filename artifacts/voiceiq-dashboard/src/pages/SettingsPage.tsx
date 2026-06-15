@@ -3130,10 +3130,30 @@ function WidgetTab() {
 type TeamMember = {
   userId: string;
   email: string;
+  // Slice 3: nullable until the (small) legacy user set is backfilled.
+  // Frontend renders "${firstName} ${lastName}" when both are set; falls
+  // back to email local-part otherwise.
+  firstName?: string | null;
+  lastName?: string | null;
   role: string;
   joinedAt: string;
   permissions?: any;
 };
+
+// Render the most human-readable display name for a member, with a
+// graceful fallback chain for accounts that signed up before Slice 3
+// captured first_name + last_name.
+function memberDisplayName(m: TeamMember): string {
+  const first = m.firstName?.trim();
+  const last = m.lastName?.trim();
+  if (first && last) return `${first} ${last}`;
+  if (first) return first;
+  if (last) return last;
+  // Email local-part (lowercased, before the @) — not pretty, but
+  // identifiable. Preferable to a literal "undefined undefined".
+  const local = (m.email || "").split("@")[0];
+  return local || "Team member";
+}
 
 type Organization = {
   name: string;
@@ -3397,7 +3417,7 @@ function TeamTab() {
         <table className="w-full text-sm">
           <thead>
             <tr className="bg-gray-50 border-b border-gray-200">
-              <th className="text-left px-4 py-3 font-semibold text-slate-700 text-xs uppercase tracking-wide">Email</th>
+              <th className="text-left px-4 py-3 font-semibold text-slate-700 text-xs uppercase tracking-wide">Member</th>
               <th className="text-left px-4 py-3 font-semibold text-slate-700 text-xs uppercase tracking-wide">Role</th>
               <th className="text-left px-4 py-3 font-semibold text-slate-700 text-xs uppercase tracking-wide">Joined</th>
               <th className="text-right px-4 py-3 font-semibold text-slate-700 text-xs uppercase tracking-wide">Actions</th>
@@ -3407,7 +3427,10 @@ function TeamTab() {
             {members.map(m => (
               <tr key={m.userId} className="border-b border-gray-100 last:border-0">
                 <td className="px-4 py-3">
-                  <div className="font-medium text-slate-900">{m.email}</div>
+                  <div className="font-medium text-slate-900">{memberDisplayName(m)}</div>
+                  {m.email && (m.firstName || m.lastName) && (
+                    <div className="text-xs text-slate-500 mt-0.5">{m.email}</div>
+                  )}
                 </td>
                 <td className="px-4 py-3">
                   <span className={`text-[10px] uppercase font-semibold tracking-wide px-2 py-0.5 rounded ${ROLE_BADGE_STYLES[m.role] || ROLE_BADGE_STYLES.user}`}>
@@ -3462,7 +3485,7 @@ function TeamTab() {
           <div className="bg-white rounded-2xl shadow-2xl w-full max-w-sm p-6" onClick={e => e.stopPropagation()}>
             <h3 className="text-lg font-bold text-slate-900 mb-2">Remove team member?</h3>
             <p className="text-sm text-slate-600 mb-5">
-              <strong>{confirmRemove.email}</strong> will lose access to this business immediately.
+              <strong>{memberDisplayName(confirmRemove)}</strong> ({confirmRemove.email}) will lose access to this business immediately.
             </p>
             <div className="flex gap-2">
               <button

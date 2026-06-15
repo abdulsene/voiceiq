@@ -165,6 +165,10 @@ export default function Signup({ initialTab = "signup" }: { initialTab?: "login"
   // from inside the form (they go to /pricing via the "Change plan →" link).
   const [{ planId, cycle }] = useState(readSelectedPlan);
   const [form, setForm] = useState({
+    // Slice 3: first_name + last_name persisted into auth.users.user_metadata
+    // so the trust portal can render real staff names. Required server-side
+    // (authSignupSchema in middlewares/validate.ts).
+    first_name: "", last_name: "",
     business_name: "", email: "", password: "", phone_number: "",
     industry: "general", timezone: "America/New_York",
   });
@@ -190,6 +194,16 @@ export default function Signup({ initialTab = "signup" }: { initialTab?: "login"
 
   function validateSignupForm(): { errors: Record<string, string>; firstInvalid: string | null } {
     const errors: Record<string, string> = {};
+    // Slice 3: name regex mirrors authSignupSchema in api-server's
+    // middlewares/validate.ts — Unicode letters, apostrophes, hyphens,
+    // spaces. \p{L} requires the /u flag.
+    const NAME_RE = /^[\p{L}'\-\s]+$/u;
+    if (!form.first_name.trim()) errors.first_name = "First name is required";
+    else if (form.first_name.length > 50) errors.first_name = "First name is too long";
+    else if (!NAME_RE.test(form.first_name.trim())) errors.first_name = "Letters, hyphens, apostrophes, spaces only";
+    if (!form.last_name.trim()) errors.last_name = "Last name is required";
+    else if (form.last_name.length > 50) errors.last_name = "Last name is too long";
+    else if (!NAME_RE.test(form.last_name.trim())) errors.last_name = "Letters, hyphens, apostrophes, spaces only";
     if (!form.business_name.trim()) errors.business_name = "Business name is required";
     if (!form.email.trim()) errors.email = "Email is required";
     else if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(form.email.trim())) errors.email = "Enter a valid email address";
@@ -198,7 +212,7 @@ export default function Signup({ initialTab = "signup" }: { initialTab?: "login"
     // phone_number / industry / timezone are either optional, default-set,
     // or validated server-side — keep them out of the client gate so the
     // user isn't blocked by anything they can't immediately understand.
-    const order = ["business_name", "email", "password"];
+    const order = ["first_name", "last_name", "business_name", "email", "password"];
     const firstInvalid = order.find(k => errors[k]) || null;
     return { errors, firstInvalid };
   }
@@ -645,6 +659,8 @@ export default function Signup({ initialTab = "signup" }: { initialTab?: "login"
           {tab === "signup" && (
             <div>
               {[
+                { label: "First name", key: "first_name", type: "text", placeholder: "Jamie" },
+                { label: "Last name", key: "last_name", type: "text", placeholder: "Chen" },
                 { label: "Business name", key: "business_name", type: "text", placeholder: "Acme Dental, Smith Law Firm..." },
                 { label: "Work email", key: "email", type: "email", placeholder: "you@yourbusiness.com" },
                 { label: "Password", key: "password", type: "password", placeholder: "Min 8 characters" },

@@ -49,7 +49,7 @@ function getSupabaseAdmin() {
 }
 
 router.post("/auth/signup", validate(authSignupSchema), async (req: Request, res: Response) => {
-  const { email, password, business_name, industry, phone_number, timezone, sms_opt_in } = req.body;
+  const { email, password, business_name, industry, phone_number, timezone, sms_opt_in, first_name, last_name } = req.body;
   // Twilio 10DLC compliance: capture the two separate consent flags. Both
   // are voluntary — neither blocks signup. We persist them to audit_logs as
   // an immutable, timestamped record for Twilio audits.
@@ -73,7 +73,20 @@ router.post("/auth/signup", validate(authSignupSchema), async (req: Request, res
   const meta = extractRequestMeta(req);
   try {
     const { data: authData, error: authError } = await supabase.auth.admin.createUser({
-      email, password, email_confirm: true,
+      email,
+      password,
+      email_confirm: true,
+      // Slice 3: persist first_name + last_name into user_metadata so the
+      // trust portal's staff-name resolver (routes/public-lead.ts
+      // firstNameFromUser) returns real names instead of "Your team".
+      // full_name is back-filled from the two parts so the legacy resolver
+      // fallback chain ("first_name → given_name → full_name → name") works
+      // for any reader that hasn't been updated yet.
+      user_metadata: {
+        first_name,
+        last_name,
+        full_name: `${first_name} ${last_name}`,
+      },
     });
     if (authError || !authData.user) {
       await auditLog({

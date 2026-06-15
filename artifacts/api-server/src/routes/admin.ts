@@ -6153,11 +6153,24 @@ router.get(
       // for any membership that's still missing an email so the team list is
       // never blank for the owner. Per-user lookup is fine: tenant member
       // counts are small and this is a rarely-hit list endpoint.
-      const missingIds = userIds.filter((id) => !emailByUserId[id]);
-      for (const uid of missingIds) {
+      //
+      // Slice 3: extend the same per-user lookup to ALL userIds (not just
+      // missing-email rows) so we can pull first_name + last_name out of
+      // user_metadata for the TeamTab display.
+      const firstNameByUserId: Record<string, string> = {};
+      const lastNameByUserId: Record<string, string> = {};
+      for (const uid of userIds) {
         try {
           const { data: u } = await supabase.auth.admin.getUserById(uid);
-          if (u?.user?.email) emailByUserId[uid] = u.user.email;
+          if (!u?.user) continue;
+          if (!emailByUserId[uid] && u.user.email) emailByUserId[uid] = u.user.email;
+          const meta = (u.user.user_metadata || {}) as Record<string, unknown>;
+          if (typeof meta.first_name === "string" && meta.first_name.trim()) {
+            firstNameByUserId[uid] = meta.first_name.trim();
+          }
+          if (typeof meta.last_name === "string" && meta.last_name.trim()) {
+            lastNameByUserId[uid] = meta.last_name.trim();
+          }
         } catch (e) {
           console.warn("[Team] auth lookup failed for", uid, e);
         }
@@ -6177,6 +6190,8 @@ router.get(
       const members = (memberships || []).map((m) => ({
         userId: m.user_id,
         email: emailByUserId[m.user_id] || null,
+        firstName: firstNameByUserId[m.user_id] || null,
+        lastName: lastNameByUserId[m.user_id] || null,
         role: m.role,
         joinedAt: m.created_at,
         permissions: permissionsAsMap(m.role as EnterpriseRole),
@@ -6494,10 +6509,12 @@ router.delete(
 router.post("/team/activate", async (req: Request, res: Response) => {
   const meta = extractRequestMeta(req);
   try {
-    const { token, email, password } = (req.body || {}) as {
+    const { token, email, password, first_name, last_name } = (req.body || {}) as {
       token?: string;
       email?: string;
       password?: string;
+      first_name?: string;
+      last_name?: string;
     };
 
     if (!token || !email || !password) {
@@ -6508,6 +6525,17 @@ router.post("/team/activate", async (req: Request, res: Response) => {
     }
     if (typeof email !== "string" || !/.+@.+\..+/.test(email)) {
       return res.status(400).json({ error: "Valid email is required" });
+    }
+    // Slice 3: invitees must provide their name. Mirrors the signup
+    // validation in middlewares/validate.ts so /auth/signup and
+    // /team/activate produce the same user_metadata shape regardless of
+    // which path created the auth user.
+    const PERSON_NAME_RE = /^[\p{L}'\-\s]+$/u;
+    if (typeof first_name !== "string" || first_name.trim().length < 1 || first_name.length > 50 || !PERSON_NAME_RE.test(first_name)) {
+      return res.status(400).json({ error: "first_name is required (letters, hyphens, apostrophes, spaces; max 50 chars)" });
+    }
+    if (typeof last_name !== "string" || last_name.trim().length < 1 || last_name.length > 50 || !PERSON_NAME_RE.test(last_name)) {
+      return res.status(400).json({ error: "last_name is required (letters, hyphens, apostrophes, spaces; max 50 chars)" });
     }
 
     const supabase = getSupabase();
@@ -6610,6 +6638,11 @@ router.post("/team/activate", async (req: Request, res: Response) => {
       invitation_token: null,
       invitation_expires_at: null,
       invitation_scope: null,
+      // Slice 3: persist name into user_metadata so the trust portal can
+      // attribute callbacks to "Jamie" instead of "Your team".
+      first_name,
+      last_name,
+      full_name: `${first_name} ${last_name}`,
     };
 
     const { error: updErr } = await supabase.auth.admin.updateUserById(target.id, {

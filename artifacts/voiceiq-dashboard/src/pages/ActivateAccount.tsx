@@ -4,9 +4,19 @@ import LandingFooter from "../components/LandingFooter";
 
 const API = window.location.origin + "/api";
 
+// Slice 3: name regex mirrors authSignupSchema in api-server's
+// middlewares/validate.ts — Unicode letters, apostrophes, hyphens,
+// spaces. The /u flag is required for \p{L}.
+const NAME_RE = /^[\p{L}'\-\s]+$/u;
+
 export default function ActivateAccount() {
   const [token, setToken] = useState("");
   const [email, setEmail] = useState("");
+  // Slice 3: collect first_name + last_name at activation so the trust
+  // portal can render real staff names. Required server-side
+  // (routes/admin.ts /team/activate).
+  const [firstName, setFirstName] = useState("");
+  const [lastName, setLastName] = useState("");
   const [password, setPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
   const [submitting, setSubmitting] = useState(false);
@@ -25,6 +35,16 @@ export default function ActivateAccount() {
       setError("Invalid activation link. Check your invitation email.");
       return;
     }
+    const trimmedFirst = firstName.trim();
+    const trimmedLast = lastName.trim();
+    if (!trimmedFirst || trimmedFirst.length > 50 || !NAME_RE.test(trimmedFirst)) {
+      setError("First name is required (letters, hyphens, apostrophes, spaces; max 50 chars).");
+      return;
+    }
+    if (!trimmedLast || trimmedLast.length > 50 || !NAME_RE.test(trimmedLast)) {
+      setError("Last name is required (letters, hyphens, apostrophes, spaces; max 50 chars).");
+      return;
+    }
     if (password.length < 8) {
       setError("Password must be at least 8 characters");
       return;
@@ -39,7 +59,11 @@ export default function ActivateAccount() {
       const r = await fetch(`${API}/admin/team/activate`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ token, email, password }),
+        body: JSON.stringify({
+          token, email, password,
+          first_name: trimmedFirst,
+          last_name: trimmedLast,
+        }),
       });
       const d = await r.json();
       if (!r.ok) {
@@ -127,6 +151,36 @@ export default function ActivateAccount() {
 
           <div>
             <label className="block text-sm font-semibold text-slate-900 mb-1.5">
+              First name
+            </label>
+            <input
+              type="text"
+              className="w-full p-2.5 border border-slate-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+              placeholder="Jamie"
+              value={firstName}
+              onChange={(e) => setFirstName(e.target.value)}
+              disabled={submitting}
+              maxLength={50}
+            />
+          </div>
+
+          <div>
+            <label className="block text-sm font-semibold text-slate-900 mb-1.5">
+              Last name
+            </label>
+            <input
+              type="text"
+              className="w-full p-2.5 border border-slate-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+              placeholder="Chen"
+              value={lastName}
+              onChange={(e) => setLastName(e.target.value)}
+              disabled={submitting}
+              maxLength={50}
+            />
+          </div>
+
+          <div>
+            <label className="block text-sm font-semibold text-slate-900 mb-1.5">
               Password
             </label>
             <input
@@ -165,6 +219,8 @@ export default function ActivateAccount() {
             onClick={handleActivate}
             disabled={
               submitting ||
+              !firstName.trim() ||
+              !lastName.trim() ||
               !password ||
               !confirmPassword ||
               password !== confirmPassword
