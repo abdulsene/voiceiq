@@ -70,11 +70,17 @@ function firstChunk(s: string): string | null {
  *   2. user_metadata.given_name          — OAuth-style (Google IdP)
  *   3. user_metadata.full_name           — split on whitespace, take [0]
  *   4. user_metadata.name                — same split
- *   5. user.email local-part             — humanize (strip dots/digits)
  *
  * Returns null when none are usable so the caller can fall back to a
  * neutral label ("Your team"). Order matters: an OAuth signup may
  * have both given_name and full_name; given_name is more accurate.
+ *
+ * NOTE: an email local-part fallback used to live here. Removed: many
+ * SMB owners sign up with shared business inboxes ("ezrentalsleasing
+ * @gmail.com") which humanize into nonsense first names. Better to
+ * surface the dignified "Your team" fallback than to confidently
+ * mis-name a person. A future onboarding slice should capture
+ * first_name explicitly so this resolver doesn't have to guess.
  */
 function firstNameFromUser(
   user: { email?: string | null; user_metadata?: unknown } | null | undefined,
@@ -90,17 +96,6 @@ function firstNameFromUser(
     for (const field of ["full_name", "name", "display_name"]) {
       const v = m[field];
       if (typeof v === "string" && v.trim()) return firstChunk(v);
-    }
-  }
-  // Last-ditch: email local-part. "anna.smith+work@x.com" → "Anna".
-  // Better than the generic fallback because at least it's specific to
-  // the staff member.
-  if (typeof user.email === "string" && user.email.includes("@")) {
-    const local = user.email.split("@")[0].replace(/\+.*/, "");
-    const cleaned = local.replace(/[._-]+/g, " ").replace(/\d+/g, " ").trim();
-    if (cleaned) {
-      const first = firstChunk(cleaned);
-      if (first) return first.charAt(0).toUpperCase() + first.slice(1).toLowerCase();
     }
   }
   return null;
@@ -281,10 +276,29 @@ function buildSanitizedTimeline(
       case "call_completed": {
         const callId = (a.metadata?.lead_call_id ?? a.metadata?.call_id) as string | undefined;
         const matchingCall = callId ? calls.find((c) => c.id === callId) : undefined;
+        // Attribution priority:
+        //   1. metadata.staff_user_id    — set by twilio-callbacks.ts when
+        //      the call_completed activity is inserted
+        //   2. matchingCall.staff_user_id — fallback for legacy rows
+        //      written before metadata.staff_user_id was wired
+        //   3. a.actor_id                 — legacy / future paths that
+        //      write call_completed with actor attribution
+        // The activity itself has actor_type='system' with actor_id=null
+        // by design (Twilio's webhook is system-triggered), so without
+        // one of the first two lookups we'd render "Your team" instead
+        // of the actual staff member who took the call.
+        const completedStaffId =
+          (a.metadata?.staff_user_id as string | undefined) ??
+          matchingCall?.staff_user_id ??
+          a.actor_id ??
+          null;
+        const completedStaffName = completedStaffId
+          ? staffNames.get(completedStaffId) ?? "Your team"
+          : staff;
         events.push({
           type: "callback_completed",
           at: a.created_at,
-          staff_first_name: staff,
+          staff_first_name: completedStaffName,
           duration_secs: matchingCall?.duration_secs ?? undefined,
         });
         break;
@@ -381,6 +395,9 @@ router.get("/public/lead/:token", async (req: Request, res: Response) => {
   const { business, lead, activities, calls, latestOutcome } = state;
   const staffIds = [
     ...activities.map((a) => a.actor_id).filter((x): x is string => !!x),
+    ...activities
+      .map((a) => a.metadata?.staff_user_id as string | undefined)
+      .filter((x): x is string => typeof x === "string" && x.length > 0),
     ...calls.map((c) => c.staff_user_id).filter((x): x is string => !!x),
     ...(latestOutcome?.staff_user_id ? [latestOutcome.staff_user_id] : []),
   ];

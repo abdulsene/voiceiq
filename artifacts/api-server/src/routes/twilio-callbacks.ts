@@ -186,10 +186,15 @@ router.post("/twilio/recording-status", async (req: Request, res: Response) => {
   try {
     const { data: callRow } = await supabase
       .from("lead_calls")
-      .select("id, lead_id, recording_sid")
+      .select("id, lead_id, recording_sid, staff_user_id")
       .eq("call_sid", callSid)
       .maybeSingle();
-    const row = callRow as { id: string; lead_id: string; recording_sid: string | null } | null;
+    const row = callRow as {
+      id: string;
+      lead_id: string;
+      recording_sid: string | null;
+      staff_user_id: string | null;
+    } | null;
     if (!row) {
       // Possible race — Twilio retries before the lead_calls UPDATE
       // landed our CallSid. Twilio retries automatically; ack 200 so it
@@ -259,6 +264,12 @@ router.post("/twilio/recording-status", async (req: Request, res: Response) => {
       metadata: {
         lead_call_id: leadCallId,
         call_sid: callSid,
+        // staff_user_id from the lead_calls row — set by handleInitiateCall
+        // at the time the call was placed. The customer-facing trust
+        // portal uses this to attribute "callback completed with Abdul"
+        // instead of falling back to the generic "Your team" label
+        // (call_completed is actor_type='system' so a.actor_id is null).
+        staff_user_id: row.staff_user_id,
         recording_available: true,
         recording_duration_secs: recordingDurationSecs,
         transcript_pending: true,
