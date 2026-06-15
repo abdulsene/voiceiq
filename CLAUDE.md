@@ -27,10 +27,6 @@ Dashboard (`artifacts/voiceiq-dashboard`, name `@neverr/dashboard`):
 - `pnpm --filter @neverr/dashboard run build` — Vite production build to `dist/public/`.
 - Replit dev-only Vite plugins (`@replit/vite-plugin-cartographer`, `dev-banner`, `runtime-error-modal`) are gated behind `NODE_ENV !== "production" && REPL_ID !== undefined` — they never ship to prod.
 
-Voice engine (`voiceiq-engine/` at repo root, **NOT** under `artifacts/`, name `neverr-engine`):
-- `pnpm --filter neverr-engine run dev` — `node --watch server.js`.
-- Plain Node ESM (no TypeScript build). Fastify + WebSockets to ElevenLabs + Twilio. Loads `.env` directly via `dotenv`.
-
 Database (`lib/db`, name `@workspace/db`):
 - `pnpm --filter @workspace/db run push` — `drizzle-kit push` (requires `DATABASE_URL`). `push-force` for destructive pushes.
 - Schema is empty boilerplate in `src/schema/index.ts`. The active production schema lives in `artifacts/api-server/migrations/*.sql` and is applied manually via the Supabase SQL editor against project `zqhijauefcpwggklshoa`. Drizzle is wired up but not the source of truth — be careful before assuming `db push` reflects production.
@@ -40,15 +36,15 @@ API contract (`lib/api-spec`):
 
 ## Architecture
 
-This is a pnpm monorepo for **Neverr AI**, an AI receptionist SaaS (voice + chat + CRM + SMS) marketed at SMB / enterprise. There are three independently-deployed services and a shared lib layer.
+This is a pnpm monorepo for **Neverr AI**, an AI receptionist SaaS (voice + chat + CRM + SMS) marketed at SMB / enterprise. There are two independently-deployed services and a shared lib layer.
 
-### Services (three deploys)
+### Services (two deploys)
 
-1. **`artifacts/api-server`** — Express 5 + TypeScript REST API on port 8080. Single entry `src/index.ts` boots Sentry (gated on `SENTRY_API_DSN`), then `app.ts`, then schedules cron (`scheduleBriefings`, `scheduleRetentionCron`). Routes are composed in `src/routes/index.ts` — `health`, `auth`, `mfa`, `stripe`, `widget`, `enterprise`, `admin` (with `dashboard-builder` + `webhooks` mounted first to win ordering), `industry-categories` (before `industry-pages` for the same reason), `chat`, `chat-tts`, `config`, and the catch-all `api` last. Auth uses Supabase JWTs verified via `middlewares/auth.ts`; certain paths are whitelisted in `AUTH_BYPASS_PATTERNS` inside `app.ts` (e.g. `/api/healthz`, `/api/livez`, `/api/config`, the chat endpoints). Persistent boot-time env checks live inside `src/lib/anthropic.ts`, `src/lib/elevenlabs-tts.ts`, and `src/lib/workos.ts` — importing a route that depends on these crashes the server at boot if the key is missing (intentional fail-fast).
+1. **`artifacts/api-server`** — Express 5 + TypeScript REST API on port 8080. Single entry `src/index.ts` boots Sentry (gated on `SENTRY_API_DSN`), then `app.ts`, then schedules cron (`scheduleBriefings`, `scheduleRetentionCron`). Routes are composed in `src/routes/index.ts` — `health`, `auth`, `mfa`, `stripe`, `widget`, `enterprise`, `admin` (with `dashboard-builder` + `webhooks` mounted first to win ordering), `industry-categories` (before `industry-pages` for the same reason), `chat`, `chat-tts`, `config`, and the catch-all `api` last. Auth uses Supabase JWTs verified via `middlewares/auth.ts`; certain paths are whitelisted in `AUTH_BYPASS_PATTERNS` inside `app.ts` (e.g. `/api/healthz`, `/api/livez`, `/api/config`, the chat endpoints). Persistent boot-time env checks live inside `src/lib/anthropic.ts`, `src/lib/elevenlabs-tts.ts`, and `src/lib/workos.ts` — importing a route that depends on these crashes the server at boot if the key is missing (intentional fail-fast). Inbound voice routes via `POST /api/twilio/voice` forwarding to `api.us.elevenlabs.io/twilio/inbound_call`; ElevenLabs hosts the conversational WSS directly.
 
 2. **`artifacts/voiceiq-dashboard`** — React 19 + Vite 7 + Wouter SPA built to `dist/public/`. Tailwind v4 is CSS-native via `@import "tailwindcss"` + `@theme inline` in `src/index.css` (no `tailwind.config.js`). shadcn/ui components in `src/components/ui/` (style "new-york", baseColor "neutral" per `components.json`). Path aliases: `@` → `src`, `@assets` → repo-root `attached_assets/`. State via TanStack Query through generated hooks in `@workspace/api-client-react`. i18n via `i18next` (en/es/fr).
 
-3. **`voiceiq-engine/server.js`** — Fastify voice processing server at the repo root (the `artifacts/voiceiq-engine/` directory is a *separate* React frontend bundle, also named `@neverr/engine`; its `dev` script confusingly invokes `node ../../voiceiq-engine/server.js`). The runtime engine handles Twilio webhooks + ElevenLabs WS streaming + Anthropic call summarisation + Supabase persistence. Plain Node ESM, no build step. PII redaction logic in `voiceiq-engine/lib/pii-redact-transcript.js` is mirrored in `artifacts/api-server/src/lib/pii-redact-transcript.ts` — changes must be made in both.
+> **Heads up on Replit's artifact deployment**: Replit's deployment system auto-discovers nested `.replit-artifact/artifact.toml` files even when the artifact isn't listed under `[[artifacts]]` in the root `.replit`. If you create an `artifact.toml` under any `artifacts/<name>/.replit-artifact/`, it gets deployed on next push. A historical `artifacts/voiceiq-engine/` artifact silently shipped for weeks before being noticed as dead (see the Phase 0 prep commit for context).
 
 ### Shared libs (`lib/*`)
 
@@ -63,7 +59,7 @@ These four are TypeScript project references (`tsconfig.json` lists them under `
 
 - **Supabase project `zqhijauefcpwggklshoa`** is the system of record for Postgres + auth. Service-role access via `SUPABASE_URL` + `SUPABASE_SERVICE_KEY`. The `audit_logs` table lives here, written by `middlewares/audit.ts`.
 - `DATABASE_URL` points to a separate "helium PG" instance used for chat (`chat_conversations`, `chat_messages` via raw `pg.Pool`) and for Drizzle. Do not assume Supabase ↔ DATABASE_URL parity — `replit.md` records past confusion where audit log presence was checked against the wrong DB.
-- **`business_configs.pii_handling`** column (migration 016) gates per-business PII redaction: `resolveRedactionMode()` checks business config → `PII_REDACTION_MODE` env → `'minimize'` default, with a 60s in-memory cache and graceful fallback on DB error.
+- **`business_configs.pii_handling`** column (migration 016) gates per-business PII redaction: `resolveRedactionMode()` checks business config → `PII_REDACTION_MODE` env → `'minimize'` default, with a 60s in-memory cache and graceful fallback on DB error. Single source of truth is `artifacts/api-server/src/lib/pii-redact-transcript.ts` (the previous `.js` mirror in voiceiq-engine was removed when that service was retired).
 - **Migrations** are SQL files in `artifacts/api-server/migrations/` (numeric prefix), applied **manually via the Supabase SQL editor**. After applying, restart the API server workflow.
 
 ### Replit deployment
