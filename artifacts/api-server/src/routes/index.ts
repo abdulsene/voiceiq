@@ -25,6 +25,7 @@ import publicLeadRouter from "./public-lead";
 import twilioCallbacksRouter from "./twilio-callbacks";
 import twilioSmsInboundRouter from "./twilio-sms-inbound";
 import twilioSmsStatusRouter from "./twilio-sms-status";
+import twilioOutboundVoiceRouter from "./twilio-outbound-voice";
 import adminBusinessesRouter from "./admin-businesses";
 
 const router: IRouter = Router();
@@ -120,6 +121,11 @@ router.use(twilioSmsInboundRouter);
 // when carriers ultimately rejected. Same AUTH_BYPASS pattern as
 // the other twilio handlers; signature verification inside.
 router.use(twilioSmsStatusRouter);
+// Phase 0 Commit 0-D: outbound voice TwiML + AMD + status webhooks.
+// Three endpoints under /api/twilio/outbound-voice/*. Signature
+// verification inside each handler; all failure paths return 2xx
+// (signature-fail is the only 403) so Twilio doesn't auto-retry.
+router.use(twilioOutboundVoiceRouter);
 // Stage 6 Phase 1: admin override surface — list + drill-in + admin
 // voice switch. Declares paths starting with /admin/business(es) at
 // root so it doesn't collide with the catch-all adminRouter mounted
