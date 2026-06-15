@@ -174,8 +174,14 @@ ALTER TABLE lead_calls
 COMMENT ON COLUMN lead_calls.scheduled_for IS
   'When the campaign engine intended this call to fire. Compare to started_at for SLA audits.';
 
+-- lead_calls has no business_id column — tenant scoping is via
+-- lead_id → leads.business_id JOIN, or via campaign_id →
+-- outbound_campaigns.business_id. The (direction, status) index
+-- handles cross-tenant queries; existing lead_calls_lead_idx
+-- (lead_id, created_at DESC) handles per-lead/per-tenant lookups;
+-- idx_lead_calls_campaign_id handles campaign-scoped queries.
 CREATE INDEX IF NOT EXISTS idx_lead_calls_direction_status
-  ON lead_calls (business_id, direction, status);
+  ON lead_calls (direction, status);
 
 CREATE INDEX IF NOT EXISTS idx_lead_calls_campaign_id
   ON lead_calls (campaign_id) WHERE campaign_id IS NOT NULL;
