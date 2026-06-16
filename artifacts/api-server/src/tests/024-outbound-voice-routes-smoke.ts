@@ -1,5 +1,5 @@
 /**
- * Phase 0 Commit 0-D + Phase 1.6 — outbound voice routes smoke. 13 cases.
+ * Phase 0-D + Phase 1.6 + Phase 2.5 — outbound voice routes smoke. 18 cases.
  *
  *   TwiML route (T1-T3)
  *     T1 — outbound_automated lead_call → <Connect><Stream> with
@@ -37,6 +37,18 @@
  *           <Hangup/></Response>
  *     T13 — /voicemail TwiML with NULL voicemail_text →
  *           <Response><Hangup/></Response>
+ *
+ *   Phase 2.5 — per-campaign voicemail override (T14-T18)
+ *     T14 — campaign_id set + voicemail_text_override='Custom...' →
+ *           resolver returns override; tenant default NOT queried
+ *     T15 — campaign_id set + voicemail_text_override=NULL → falls
+ *           back to tenant default
+ *     T16 — campaign_id=NULL → reads tenant default directly
+ *           (Phase 1.6 regression guard, no outbound_campaigns query)
+ *     T17 — voicemail_text_override='   ' (whitespace) → treated as
+ *           empty, falls back to tenant default
+ *     T18 — both override AND tenant default set → resolver picks
+ *           override; tenant default NOT queried (priority lock)
  *
  * Strategy: FakeSupabaseClient (extended from 023 with UPDATE chain
  * support) + global.fetch mock for the signed-URL fetch + FakeTwilioClient
@@ -513,8 +525,8 @@ async function runT9_T11(app: Express) {
     );
     // Redirect helper queries lead_id from lead_calls (selectColumns === "lead_id").
     fake.on(
-      (c) => c.op === "select" && c.table === "lead_calls" && c.selectColumns === "lead_id",
-      { data: { lead_id: LEAD } },
+      (c) => c.op === "select" && c.table === "lead_calls" && c.selectColumns.includes("lead_id"),
+      { data: { campaign_id: null, lead_id: LEAD } },
     );
     fake.on(
       (c) => c.op === "select" && c.table === "leads" && c.selectColumns === "business_id",
@@ -559,8 +571,8 @@ async function runT9_T11(app: Express) {
       { data: [{ id: LEAD_CALL, call_sid: "CAtest_t10", campaign_id: null, status: "in_progress" }] },
     );
     fake.on(
-      (c) => c.op === "select" && c.table === "lead_calls" && c.selectColumns === "lead_id",
-      { data: { lead_id: LEAD } },
+      (c) => c.op === "select" && c.table === "lead_calls" && c.selectColumns.includes("lead_id"),
+      { data: { campaign_id: null, lead_id: LEAD } },
     );
     fake.on(
       (c) => c.op === "select" && c.table === "leads" && c.selectColumns === "business_id",
@@ -611,8 +623,8 @@ async function runT12_T13(app: Express) {
     const fake = new FakeSupabaseClient();
     setSupabaseForTesting(fake);
     fake.on(
-      (c) => c.op === "select" && c.table === "lead_calls" && c.selectColumns === "lead_id",
-      { data: { lead_id: LEAD } },
+      (c) => c.op === "select" && c.table === "lead_calls" && c.selectColumns.includes("lead_id"),
+      { data: { campaign_id: null, lead_id: LEAD } },
     );
     fake.on(
       (c) => c.op === "select" && c.table === "leads" && c.selectColumns === "business_id",
@@ -637,8 +649,8 @@ async function runT12_T13(app: Express) {
     const fake = new FakeSupabaseClient();
     setSupabaseForTesting(fake);
     fake.on(
-      (c) => c.op === "select" && c.table === "lead_calls" && c.selectColumns === "lead_id",
-      { data: { lead_id: LEAD } },
+      (c) => c.op === "select" && c.table === "lead_calls" && c.selectColumns.includes("lead_id"),
+      { data: { campaign_id: null, lead_id: LEAD } },
     );
     fake.on(
       (c) => c.op === "select" && c.table === "leads" && c.selectColumns === "business_id",
@@ -658,6 +670,162 @@ async function runT12_T13(app: Express) {
   }
 }
 
+// ── Phase 2.5 — per-campaign voicemail override (T14-T18) ─────────────
+// All 5 exercise the /voicemail TwiML route since the response body
+// renders the resolved text observably. The AMD redirect path (T9/T10)
+// uses the same resolver under the hood, so the wiring is covered
+// transitively.
+
+const CAMPAIGN_ID_T14 = "00000000-0000-0000-0000-0000000c0014";
+
+async function runT14_T18(app: Express) {
+  // T14 — campaign override wins.
+  {
+    const fake = new FakeSupabaseClient();
+    setSupabaseForTesting(fake);
+    fake.on(
+      (c) => c.op === "select" && c.table === "lead_calls" && c.selectColumns.includes("lead_id"),
+      { data: { campaign_id: CAMPAIGN_ID_T14, lead_id: LEAD } },
+    );
+    fake.on(
+      (c) => c.op === "select" && c.table === "outbound_campaigns" && c.selectColumns.includes("voicemail_text_override"),
+      { data: { business_id: BIZ, voicemail_text_override: "Custom campaign message" } },
+    );
+    // Tenant default also stubbed — should NOT be read because override wins.
+    fake.on(
+      (c) => c.op === "select" && c.table === "business_configs" && c.selectColumns === "outbound_voicemail_text",
+      { data: { outbound_voicemail_text: "Tenant default (should not fire)" } },
+    );
+
+    const r = await dispatch(app, `/twilio/outbound-voice/voicemail?lead_call_id=${LEAD_CALL}`);
+    const failures: string[] = [];
+    if (r.status !== 200) failures.push(`status=${r.status}`);
+    if (!r.body.includes(`<Say voice="alice">Custom campaign message</Say>`))
+      failures.push(`body=${r.body.slice(0, 200)}`);
+    // Verify tenant default was NOT queried (override should short-circuit).
+    const tenantQuery = fake.calls.find(
+      (c) => c.op === "select" && c.table === "business_configs" && c.selectColumns === "outbound_voicemail_text",
+    );
+    if (tenantQuery) failures.push("unexpected business_configs query (override should short-circuit)");
+    record("T14 campaign override → resolver uses override text", failures.length === 0, failures.join("; ") || "override wins, tenant default not queried");
+  }
+
+  // T15 — campaign exists, override=NULL → falls back to tenant default.
+  {
+    const fake = new FakeSupabaseClient();
+    setSupabaseForTesting(fake);
+    fake.on(
+      (c) => c.op === "select" && c.table === "lead_calls" && c.selectColumns.includes("lead_id"),
+      { data: { campaign_id: CAMPAIGN_ID_T14, lead_id: LEAD } },
+    );
+    fake.on(
+      (c) => c.op === "select" && c.table === "outbound_campaigns" && c.selectColumns.includes("voicemail_text_override"),
+      { data: { business_id: BIZ, voicemail_text_override: null } },
+    );
+    fake.on(
+      (c) => c.op === "select" && c.table === "business_configs" && c.selectColumns === "outbound_voicemail_text",
+      { data: { outbound_voicemail_text: "Tenant default fallback" } },
+    );
+
+    const r = await dispatch(app, `/twilio/outbound-voice/voicemail?lead_call_id=${LEAD_CALL}`);
+    const failures: string[] = [];
+    if (r.status !== 200) failures.push(`status=${r.status}`);
+    if (!r.body.includes(`<Say voice="alice">Tenant default fallback</Say>`))
+      failures.push(`body=${r.body.slice(0, 200)}`);
+    record("T15 campaign override=NULL → tenant default fallback", failures.length === 0, failures.join("; ") || "NULL override → tenant default rendered");
+  }
+
+  // T16 — lead_call.campaign_id=NULL → reads tenant default directly
+  // (Phase 1.6 regression guard).
+  {
+    const fake = new FakeSupabaseClient();
+    setSupabaseForTesting(fake);
+    fake.on(
+      (c) => c.op === "select" && c.table === "lead_calls" && c.selectColumns.includes("lead_id"),
+      { data: { campaign_id: null, lead_id: LEAD } },
+    );
+    fake.on(
+      (c) => c.op === "select" && c.table === "leads" && c.selectColumns === "business_id",
+      { data: { business_id: BIZ } },
+    );
+    fake.on(
+      (c) => c.op === "select" && c.table === "business_configs" && c.selectColumns === "outbound_voicemail_text",
+      { data: { outbound_voicemail_text: "Tenant default direct" } },
+    );
+
+    const r = await dispatch(app, `/twilio/outbound-voice/voicemail?lead_call_id=${LEAD_CALL}`);
+    const failures: string[] = [];
+    if (r.status !== 200) failures.push(`status=${r.status}`);
+    if (!r.body.includes(`<Say voice="alice">Tenant default direct</Say>`))
+      failures.push(`body=${r.body.slice(0, 200)}`);
+    // No outbound_campaigns query (campaign_id was NULL).
+    const campaignQuery = fake.calls.find(
+      (c) => c.op === "select" && c.table === "outbound_campaigns",
+    );
+    if (campaignQuery) failures.push("unexpected outbound_campaigns query for NULL campaign_id");
+    record("T16 lead_call.campaign_id=NULL → tenant default direct (Phase 1.6 regression)", failures.length === 0, failures.join("; ") || "no outbound_campaigns query, tenant default rendered");
+  }
+
+  // T17 — campaign override = whitespace-only → treated as empty,
+  // falls back to tenant default.
+  {
+    const fake = new FakeSupabaseClient();
+    setSupabaseForTesting(fake);
+    fake.on(
+      (c) => c.op === "select" && c.table === "lead_calls" && c.selectColumns.includes("lead_id"),
+      { data: { campaign_id: CAMPAIGN_ID_T14, lead_id: LEAD } },
+    );
+    fake.on(
+      (c) => c.op === "select" && c.table === "outbound_campaigns" && c.selectColumns.includes("voicemail_text_override"),
+      { data: { business_id: BIZ, voicemail_text_override: "   " } },
+    );
+    fake.on(
+      (c) => c.op === "select" && c.table === "business_configs" && c.selectColumns === "outbound_voicemail_text",
+      { data: { outbound_voicemail_text: "Tenant fallback for whitespace override" } },
+    );
+
+    const r = await dispatch(app, `/twilio/outbound-voice/voicemail?lead_call_id=${LEAD_CALL}`);
+    const failures: string[] = [];
+    if (r.status !== 200) failures.push(`status=${r.status}`);
+    if (!r.body.includes(`<Say voice="alice">Tenant fallback for whitespace override</Say>`))
+      failures.push(`body=${r.body.slice(0, 200)}`);
+    record("T17 whitespace-only override → treated as empty, tenant fallback", failures.length === 0, failures.join("; ") || "'   ' trimmed to empty, fell back to tenant default");
+  }
+
+  // T18 — priority lock: both override AND tenant default set,
+  // override must win.
+  {
+    const fake = new FakeSupabaseClient();
+    setSupabaseForTesting(fake);
+    fake.on(
+      (c) => c.op === "select" && c.table === "lead_calls" && c.selectColumns.includes("lead_id"),
+      { data: { campaign_id: CAMPAIGN_ID_T14, lead_id: LEAD } },
+    );
+    fake.on(
+      (c) => c.op === "select" && c.table === "outbound_campaigns" && c.selectColumns.includes("voicemail_text_override"),
+      { data: { business_id: BIZ, voicemail_text_override: "X" } },
+    );
+    // Tenant default also set — staging it confirms the resolver
+    // STILL picks the override rather than reading both.
+    fake.on(
+      (c) => c.op === "select" && c.table === "business_configs" && c.selectColumns === "outbound_voicemail_text",
+      { data: { outbound_voicemail_text: "Y" } },
+    );
+
+    const r = await dispatch(app, `/twilio/outbound-voice/voicemail?lead_call_id=${LEAD_CALL}`);
+    const failures: string[] = [];
+    if (r.status !== 200) failures.push(`status=${r.status}`);
+    if (!r.body.includes(`<Say voice="alice">X</Say>`)) failures.push(`body=${r.body.slice(0, 200)}`);
+    if (r.body.includes(">Y<")) failures.push("unexpectedly rendered tenant default Y");
+    // The resolver should NOT have queried tenant default at all.
+    const tenantQuery = fake.calls.find(
+      (c) => c.op === "select" && c.table === "business_configs" && c.selectColumns === "outbound_voicemail_text",
+    );
+    if (tenantQuery) failures.push("unexpected tenant default query (priority order broken)");
+    record("T18 priority — override wins over tenant default", failures.length === 0, failures.join("; ") || "X rendered, Y not rendered, tenant default not queried");
+  }
+}
+
 async function main() {
   const app = await buildApp();
   await runT1_T3(app);
@@ -665,6 +833,7 @@ async function main() {
   await runT6_T8(app);
   await runT9_T11(app);
   await runT12_T13(app);
+  await runT14_T18(app);
 
   // Restore so other harnesses running in-process see the real client.
   setSupabaseForTesting(null);

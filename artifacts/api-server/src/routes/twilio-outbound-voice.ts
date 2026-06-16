@@ -76,6 +76,7 @@ import {
   buildVoicemailTwiml,
 } from "../lib/outbound-voice/twiml-builder";
 import { getPublicApiBase } from "../lib/public-url";
+import { resolveVoicemailText } from "../lib/outbound-voice/voicemail-text-resolver";
 import { getTwilioClient } from "../sms";
 
 // Minimal Twilio client shape we need for the AMD voicemail redirect.
@@ -327,30 +328,14 @@ async function tryRedirectToVoicemail(
   leadCallIdQueryParam: string,
 ): Promise<void> {
   try {
-    // Load business_id via leads JOIN — lead_calls has no business_id.
-    const { data: rowWithLead } = await supabase
-      .from("lead_calls")
-      .select("lead_id")
-      .eq("id", leadCallRowId)
-      .maybeSingle();
-    const leadId = (rowWithLead as { lead_id?: string } | null)?.lead_id;
-    if (!leadId) return;
-    const { data: leadRow } = await supabase
-      .from("leads")
-      .select("business_id")
-      .eq("id", leadId)
-      .maybeSingle();
-    const businessId = (leadRow as { business_id?: string } | null)?.business_id;
-    if (!businessId) return;
-    const { data: bizRow } = await supabase
-      .from("business_configs")
-      .select("outbound_voicemail_text")
-      .eq("business_id", businessId)
-      .maybeSingle();
-    const voicemailText = (bizRow as { outbound_voicemail_text?: string | null } | null)?.outbound_voicemail_text;
-    if (!voicemailText || voicemailText.trim().length === 0) {
-      // Tenant didn't configure voicemail. Agent disconnects gracefully
-      // when the line drops; voicemail_left stays FALSE.
+    // Phase 2.5 — voicemail text resolution delegated to
+    // resolveVoicemailText. Walks lead_calls → campaign override (if
+    // set) → tenant default. NULL = no voicemail configured; agent
+    // disconnects gracefully when the line drops, voicemail_left
+    // stays FALSE. Empty / whitespace-only campaign overrides fall
+    // back to tenant default automatically.
+    const voicemailText = await resolveVoicemailText(supabase, leadCallRowId);
+    if (!voicemailText) {
       return;
     }
 
@@ -408,32 +393,11 @@ router.post("/twilio/outbound-voice/voicemail", async (req: Request, res: Respon
   }
 
   try {
-    const { data: callRow } = await supabase
-      .from("lead_calls")
-      .select("lead_id")
-      .eq("id", leadCallId)
-      .maybeSingle();
-    const leadId = (callRow as { lead_id?: string } | null)?.lead_id;
-    if (!leadId) {
-      sendTwiml(res, buildVoicemailTwiml(null));
-      return;
-    }
-    const { data: leadRow } = await supabase
-      .from("leads")
-      .select("business_id")
-      .eq("id", leadId)
-      .maybeSingle();
-    const businessId = (leadRow as { business_id?: string } | null)?.business_id;
-    if (!businessId) {
-      sendTwiml(res, buildVoicemailTwiml(null));
-      return;
-    }
-    const { data: bizRow } = await supabase
-      .from("business_configs")
-      .select("outbound_voicemail_text")
-      .eq("business_id", businessId)
-      .maybeSingle();
-    const voicemailText = (bizRow as { outbound_voicemail_text?: string | null } | null)?.outbound_voicemail_text ?? null;
+    // Phase 2.5 — same resolver as the AMD redirect path.
+    // resolveVoicemailText walks lead_calls → campaign override
+    // (if non-empty) → tenant default. Returns null for any missing
+    // link; buildVoicemailTwiml(null) renders bare <Hangup/>.
+    const voicemailText = await resolveVoicemailText(supabase, leadCallId);
     sendTwiml(res, buildVoicemailTwiml(voicemailText));
   } catch (err: any) {
     Sentry.captureException(err, {
