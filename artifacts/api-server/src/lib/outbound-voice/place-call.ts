@@ -90,7 +90,12 @@
  *
  * Phase 2.1 — daily cap enforcement:
  *   business_configs.max_outbound_calls_per_day is now enforced at
- *   step 3.5 (between compliance and idempotency). Behavior:
+ *   step 5.5 (AFTER idempotency check, BEFORE pre-insert). Order
+ *   moved from 3.5 → 5.5 in Phase 2.1.1: idempotent re-submits must
+ *   short-circuit before cap check so a re-submit of an existing
+ *   scheduled row when the tenant is at cap returns idempotent:true,
+ *   not daily_cap_exceeded. Duplicate detection resolves before
+ *   quota allocation. Behavior:
  *     - direction='inbound_bridge': cap is not checked (staff-
  *       initiated bridges aren't part of automated outreach).
  *     - cap === 0: kill-switch. Immediate rejection without a count
@@ -522,64 +527,6 @@ async function placeCallCore(
       };
     }
 
-    // (3.5) Phase 2.1 — daily cap enforcement.
-    // outbound_automated only; inbound_bridge bypasses (staff-initiated
-    // callbacks are not part of automated outreach).
-    //
-    // Order: AFTER compliance, BEFORE idempotency. Compliance is the
-    // more semantically meaningful gate (TCPA exposure); reporting
-    // compliance over cap when both apply matches the "more severe
-    // issue first" intuition.
-    {
-      const cap = businessRow!.max_outbound_calls_per_day;
-      const targetDayDate = req.scheduledFor ?? new Date();
-      const targetDayStr = targetDayDate.toISOString().slice(0, 10);
-
-      // R6 — cap === 0 is a kill-switch (principle of least surprise).
-      // Short-circuit BEFORE the count query so an intentional kill
-      // doesn't incur DB cost on every call attempt.
-      if (cap === 0) {
-        return {
-          ok: false,
-          reason: "daily_cap_exceeded",
-          cap: 0,
-          currentCount: 0,
-          targetDay: targetDayStr,
-        };
-      }
-
-      // cap > 0 path — count outbound_automated lead_calls for the
-      // target day. NULL cap is treated as "no cap" — fall through.
-      if (cap !== null && cap > 0) {
-        const { count: dayCount, error: countErr } = await countOutboundCallsForDay(
-          supabase,
-          req.businessId,
-          targetDayDate,
-        );
-        if (countErr || dayCount === null) {
-          // Fail-open: log + proceed. Cap is a soft tenant-set throttle,
-          // not a TCPA regulatory ceiling. A flaky count query should
-          // not drop calls. (Asymmetric to compliance which fails-closed
-          // because TCPA exposure is real.)
-          Sentry.captureMessage("daily_cap_count_query_failed", {
-            level: "warning",
-            extra: {
-              businessId: req.businessId,
-              error: countErr,
-              targetDay: targetDayStr,
-            },
-          });
-        } else if (dayCount >= cap) {
-          return {
-            ok: false,
-            reason: "daily_cap_exceeded",
-            cap,
-            currentCount: dayCount,
-            targetDay: targetDayStr,
-          };
-        }
-      }
-    }
   }
 
   // (4) inbound_bridge — resolve outbound caller ID for the customer leg.
@@ -616,6 +563,68 @@ async function placeCallCore(
       }
     } catch (err: any) {
       return { ok: false, reason: "db_error", step: "idempotency_check", error: err?.message || String(err) };
+    }
+  }
+
+  // (5.5) Phase 2.1.1 — daily cap enforcement.
+  // Moved from step 3.5 to step 5.5 in 2.1.1: idempotent re-submits
+  // must short-circuit BEFORE cap check so a re-submit of an
+  // already-scheduled row when the tenant is at cap returns
+  // idempotent:true (the existing row IS counted toward cap; the
+  // re-submit wouldn't insert a new row). Fresh submits at cap still
+  // get daily_cap_exceeded. Duplicate detection resolves before
+  // quota allocation.
+  //
+  // outbound_automated only; inbound_bridge bypasses (staff-initiated
+  // callbacks are not part of automated outreach).
+  if (req.direction === "outbound_automated" && businessRow) {
+    const cap = businessRow.max_outbound_calls_per_day;
+    const targetDayDate = req.scheduledFor ?? new Date();
+    const targetDayStr = targetDayDate.toISOString().slice(0, 10);
+
+    // R6 — cap === 0 is a kill-switch (principle of least surprise).
+    // Short-circuit BEFORE the count query so an intentional kill
+    // doesn't incur DB cost on every call attempt.
+    if (cap === 0) {
+      return {
+        ok: false,
+        reason: "daily_cap_exceeded",
+        cap: 0,
+        currentCount: 0,
+        targetDay: targetDayStr,
+      };
+    }
+
+    // cap > 0 path — count outbound_automated lead_calls for the
+    // target day. NULL cap is treated as "no cap" — fall through.
+    if (cap !== null && cap > 0) {
+      const { count: dayCount, error: countErr } = await countOutboundCallsForDay(
+        supabase,
+        req.businessId,
+        targetDayDate,
+      );
+      if (countErr || dayCount === null) {
+        // Fail-open: log + proceed. Cap is a soft tenant-set throttle,
+        // not a TCPA regulatory ceiling. A flaky count query should
+        // not drop calls. (Asymmetric to compliance which fails-closed
+        // because TCPA exposure is real.)
+        Sentry.captureMessage("daily_cap_count_query_failed", {
+          level: "warning",
+          extra: {
+            businessId: req.businessId,
+            error: countErr,
+            targetDay: targetDayStr,
+          },
+        });
+      } else if (dayCount >= cap) {
+        return {
+          ok: false,
+          reason: "daily_cap_exceeded",
+          cap,
+          currentCount: dayCount,
+          targetDay: targetDayStr,
+        };
+      }
     }
   }
 

@@ -1,6 +1,7 @@
 /**
- * Phase 1.3 — place-call.ts smoke. 28 cases.
- * 18 from 1.3 + T19/T20 from 1.5a + T21-T28 from 2.1 (daily cap).
+ * Phase 1.3 — place-call.ts smoke. 29 cases.
+ * 18 from 1.3 + T19/T20 from 1.5a + T21-T28 from 2.1 (daily cap) +
+ * T29 from 2.1.1 (cap-vs-idempotency ordering fix).
  *
  * Happy paths (4):
  *   T1  inbound_bridge immediate placement
@@ -47,6 +48,12 @@
  *   T26 existingLeadCallId + cap=100 + count=100 → daily_cap_exceeded + wrapper UPDATEs row terminal
  *   T27 cap=100, count query errors → fail-open + Sentry, placeCall proceeds
  *   T28 cap=0 kill-switch → daily_cap_exceeded WITHOUT running the count query (short-circuit)
+ *
+ * Phase 2.1.1 — cap-vs-idempotency ordering (1):
+ *   T29 idempotent re-submit at cap → returns idempotent:true (NOT daily_cap_exceeded).
+ *       Cap check moved from step 3.5 to step 5.5 so duplicate detection
+ *       resolves before quota allocation. Verifies zero count queries ran
+ *       (idempotency short-circuited cap check).
  *
  * Strategy: FakeSupabaseClient with .from(...).select(...).eq(...).maybeSingle()
  * + .insert(...).select(...).single() + .update(...).eq(...) chains.
@@ -1249,6 +1256,71 @@ async function T28() {
   record("T28 cap=0 kill-switch short-circuits", failures.length === 0, failures.join("; ") || "daily_cap_exceeded, cap=0, no count query ran");
 }
 
+// ── Phase 2.1.1: cap-vs-idempotency ordering (T29) ───────────────────
+
+async function T29() {
+  // Idempotent re-submit at cap → returns idempotent:true, NOT
+  // daily_cap_exceeded. Cap check (step 5.5) must run AFTER idempotency
+  // check (step 5), so a matching scheduled row short-circuits before
+  // any cap evaluation. Existing row is already counted against cap;
+  // re-submit wouldn't insert a new row, so cap is irrelevant.
+  placeCallInvocations.length = 0;
+  providerShouldFail = null;
+  const fake = new FakeSupabaseClient();
+  const scheduledFor = new Date(Date.now() + 7200_000);
+
+  fake.on((c) => c.op === "select" && c.table === "leads", {
+    data: { id: LEAD, business_id: BIZ, contact_phone: PHONE, reason: "T29" },
+  });
+  fake.on(
+    (c) => c.op === "select" && c.table === "business_configs" && c.selectColumns.includes("outbound_provider"),
+    { data: bizConfigDataForPlaceCall({ maxOutboundCallsPerDay: 100 }) },
+  );
+  fake.on(
+    (c) => c.op === "select" && c.table === "business_configs" && c.selectColumns.includes("outbound_calling_hours_start"),
+    { data: bizConfigDataForCompliance() },
+  );
+  fake.on(
+    (c) => c.op === "select" && c.table === "business_configs" && c.selectColumns.includes("voice_consent_default"),
+    { data: { voice_consent_default: true } },
+  );
+  fake.on((c) => c.op === "select" && c.table === "dnc_list", { data: null });
+  fake.on((c) => c.op === "select" && c.table === "voice_consent_records", { data: null });
+  // Idempotency match — existing scheduled row.
+  fake.on(
+    (c) => c.op === "select" && c.table === "lead_calls" && c.eqFilters.some((f) => f.column === "scheduled_for"),
+    { data: { id: "lc_existing_t29" } },
+  );
+  // If cap check ran (which it MUST NOT), it would hit count=100 → daily_cap_exceeded.
+  // Stage it anyway to prove the check was never invoked.
+  stageCapCount(fake, scheduledFor, { scheduledCount: 50, immediateCount: 50 });
+
+  const r = await placeCall(asClient(fake), {
+    businessId: BIZ,
+    leadId: LEAD,
+    direction: "outbound_automated",
+    callObjective: "appointment_reminder",
+    scheduledFor,
+  });
+
+  const failures: string[] = [];
+  if (!r.ok) failures.push(`!ok: ${JSON.stringify(r)}`);
+  if (r.ok) {
+    if (r.status !== "scheduled") failures.push(`status=${r.status}`);
+    if (r.idempotent !== true) failures.push(`idempotent=${r.idempotent}`);
+    if (r.leadCallId !== "lc_existing_t29") failures.push(`leadCallId=${r.leadCallId}`);
+  }
+  // Cap count queries must NOT have run — idempotency short-circuited.
+  const countQueries = fake.calls.filter(
+    (c) => c.op === "select" && c.table === "lead_calls" && c.countMode === "exact",
+  );
+  if (countQueries.length !== 0) failures.push(`${countQueries.length} unexpected count queries (idempotency should short-circuit cap check)`);
+  // No new lead_calls INSERT.
+  const inserts = fake.calls.filter((c) => c.op === "insert" && c.table === "lead_calls");
+  if (inserts.length !== 0) failures.push(`${inserts.length} unexpected lead_calls INSERTs`);
+  record("T29 idempotent re-submit at cap → idempotent:true (not daily_cap_exceeded)", failures.length === 0, failures.join("; ") || "idempotent:true, zero count queries, zero inserts");
+}
+
 async function main() {
   await T1();
   await T2();
@@ -1278,6 +1350,7 @@ async function main() {
   await T26();
   await T27();
   await T28();
+  await T29();
 
   // Restore for cleanliness.
   __setProviderFactoryForTesting(null);
