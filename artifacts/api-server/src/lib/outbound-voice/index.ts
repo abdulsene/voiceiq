@@ -22,6 +22,10 @@ import { ElevenLabsHostedProvider } from "./elevenlabs-hosted-provider";
 export * from "./types";
 export { TwilioRestProvider } from "./twilio-rest-provider";
 export { ElevenLabsHostedProvider } from "./elevenlabs-hosted-provider";
+// Phase 1.3 — placement primitive. Re-exported here so consumers
+// import from a single barrel rather than reaching into the file
+// directly. See JSDoc in place-call.ts for invariants.
+export { placeCall, type PlaceCallRequest, type PlaceCallResponse } from "./place-call";
 
 export interface GetProviderOptions {
   twilioClient?: TwilioClient;
