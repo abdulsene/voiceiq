@@ -5,6 +5,7 @@
     "callbackNumber": "Callback ring number",
     "callsLeads": "Calls & Leads",
     "leads": "Leads",
+    "campaigns": "Campaigns",
     "contacts": "Contacts",
     "appointments": "Appointments",
     "sms": "SMS & Campaigns",
@@ -484,6 +485,243 @@
       "save": "Save",
       "saving": "Saving...",
       "savedToast": "Saved. We'll ring this number on your next callback."
+    }
+  },
+  "campaigns": {
+    "list": {
+      "title": "Campaigns",
+      "subtitle": "Outbound voice campaigns that target leads matching a segment on the schedule you choose.",
+      "createDraft": "Create draft",
+      "createFailed": "Couldn't create campaign. Please try again.",
+      "filterStatus": "Status",
+      "statusAll": "All statuses",
+      "untitledName": "Untitled campaign",
+      "showingRange": "Showing {{from}}–{{to}} of {{total}}",
+      "prev": "Previous",
+      "next": "Next",
+      "empty": {
+        "title": "No campaigns yet",
+        "hint": "Create your first campaign — pick a segment of leads, choose when to call, and the AI will dial."
+      },
+      "col": {
+        "name": "Name",
+        "status": "Status",
+        "objective": "Objective",
+        "target": "Target",
+        "completed": "Completed",
+        "lastExpansion": "Last expansion",
+        "created": "Created"
+      }
+    },
+    "status": {
+      "draft": "Draft",
+      "queued": "Queued",
+      "active": "Active",
+      "paused": "Paused",
+      "completed": "Completed",
+      "cancelled": "Cancelled"
+    },
+    "objective": {
+      "appointment_reminder": "Appointment reminder",
+      "winback": "Win-back",
+      "follow_up": "Follow up",
+      "review_request": "Review request",
+      "general": "General"
+    },
+    "junctionState": {
+      "pending": "Pending",
+      "scheduled": "Scheduled",
+      "completed": "Completed",
+      "succeeded": "Succeeded",
+      "failed": "Failed",
+      "skipped": "Skipped"
+    },
+    "skipReason": {
+      "do_not_call": "On Do-Not-Call list",
+      "no_matching_anchor": "No matching appointment",
+      "already_in_campaign": "Already in campaign",
+      "outside_calling_hours": "Outside calling hours",
+      "daily_cap_exceeded": "Daily cap reached",
+      "consent_missing": "Voice consent missing"
+    },
+    "detail": {
+      "backToList": "Back to campaigns",
+      "namePlaceholder": "Campaign name",
+      "basic": {
+        "title": "Basic info",
+        "objective": "Call objective",
+        "status": "Status",
+        "agentId": "Agent ID",
+        "agentIdPlaceholder": "Use tenant default",
+        "voicemailOverride": "Voicemail message override",
+        "voicemailPlaceholder": "Leave blank to use the tenant default.",
+        "voicemailHint": "If a call hits voicemail, the AI plays this text. Empty = fall back to your tenant default."
+      },
+      "targeting": { "title": "Targeting" },
+      "timing": { "title": "Timing" },
+      "limits": {
+        "title": "Limits",
+        "unlimited": "Unlimited — no daily cap",
+        "capEnabled": "Cap daily call volume",
+        "callsPerDay": "calls / day",
+        "hint": "Once this campaign hits the cap on a given day, no further calls are placed until the next day."
+      },
+      "materialization": {
+        "title": "Materialization status",
+        "lastExpansion": "Last expansion",
+        "counters": {
+          "target": "Target",
+          "scheduled": "Scheduled",
+          "completed": "Completed",
+          "succeeded": "Succeeded",
+          "failed": "Failed",
+          "voicemail": "Voicemail"
+        }
+      },
+      "activity": {
+        "title": "Recent activity",
+        "empty": "No leads have been processed for this campaign yet.",
+        "col": {
+          "lead": "Lead",
+          "phone": "Phone",
+          "state": "State",
+          "skipReason": "Skip reason",
+          "scheduledFor": "Scheduled for"
+        }
+      },
+      "actions": {
+        "save": "Save",
+        "activate": "Activate",
+        "pause": "Pause",
+        "delete": "Delete"
+      },
+      "deleteConfirm": {
+        "title": "Delete this campaign?",
+        "body": "This cancels any scheduled calls and removes {{target}} campaign-lead records. {{scheduled}} scheduled calls will be canceled. This can't be undone.",
+        "cancel": "Cancel",
+        "confirm": "Delete campaign"
+      },
+      "toast": {
+        "saved": "Campaign saved.",
+        "activated": "Campaign activated.",
+        "paused": "Campaign paused.",
+        "deleted": "Campaign deleted. Canceled {{canceled}} scheduled calls."
+      }
+    },
+    "builder": {
+      "segment": {
+        "title": "Who should we call?",
+        "description": "Pick the leads this campaign targets. Filters in the All section AND together; filters in Any OR together.",
+        "showJson": "Show JSON",
+        "showForm": "Show form",
+        "allTitle": "All of these (AND)",
+        "allHint": "Every condition must be true for the lead to qualify.",
+        "anyTitle": "Any of these (OR)",
+        "anyHint": "Any one matching condition is enough.",
+        "empty": "No filters yet — add one to narrow your audience.",
+        "addRow": "Add filter",
+        "removeRow": "Remove filter",
+        "selectField": "Select a field",
+        "selectOperator": "Select an operator",
+        "jsonHint": "Edit JSON directly. Parsed on blur; invalid input keeps the previous form value.",
+        "fields": {
+          "leads_status": "Lead status",
+          "leads_urgency": "Lead urgency",
+          "leads_source": "Lead source",
+          "leads_preferred_channel": "Preferred channel",
+          "leads_do_not_call": "Do-not-call flag",
+          "leads_outcome_booked": "Booked an appointment",
+          "leads_outbound_attempt_count": "Outbound attempts",
+          "leads_last_outbound_attempt_at": "Last outbound attempt",
+          "leads_first_response_at": "First response time",
+          "leads_created_at": "Lead created at",
+          "leads_resolved_at": "Lead resolved at"
+        },
+        "ops": {
+          "eq": "is",
+          "neq": "is not",
+          "in": "is one of",
+          "not_in": "is not one of",
+          "lt": "is before",
+          "lte": "is on or before",
+          "gt": "is after",
+          "gte": "is on or after",
+          "older_than": "is older than",
+          "newer_than": "is newer than",
+          "exists": "has a value",
+          "not_exists": "has no value"
+        },
+        "value": {
+          "selectOne": "Select…",
+          "text": "Enter a value",
+          "commaSeparated": "Comma-separated list",
+          "true": "True",
+          "false": "False",
+          "pickDate": "Pick a date",
+          "noValueNeeded": "—"
+        },
+        "units": {
+          "minutes": "minutes",
+          "hours": "hours",
+          "days": "days",
+          "weeks": "weeks"
+        },
+        "enum": {
+          "leads_status": {
+            "new": "New",
+            "claimed": "Claimed",
+            "in_progress": "In progress",
+            "resolved": "Resolved",
+            "dismissed": "Dismissed"
+          },
+          "leads_urgency": {
+            "low": "Low",
+            "medium": "Medium",
+            "high": "High",
+            "emergency": "Emergency"
+          },
+          "leads_preferred_channel": {
+            "text": "Text",
+            "call": "Phone call",
+            "email": "Email",
+            "voice_callback": "Voice callback"
+          }
+        },
+        "preview": {
+          "leadsMatch": "leads match this segment",
+          "showSample": "Show sample of {{count}}",
+          "colName": "Name",
+          "colPhone": "Phone"
+        }
+      },
+      "schedule": {
+        "title": "When should we call?",
+        "description": "Pick a fire time strategy. Bulk fires every targeted lead at the same moment; Per appointment offsets each call from each lead's confirmed appointment.",
+        "tabs": {
+          "bulk": "Fire all at once",
+          "timeRelative": "Per appointment"
+        },
+        "bulk": {
+          "label": "Fire at",
+          "hint": "Every targeted lead is called at this single moment.",
+          "warningPast": "Fire time is in the past. Pick a future time before activating the campaign."
+        },
+        "timeRelative": {
+          "label": "Offset from anchor",
+          "hint": "Each call fires at a fixed offset before each lead's confirmed appointment.",
+          "sendCall": "Send a call",
+          "beforeAppointment": "before each lead's next confirmed appointment.",
+          "warningNonPositive": "Offset must be positive — we treat the value as 'before the appointment'.",
+          "advanced": "Advanced (read-only)",
+          "anchorSource": "Anchor source",
+          "anchorFilter": "Anchor filter"
+        },
+        "preview": {
+          "colLead": "Lead",
+          "colWhen": "Scheduled for",
+          "noMatches": "No sample leads have a resolvable scheduled time yet. Add a segment that matches leads with confirmed appointments."
+        }
+      }
     }
   },
   "transfer": {

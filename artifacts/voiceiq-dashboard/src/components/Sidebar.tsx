@@ -18,6 +18,7 @@ import {
   Shield,
   Bot,
   Inbox,
+  Megaphone,
 } from "lucide-react";
 // Sprint 1 BUG-17 sub-step 3f: removed import of OnboardingWizard. The
 // in-sidebar "Start Setup" / "New Business" buttons used to open it and
@@ -61,6 +62,11 @@ const navItems: NavItem[] = [
   // escalates from. Visible to all business members; admin override
   // available at /admin/businesses/:id/leads.
   { path: "/leads", labelKey: "nav.leads", icon: Inbox },
+  // Phase 2.6b: outbound voice campaigns dashboard. Slotted between
+  // Leads (which can act as the source of segment-able leads) and
+  // Contacts so the outbound-call workflow lives alongside the lead
+  // pipeline it draws from.
+  { path: "/campaigns", labelKey: "nav.campaigns", icon: Megaphone },
   { path: "/contacts", labelKey: "nav.contacts", icon: Users },
   { path: "/appointments", labelKey: "nav.appointments", icon: Calendar },
   { path: "/sms", labelKey: "nav.sms", icon: MessageSquare },

@@ -5,6 +5,7 @@
     "callbackNumber": "Numéro de rappel",
     "callsLeads": "Appels et prospects",
     "leads": "Leads",
+    "campaigns": "Campagnes",
     "contacts": "Contacts",
     "appointments": "Rendez-vous",
     "sms": "SMS et campagnes",
@@ -484,6 +485,243 @@
       "save": "Enregistrer",
       "saving": "Enregistrement...",
       "savedToast": "Enregistré. Nous appellerons ce numéro lors de votre prochain rappel."
+    }
+  },
+  "campaigns": {
+    "list": {
+      "title": "Campagnes",
+      "subtitle": "Campagnes vocales sortantes qui ciblent les leads correspondant à un segment, selon le calendrier choisi.",
+      "createDraft": "Créer un brouillon",
+      "createFailed": "Impossible de créer la campagne. Réessayez.",
+      "filterStatus": "Statut",
+      "statusAll": "Tous les statuts",
+      "untitledName": "Campagne sans titre",
+      "showingRange": "Affichage {{from}}–{{to}} sur {{total}}",
+      "prev": "Précédent",
+      "next": "Suivant",
+      "empty": {
+        "title": "Aucune campagne pour l'instant",
+        "hint": "Créez votre première campagne : choisissez un segment de leads, planifiez le moment des appels et l'IA composera."
+      },
+      "col": {
+        "name": "Nom",
+        "status": "Statut",
+        "objective": "Objectif",
+        "target": "Cible",
+        "completed": "Terminées",
+        "lastExpansion": "Dernière expansion",
+        "created": "Créée"
+      }
+    },
+    "status": {
+      "draft": "Brouillon",
+      "queued": "En file",
+      "active": "Active",
+      "paused": "En pause",
+      "completed": "Terminée",
+      "cancelled": "Annulée"
+    },
+    "objective": {
+      "appointment_reminder": "Rappel de rendez-vous",
+      "winback": "Reconquête",
+      "follow_up": "Suivi",
+      "review_request": "Demande d'avis",
+      "general": "Général"
+    },
+    "junctionState": {
+      "pending": "En attente",
+      "scheduled": "Planifié",
+      "completed": "Terminé",
+      "succeeded": "Réussi",
+      "failed": "Échoué",
+      "skipped": "Ignoré"
+    },
+    "skipReason": {
+      "do_not_call": "Liste Ne-pas-appeler",
+      "no_matching_anchor": "Aucun rendez-vous correspondant",
+      "already_in_campaign": "Déjà dans la campagne",
+      "outside_calling_hours": "Hors plage horaire",
+      "daily_cap_exceeded": "Plafond quotidien atteint",
+      "consent_missing": "Consentement vocal manquant"
+    },
+    "detail": {
+      "backToList": "Retour aux campagnes",
+      "namePlaceholder": "Nom de la campagne",
+      "basic": {
+        "title": "Informations de base",
+        "objective": "Objectif de l'appel",
+        "status": "Statut",
+        "agentId": "ID d'agent",
+        "agentIdPlaceholder": "Utiliser le défaut du tenant",
+        "voicemailOverride": "Message vocal personnalisé",
+        "voicemailPlaceholder": "Laissez vide pour utiliser le défaut du tenant.",
+        "voicemailHint": "Si l'appel arrive sur la messagerie, l'IA joue ce texte. Vide = défaut du tenant."
+      },
+      "targeting": { "title": "Ciblage" },
+      "timing": { "title": "Planification" },
+      "limits": {
+        "title": "Limites",
+        "unlimited": "Illimité — pas de plafond quotidien",
+        "capEnabled": "Limiter le volume quotidien",
+        "callsPerDay": "appels / jour",
+        "hint": "Une fois le plafond atteint, plus aucun appel n'est passé jusqu'au lendemain."
+      },
+      "materialization": {
+        "title": "État de matérialisation",
+        "lastExpansion": "Dernière expansion",
+        "counters": {
+          "target": "Cible",
+          "scheduled": "Planifiés",
+          "completed": "Terminés",
+          "succeeded": "Réussis",
+          "failed": "Échoués",
+          "voicemail": "Messagerie"
+        }
+      },
+      "activity": {
+        "title": "Activité récente",
+        "empty": "Aucun lead traité pour cette campagne pour l'instant.",
+        "col": {
+          "lead": "Lead",
+          "phone": "Téléphone",
+          "state": "État",
+          "skipReason": "Raison d'omission",
+          "scheduledFor": "Planifié pour"
+        }
+      },
+      "actions": {
+        "save": "Enregistrer",
+        "activate": "Activer",
+        "pause": "Mettre en pause",
+        "delete": "Supprimer"
+      },
+      "deleteConfirm": {
+        "title": "Supprimer cette campagne ?",
+        "body": "Cela annule les appels planifiés et supprime {{target}} enregistrements lead-campagne. {{scheduled}} appels planifiés seront annulés. Cette action est irréversible.",
+        "cancel": "Annuler",
+        "confirm": "Supprimer la campagne"
+      },
+      "toast": {
+        "saved": "Campagne enregistrée.",
+        "activated": "Campagne activée.",
+        "paused": "Campagne mise en pause.",
+        "deleted": "Campagne supprimée. {{canceled}} appels planifiés annulés."
+      }
+    },
+    "builder": {
+      "segment": {
+        "title": "Qui appeler ?",
+        "description": "Choisissez les leads ciblés. Les filtres « Tous » se combinent par ET ; ceux de « N'importe lequel » par OU.",
+        "showJson": "Afficher JSON",
+        "showForm": "Afficher le formulaire",
+        "allTitle": "Tous ceux-ci (ET)",
+        "allHint": "Chaque condition doit être vraie pour que le lead soit retenu.",
+        "anyTitle": "L'un de ceux-ci (OU)",
+        "anyHint": "Une seule condition suffit.",
+        "empty": "Aucun filtre — ajoutez-en un pour affiner votre audience.",
+        "addRow": "Ajouter un filtre",
+        "removeRow": "Supprimer le filtre",
+        "selectField": "Sélectionner un champ",
+        "selectOperator": "Sélectionner un opérateur",
+        "jsonHint": "Modifiez le JSON directement. Analysé à la perte de focus ; une saisie invalide garde la valeur précédente.",
+        "fields": {
+          "leads_status": "Statut du lead",
+          "leads_urgency": "Urgence du lead",
+          "leads_source": "Source du lead",
+          "leads_preferred_channel": "Canal préféré",
+          "leads_do_not_call": "Indicateur Ne-pas-appeler",
+          "leads_outcome_booked": "Rendez-vous réservé",
+          "leads_outbound_attempt_count": "Tentatives sortantes",
+          "leads_last_outbound_attempt_at": "Dernière tentative sortante",
+          "leads_first_response_at": "Première réponse",
+          "leads_created_at": "Lead créé le",
+          "leads_resolved_at": "Lead résolu le"
+        },
+        "ops": {
+          "eq": "est",
+          "neq": "n'est pas",
+          "in": "fait partie de",
+          "not_in": "ne fait pas partie de",
+          "lt": "est avant",
+          "lte": "est le ou avant",
+          "gt": "est après",
+          "gte": "est le ou après",
+          "older_than": "est plus ancien que",
+          "newer_than": "est plus récent que",
+          "exists": "a une valeur",
+          "not_exists": "n'a pas de valeur"
+        },
+        "value": {
+          "selectOne": "Sélectionner…",
+          "text": "Saisir une valeur",
+          "commaSeparated": "Liste séparée par des virgules",
+          "true": "Oui",
+          "false": "Non",
+          "pickDate": "Choisir une date",
+          "noValueNeeded": "—"
+        },
+        "units": {
+          "minutes": "minutes",
+          "hours": "heures",
+          "days": "jours",
+          "weeks": "semaines"
+        },
+        "enum": {
+          "leads_status": {
+            "new": "Nouveau",
+            "claimed": "Pris en charge",
+            "in_progress": "En cours",
+            "resolved": "Résolu",
+            "dismissed": "Rejeté"
+          },
+          "leads_urgency": {
+            "low": "Faible",
+            "medium": "Moyenne",
+            "high": "Élevée",
+            "emergency": "Urgence"
+          },
+          "leads_preferred_channel": {
+            "text": "Texte",
+            "call": "Appel",
+            "email": "Email",
+            "voice_callback": "Rappel vocal"
+          }
+        },
+        "preview": {
+          "leadsMatch": "leads correspondent à ce segment",
+          "showSample": "Afficher un échantillon de {{count}}",
+          "colName": "Nom",
+          "colPhone": "Téléphone"
+        }
+      },
+      "schedule": {
+        "title": "Quand appeler ?",
+        "description": "Choisissez une stratégie. Groupé envoie tous les appels au même moment ; Par rendez-vous décale chaque appel par rapport au rendez-vous confirmé du lead.",
+        "tabs": {
+          "bulk": "Tout envoyer en une fois",
+          "timeRelative": "Par rendez-vous"
+        },
+        "bulk": {
+          "label": "Heure d'envoi",
+          "hint": "Chaque lead ciblé est appelé à ce moment précis.",
+          "warningPast": "L'heure d'envoi est dans le passé. Choisissez une heure future avant d'activer la campagne."
+        },
+        "timeRelative": {
+          "label": "Décalage par rapport à l'ancre",
+          "hint": "Chaque appel se déclenche avec un décalage fixe avant le rendez-vous confirmé du lead.",
+          "sendCall": "Envoyer un appel",
+          "beforeAppointment": "avant le prochain rendez-vous confirmé du lead.",
+          "warningNonPositive": "Le décalage doit être positif — interprété comme « avant le rendez-vous ».",
+          "advanced": "Avancé (lecture seule)",
+          "anchorSource": "Source de l'ancre",
+          "anchorFilter": "Filtre de l'ancre"
+        },
+        "preview": {
+          "colLead": "Lead",
+          "colWhen": "Planifié pour",
+          "noMatches": "Aucun lead d'échantillon n'a encore d'heure planifiée résolvable. Ajoutez un segment qui correspond à des leads avec des rendez-vous confirmés."
+        }
+      }
     }
   },
   "transfer": {

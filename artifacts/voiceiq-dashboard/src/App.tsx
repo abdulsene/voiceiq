@@ -6,6 +6,9 @@ import CommandCenter from "./pages/CommandCenter";
 import CallsLeads from "./pages/CallsLeads";
 import LeadsListPage from "./pages/Leads/LeadsListPage";
 import LeadDetailPage from "./pages/Leads/LeadDetailPage";
+import CampaignsListPage from "./pages/Campaigns/CampaignsListPage";
+import CampaignDetailPage from "./pages/Campaigns/CampaignDetailPage";
+import { Toaster as SonnerToaster } from "./components/ui/sonner";
 import CallbackSettingsPage from "./pages/Leads/CallbackSettingsPage";
 import TrustPortalPage from "./pages/Public/TrustPortalPage";
 import Contacts from "./pages/Contacts";
@@ -627,6 +630,13 @@ function DashboardLayout() {
                   DashboardLayout; no extra gating needed here. */}
               <Route path="/leads" component={LeadsListPage} />
               <Route path="/leads/:id" component={LeadDetailPage} />
+              {/* Phase 2.6b: outbound voice campaigns. Backend routes
+                  under /api/business/campaigns are mounted in
+                  api-server/routes/index.ts ahead of the catch-all. */}
+              <Route path="/campaigns" component={CampaignsListPage} />
+              <Route path="/campaigns/:id">
+                {(params) => <CampaignDetailPage campaignId={params.id} />}
+              </Route>
               <Route path="/contacts" component={Contacts} />
               <Route path="/appointments" component={Appointments} />
               <Route path="/sms" component={SmsCampaigns} />
@@ -680,6 +690,11 @@ function DashboardLayout() {
           />
         </div>
         {showSuccessToast && <SuccessToast onDismiss={() => setShowSuccessToast(false)} />}
+        {/* Phase 2.6b: shared Sonner toaster for inline action feedback
+            (campaign save / activate / delete). Mounted inside the
+            dashboard wrapper so toasts only render on authenticated
+            routes, not on marketing/auth pages. */}
+        <SonnerToaster position="bottom-right" richColors />
       </LocationProvider>
     </AuthGuard>
   );
@@ -805,6 +820,8 @@ function App() {
         <Route path="/calls" component={() => <DashboardLayout />} />
         <Route path="/leads" component={() => <DashboardLayout />} />
         <Route path="/leads/:id" component={() => <DashboardLayout />} />
+        <Route path="/campaigns" component={() => <DashboardLayout />} />
+        <Route path="/campaigns/:id" component={() => <DashboardLayout />} />
         <Route path="/contacts" component={() => <DashboardLayout />} />
         <Route path="/appointments" component={() => <DashboardLayout />} />
         <Route path="/sms" component={() => <DashboardLayout />} />

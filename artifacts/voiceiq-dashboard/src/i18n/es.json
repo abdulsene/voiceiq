@@ -5,6 +5,7 @@
     "callbackNumber": "Número de devolución",
     "callsLeads": "Llamadas y leads",
     "leads": "Leads",
+    "campaigns": "Campañas",
     "contacts": "Contactos",
     "appointments": "Citas",
     "sms": "SMS y campañas",
@@ -484,6 +485,243 @@
       "save": "Guardar",
       "saving": "Guardando...",
       "savedToast": "Guardado. Llamaremos a este número en tu próxima devolución."
+    }
+  },
+  "campaigns": {
+    "list": {
+      "title": "Campañas",
+      "subtitle": "Campañas de voz salientes que llaman a leads que coinciden con un segmento, según el horario que elijas.",
+      "createDraft": "Crear borrador",
+      "createFailed": "No se pudo crear la campaña. Inténtalo de nuevo.",
+      "filterStatus": "Estado",
+      "statusAll": "Todos los estados",
+      "untitledName": "Campaña sin título",
+      "showingRange": "Mostrando {{from}}–{{to}} de {{total}}",
+      "prev": "Anterior",
+      "next": "Siguiente",
+      "empty": {
+        "title": "Aún no hay campañas",
+        "hint": "Crea tu primera campaña: elige un segmento de leads, programa cuándo llamar y la IA marcará."
+      },
+      "col": {
+        "name": "Nombre",
+        "status": "Estado",
+        "objective": "Objetivo",
+        "target": "Objetivo",
+        "completed": "Completadas",
+        "lastExpansion": "Última expansión",
+        "created": "Creada"
+      }
+    },
+    "status": {
+      "draft": "Borrador",
+      "queued": "En cola",
+      "active": "Activa",
+      "paused": "Pausada",
+      "completed": "Completada",
+      "cancelled": "Cancelada"
+    },
+    "objective": {
+      "appointment_reminder": "Recordatorio de cita",
+      "winback": "Recuperación",
+      "follow_up": "Seguimiento",
+      "review_request": "Solicitud de reseña",
+      "general": "General"
+    },
+    "junctionState": {
+      "pending": "Pendiente",
+      "scheduled": "Programada",
+      "completed": "Completada",
+      "succeeded": "Exitosa",
+      "failed": "Fallida",
+      "skipped": "Omitida"
+    },
+    "skipReason": {
+      "do_not_call": "Lista No-Llamar",
+      "no_matching_anchor": "Sin cita coincidente",
+      "already_in_campaign": "Ya en la campaña",
+      "outside_calling_hours": "Fuera de horario",
+      "daily_cap_exceeded": "Tope diario alcanzado",
+      "consent_missing": "Sin consentimiento de voz"
+    },
+    "detail": {
+      "backToList": "Volver a campañas",
+      "namePlaceholder": "Nombre de la campaña",
+      "basic": {
+        "title": "Información básica",
+        "objective": "Objetivo de la llamada",
+        "status": "Estado",
+        "agentId": "ID de agente",
+        "agentIdPlaceholder": "Usar el predeterminado del tenant",
+        "voicemailOverride": "Mensaje de buzón personalizado",
+        "voicemailPlaceholder": "Déjalo vacío para usar el predeterminado del tenant.",
+        "voicemailHint": "Si la llamada cae en buzón, la IA reproduce este texto. Vacío = se usa el predeterminado."
+      },
+      "targeting": { "title": "Segmentación" },
+      "timing": { "title": "Programación" },
+      "limits": {
+        "title": "Límites",
+        "unlimited": "Ilimitado — sin tope diario",
+        "capEnabled": "Limitar volumen diario",
+        "callsPerDay": "llamadas / día",
+        "hint": "Cuando se alcanza el tope, no se realizan más llamadas hasta el día siguiente."
+      },
+      "materialization": {
+        "title": "Estado de materialización",
+        "lastExpansion": "Última expansión",
+        "counters": {
+          "target": "Objetivo",
+          "scheduled": "Programadas",
+          "completed": "Completadas",
+          "succeeded": "Exitosas",
+          "failed": "Fallidas",
+          "voicemail": "Buzón"
+        }
+      },
+      "activity": {
+        "title": "Actividad reciente",
+        "empty": "Aún no se han procesado leads para esta campaña.",
+        "col": {
+          "lead": "Lead",
+          "phone": "Teléfono",
+          "state": "Estado",
+          "skipReason": "Razón de omisión",
+          "scheduledFor": "Programada para"
+        }
+      },
+      "actions": {
+        "save": "Guardar",
+        "activate": "Activar",
+        "pause": "Pausar",
+        "delete": "Eliminar"
+      },
+      "deleteConfirm": {
+        "title": "¿Eliminar esta campaña?",
+        "body": "Se cancelan las llamadas programadas y se eliminan {{target}} registros lead-campaña. {{scheduled}} llamadas programadas se cancelarán. Esto no se puede deshacer.",
+        "cancel": "Cancelar",
+        "confirm": "Eliminar campaña"
+      },
+      "toast": {
+        "saved": "Campaña guardada.",
+        "activated": "Campaña activada.",
+        "paused": "Campaña pausada.",
+        "deleted": "Campaña eliminada. Se cancelaron {{canceled}} llamadas programadas."
+      }
+    },
+    "builder": {
+      "segment": {
+        "title": "¿A quién debemos llamar?",
+        "description": "Elige los leads que esta campaña tiene como objetivo. Los filtros en Todos se combinan con Y; los de Cualquiera con O.",
+        "showJson": "Ver JSON",
+        "showForm": "Ver formulario",
+        "allTitle": "Todos estos (Y)",
+        "allHint": "Cada condición debe cumplirse para que el lead califique.",
+        "anyTitle": "Cualquiera de estos (O)",
+        "anyHint": "Basta con una condición.",
+        "empty": "Sin filtros — agrega uno para acotar tu audiencia.",
+        "addRow": "Agregar filtro",
+        "removeRow": "Eliminar filtro",
+        "selectField": "Selecciona un campo",
+        "selectOperator": "Selecciona un operador",
+        "jsonHint": "Edita el JSON directamente. Se analiza al perder el foco; un valor inválido mantiene el formulario anterior.",
+        "fields": {
+          "leads_status": "Estado del lead",
+          "leads_urgency": "Urgencia del lead",
+          "leads_source": "Origen del lead",
+          "leads_preferred_channel": "Canal preferido",
+          "leads_do_not_call": "Marca No-Llamar",
+          "leads_outcome_booked": "Reservó una cita",
+          "leads_outbound_attempt_count": "Intentos salientes",
+          "leads_last_outbound_attempt_at": "Último intento saliente",
+          "leads_first_response_at": "Primera respuesta",
+          "leads_created_at": "Lead creado en",
+          "leads_resolved_at": "Lead resuelto en"
+        },
+        "ops": {
+          "eq": "es",
+          "neq": "no es",
+          "in": "es uno de",
+          "not_in": "no es ninguno de",
+          "lt": "es antes de",
+          "lte": "es en o antes de",
+          "gt": "es después de",
+          "gte": "es en o después de",
+          "older_than": "es más antiguo que",
+          "newer_than": "es más reciente que",
+          "exists": "tiene valor",
+          "not_exists": "no tiene valor"
+        },
+        "value": {
+          "selectOne": "Selecciona…",
+          "text": "Ingresa un valor",
+          "commaSeparated": "Lista separada por comas",
+          "true": "Sí",
+          "false": "No",
+          "pickDate": "Elige una fecha",
+          "noValueNeeded": "—"
+        },
+        "units": {
+          "minutes": "minutos",
+          "hours": "horas",
+          "days": "días",
+          "weeks": "semanas"
+        },
+        "enum": {
+          "leads_status": {
+            "new": "Nuevo",
+            "claimed": "Tomado",
+            "in_progress": "En curso",
+            "resolved": "Resuelto",
+            "dismissed": "Descartado"
+          },
+          "leads_urgency": {
+            "low": "Baja",
+            "medium": "Media",
+            "high": "Alta",
+            "emergency": "Emergencia"
+          },
+          "leads_preferred_channel": {
+            "text": "Texto",
+            "call": "Llamada",
+            "email": "Correo",
+            "voice_callback": "Devolución de voz"
+          }
+        },
+        "preview": {
+          "leadsMatch": "leads coinciden con este segmento",
+          "showSample": "Mostrar muestra de {{count}}",
+          "colName": "Nombre",
+          "colPhone": "Teléfono"
+        }
+      },
+      "schedule": {
+        "title": "¿Cuándo debemos llamar?",
+        "description": "Elige una estrategia. Masivo llama a todos los leads en el mismo momento; Por cita programa cada llamada con un desfase relativo a la cita del lead.",
+        "tabs": {
+          "bulk": "Disparar todos a la vez",
+          "timeRelative": "Por cita"
+        },
+        "bulk": {
+          "label": "Disparar a las",
+          "hint": "Cada lead objetivo se llamará en este momento exacto.",
+          "warningPast": "La hora de disparo está en el pasado. Elige una hora futura antes de activar la campaña."
+        },
+        "timeRelative": {
+          "label": "Desfase desde el ancla",
+          "hint": "Cada llamada se dispara con un desfase fijo antes de la cita confirmada del lead.",
+          "sendCall": "Enviar una llamada",
+          "beforeAppointment": "antes de la próxima cita confirmada del lead.",
+          "warningNonPositive": "El desfase debe ser positivo — se interpreta como 'antes de la cita'.",
+          "advanced": "Avanzado (solo lectura)",
+          "anchorSource": "Fuente del ancla",
+          "anchorFilter": "Filtro del ancla"
+        },
+        "preview": {
+          "colLead": "Lead",
+          "colWhen": "Programada para",
+          "noMatches": "Aún no hay leads de muestra con una hora programada resoluble. Agrega un segmento que coincida con leads que tengan citas confirmadas."
+        }
+      }
     }
   },
   "transfer": {
