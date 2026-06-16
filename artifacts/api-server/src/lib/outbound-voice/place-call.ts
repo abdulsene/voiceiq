@@ -119,7 +119,22 @@ export interface PlaceCallRequest {
 }
 
 export type PlaceCallResponse =
-  | { ok: true; leadCallId: string; callSid: string; provider: CallProvider; status: "placed"; idempotent?: false }
+  | {
+      ok: true;
+      leadCallId: string;
+      callSid: string;
+      provider: CallProvider;
+      status: "placed";
+      idempotent?: false;
+      /**
+       * The E.164 number Twilio actually dialed from. Always present for
+       * inbound_bridge. For outbound_automated/twilio it's the tenant's
+       * twilio_phone_number. Undefined for outbound_automated/elevenlabs
+       * (ElevenLabs hosted resolves from-number from phone_number_id, not
+       * an E.164 we surface).
+       */
+      fromCallerId?: string;
+    }
   | { ok: true; leadCallId: string; callSid: null; provider: null; status: "scheduled"; idempotent?: boolean }
   | { ok: false; reason: "lead_not_found" }
   | { ok: false; reason: "lead_phone_invalid" }
@@ -483,11 +498,22 @@ export async function placeCall(
   }
 
   // (15) Return success.
+  // fromCallerId is the actual E.164 we dialed from. For bridge it's the
+  // resolved outbound caller ID; for outbound_automated/twilio it's the
+  // tenant's twilio_phone_number; for elevenlabs the empty placeholder is
+  // not meaningful — omit it so consumers can branch on presence.
+  const fromCallerId =
+    req.direction === "inbound_bridge"
+      ? bridgeCallerIdFrom ?? undefined
+      : providerToUse === "twilio"
+        ? fromNumber || undefined
+        : undefined;
   return {
     ok: true,
     leadCallId,
     callSid: result.callSid,
     provider: providerToUse,
     status: "placed",
+    ...(fromCallerId ? { fromCallerId } : {}),
   };
 }

@@ -38,12 +38,10 @@ import * as Sentry from "@sentry/node";
 
 import { requireAuth, requirePermission } from "../middlewares/auth";
 import { requireStaffPermission } from "../middlewares/staff-rbac";
-import { auditLog, extractRequestMeta } from "../middlewares/audit";
-import { getTwilioClient } from "../sms";
-import { resolveOutboundCallerId } from "../lib/twilio-caller-id";
+import { extractRequestMeta } from "../middlewares/audit";
 import { sendLeadSms } from "../lib/sms-service";
 import { briefReason } from "../lib/sms-templates";
-import { getPublicApiBase } from "../lib/public-url";
+import { placeCall } from "../lib/outbound-voice";
 
 const router = Router();
 
@@ -89,8 +87,30 @@ async function resolveStaffRingNumber(
 
 /**
  * Shared handler used by both /api/business/leads/:id/call and the
- * admin parallel. The admin route resolves businessId from the URL
- * param; the customer route uses req.businessId.
+ * admin parallel. Phase 1.4 — thin HTTP wrapper over placeCall().
+ *
+ * The route owns:
+ *   - Staff ring-number resolution (per-user preference).
+ *   - Request meta extraction for the audit trail.
+ *   - Fetching the lead's reason + contact_phone for the SMS dispatch
+ *     and the documented response body shape.
+ *   - HTTP status mapping.
+ *   - 'callback_starting' SMS fire-and-forget.
+ *   - Response body shaping (preserving the legacy fields the
+ *     dashboard's LeadDetailPage and SMS receipts expect).
+ *
+ * placeCall() owns:
+ *   - Cross-tenant lead guard, lead-row + phone validation.
+ *   - Outbound caller-ID resolution.
+ *   - lead_calls pre-insert + post-insert call_sid UPDATE.
+ *   - Twilio dispatch (incl. 21217 retry via TwilioRestProvider).
+ *   - lead_activities insert + auditLog.
+ *
+ * NOTE on 21217 fallback: TwilioRestProvider falls back to
+ * process.env.TWILIO_PHONE_NUMBER, not business_configs.twilio_phone_number
+ * as the pre-1.4 route did. This is the documented Phase 0-B shortcut
+ * (see twilio-rest-provider.ts JSDoc) — Phase 2 can lift it to a
+ * per-tenant lookup if needed.
  */
 async function handleInitiateCall(opts: {
   req: Request;
@@ -104,37 +124,6 @@ async function handleInitiateCall(opts: {
 }): Promise<void> {
   const { req, res, supabase, businessId, leadId, staffUserId, ringNumberOverride, isAdmin } = opts;
 
-  // Validate the lead belongs to this business — cross-tenant guard.
-  const { data: lead, error: leadErr } = await supabase
-    .from("leads")
-    .select("id, business_id, contact_name, contact_phone, reason")
-    .eq("id", leadId)
-    .eq("business_id", businessId)
-    .maybeSingle();
-  if (leadErr) {
-    Sentry.captureMessage("lead_call_lead_lookup_failed", {
-      level: "error",
-      extra: { businessId, leadId, error: leadErr.message },
-    });
-    res.status(500).json({ error: "Database error" });
-    return;
-  }
-  const leadRow = lead as {
-    id: string;
-    business_id: string;
-    contact_name: string | null;
-    contact_phone: string | null;
-    reason: string;
-  } | null;
-  if (!leadRow) {
-    res.status(404).json({ error: "Lead not found" });
-    return;
-  }
-  if (!leadRow.contact_phone || !E164_RE.test(leadRow.contact_phone)) {
-    res.status(400).json({ error: "This lead has no usable customer phone on file" });
-    return;
-  }
-
   const ringNumber = await resolveStaffRingNumber(supabase, staffUserId, businessId, ringNumberOverride);
   if (!ringNumber) {
     res.status(400).json({
@@ -145,193 +134,139 @@ async function handleInitiateCall(opts: {
     return;
   }
 
-  const callerId = await resolveOutboundCallerId(supabase, businessId);
-  if (!callerId) {
-    res.status(500).json({ error: "Could not resolve a caller ID for this business" });
-    return;
-  }
-
-  // Pre-insert the lead_calls row so a Twilio failure has somewhere to
-  // attach the failure status. The Twilio CallSid lands in a follow-up
-  // UPDATE after the create call succeeds.
-  const { data: callRowInsert, error: insertErr } = await supabase
-    .from("lead_calls")
-    .insert({
-      lead_id: leadId,
-      staff_user_id: staffUserId,
-      staff_ring_number: ringNumber,
-      customer_phone: leadRow.contact_phone,
-      from_caller_id: callerId.from,
-      status: "initiated",
-      started_at: new Date().toISOString(),
-    })
-    .select("id")
-    .single();
-  if (insertErr || !callRowInsert) {
-    Sentry.captureMessage("lead_call_row_insert_failed", {
-      level: "error",
-      extra: { businessId, leadId, error: insertErr?.message },
-    });
-    res.status(500).json({ error: "Failed to record call attempt" });
-    return;
-  }
-  const leadCallId = (callRowInsert as { id: string }).id;
-
-  // Build the absolute URL Twilio will hit for the bridge TwiML +
-  // status callbacks. Same env resolution as the signature verifier
-  // (PUBLIC_API_URL with documented fallback) — must match the URL
-  // Twilio sees so our signature verify can rebuild.
-  const publicBase = getPublicApiBase();
-  const bridgeTwimlUrl = `${publicBase}/api/twilio/voice/lead-bridge?lead_call_id=${encodeURIComponent(leadCallId)}`;
-  const recordingStatusUrl = `${publicBase}/api/twilio/recording-status`;
-  const callStatusUrl = `${publicBase}/api/twilio/call-status?lead_call_id=${encodeURIComponent(leadCallId)}`;
-
-  const client = getTwilioClient();
-  let callSid: string;
-  try {
-    const created = await client.calls.create({
-      to: ringNumber,
-      from: callerId.from,
-      url: bridgeTwimlUrl,
-      record: true,
-      recordingChannels: "dual",
-      recordingStatusCallback: recordingStatusUrl,
-      recordingStatusCallbackEvent: ["completed"],
-      recordingStatusCallbackMethod: "POST",
-      statusCallback: callStatusUrl,
-      statusCallbackEvent: ["initiated", "ringing", "answered", "completed"],
-      statusCallbackMethod: "POST",
-    });
-    callSid = created.sid;
-  } catch (err: any) {
-    // Twilio error 21217 = "Phone number not verified". If we hit it
-    // when using the business main line, swap to the Neverr Twilio
-    // line and retry. Future slice will surface a verification UI.
-    const code = (err && (err.code || err?.responseDetails?.code)) || null;
-    if (code === 21217 && callerId.source === "business_main_line") {
-      Sentry.addBreadcrumb({
-        category: "lead-bridge",
-        level: "warning",
-        message: "outbound_caller_id_not_verified_falling_back",
-        data: { businessId, attempted: callerId.from },
-      });
-      // Re-resolve forcing the Neverr line by reading business_configs
-      // directly — quick fallback to keep the call alive.
-      const { data: biz } = await supabase
-        .from("business_configs")
-        .select("twilio_phone_number")
-        .eq("business_id", businessId)
-        .maybeSingle();
-      const fallback = (biz as { twilio_phone_number?: string } | null)?.twilio_phone_number;
-      if (!fallback || !E164_RE.test(fallback)) {
-        Sentry.captureException(err, { extra: { route: "lead-bridge.initiate", businessId } });
-        await supabase.from("lead_calls").update({ status: "failed", end_reason: "no_caller_id" }).eq("id", leadCallId);
-        res.status(500).json({ error: "Could not initiate call — caller ID setup incomplete" });
-        return;
-      }
-      try {
-        const retried = await client.calls.create({
-          to: ringNumber,
-          from: fallback,
-          url: bridgeTwimlUrl,
-          record: true,
-          recordingChannels: "dual",
-          recordingStatusCallback: recordingStatusUrl,
-          recordingStatusCallbackEvent: ["completed"],
-          recordingStatusCallbackMethod: "POST",
-          statusCallback: callStatusUrl,
-          statusCallbackEvent: ["initiated", "ringing", "answered", "completed"],
-          statusCallbackMethod: "POST",
-        });
-        callSid = retried.sid;
-        await supabase.from("lead_calls").update({ from_caller_id: fallback }).eq("id", leadCallId);
-      } catch (retryErr: any) {
-        Sentry.captureException(retryErr, { extra: { route: "lead-bridge.initiate.retry", businessId } });
-        await supabase.from("lead_calls").update({ status: "failed", end_reason: "twilio_create_failed" }).eq("id", leadCallId);
-        res.status(500).json({ error: "Twilio could not place the call" });
-        return;
-      }
-    } else {
-      Sentry.captureException(err, { extra: { route: "lead-bridge.initiate", businessId, code } });
-      await supabase.from("lead_calls").update({ status: "failed", end_reason: "twilio_create_failed" }).eq("id", leadCallId);
-      res.status(500).json({ error: "Twilio could not place the call" });
-      return;
-    }
-  }
-
-  // Attach the CallSid to the lead_calls row + insert the activity
-  // timeline entry. Activity carries lead_call_id so the UI can
-  // dereference to the rich row.
-  await supabase.from("lead_calls").update({ call_sid: callSid }).eq("id", leadCallId);
-  await supabase.from("lead_activities").insert({
-    lead_id: leadId,
-    actor_id: staffUserId,
-    actor_type: "staff",
-    action: "call_initiated",
-    metadata: {
-      lead_call_id: leadCallId,
-      call_sid: callSid,
-      staff_user_id: staffUserId,
-      ring_number: ringNumber,
-      customer_phone: leadRow.contact_phone,
-      from_caller_id: callerId.from,
-    },
-  });
-
-  // Slice 3A pillar 2: fire the callback_starting SMS. Twilio just
-  // accepted the call; the customer's phone will ring in ~5–15s
-  // (staff has to answer first + recording disclosure plays). Sending
-  // now gives a heads-up close enough to "30 sec before bridge" to be
-  // useful. Fire-and-forget so an SMS failure doesn't break the
-  // bridge — the call is more important than the SMS.
-  (async () => {
-    try {
-      const { data: bizRow } = await supabase
-        .from("business_configs")
-        .select("business_name")
-        .eq("business_id", businessId)
-        .maybeSingle();
-      const businessName = (bizRow as { business_name?: string } | null)?.business_name || "the team";
-      await sendLeadSms({
-        supabase,
-        businessId,
-        leadId,
-        to: leadRow.contact_phone || "",
-        template: "callback_starting",
-        context: {
-          business_name: businessName,
-          brief_reason: briefReason(leadRow.reason),
-          from_phone: callerId.from,
-        },
-        locale: "en",
-      });
-    } catch (smsErr: any) {
-      Sentry.captureException(smsErr, {
-        extra: { route: "lead-calls callback_starting sms", leadId, leadCallId },
-      });
-    }
-  })().catch(() => { /* outer safety net */ });
+  // The SMS dispatch and the documented response shape need the lead's
+  // reason + contact_phone. placeCall does its own cross-tenant guard
+  // independently, so this SELECT is purely route-bookkeeping. One extra
+  // query on the happy path is fine.
+  const { data: leadData } = await supabase
+    .from("leads")
+    .select("contact_phone, reason")
+    .eq("id", leadId)
+    .eq("business_id", businessId)
+    .maybeSingle();
+  const leadRow = leadData as { contact_phone: string | null; reason: string | null } | null;
 
   const meta = extractRequestMeta(req);
-  await auditLog({
-    userId: staffUserId,
+  const result = await placeCall(supabase, {
     businessId,
-    action: "leads.call.initiated",
-    ...meta,
-    details: {
-      lead_id: leadId,
-      lead_call_id: leadCallId,
-      call_sid: callSid,
-      source: isAdmin ? "admin_raw" : "customer",
+    leadId,
+    direction: "inbound_bridge",
+    staffUserId,
+    staffRingNumber: ringNumber,
+    requestMeta: {
+      ipAddress: meta.ipAddress ?? null,
+      userAgent: meta.userAgent ?? null,
     },
+    isAdmin,
   });
+
+  if (!result.ok) {
+    switch (result.reason) {
+      case "lead_not_found":
+        res.status(404).json({ error: "Lead not found" });
+        return;
+      case "lead_phone_invalid":
+        res.status(400).json({ error: "This lead has no usable customer phone on file" });
+        return;
+      case "staff_ring_number_missing":
+        // Defensive — we resolved ringNumber above.
+        res.status(400).json({ error: "Staff ring number required for bridge" });
+        return;
+      case "caller_id_unresolvable":
+        res.status(500).json({ error: "Could not resolve a caller ID for this business" });
+        return;
+      case "business_not_found":
+        res.status(404).json({ error: "Business config missing" });
+        return;
+      case "provider_failed":
+        Sentry.captureMessage("lead_bridge_provider_failed", {
+          level: "error",
+          extra: { businessId, leadId, twilioCode: result.twilioCode, providerError: result.providerError },
+        });
+        res.status(502).json({
+          error: "Twilio could not place the call",
+          twilio_code: result.twilioCode,
+          provider_error: result.providerError,
+        });
+        return;
+      case "db_error":
+        Sentry.captureMessage("lead_bridge_db_error", {
+          level: "error",
+          extra: { businessId, leadId, step: result.step, error: result.error },
+        });
+        res.status(500).json({ error: "Database error", step: result.step });
+        return;
+      case "tenant_outbound_disabled":
+      case "non_nanp_number_no_tz_inference":
+      case "compliance_blocked":
+        // Defensive — placeCall does not gate inbound_bridge on these.
+        Sentry.captureMessage("place_call_unexpected_reason_for_inbound_bridge", {
+          level: "error",
+          extra: { reason: result.reason, businessId, leadId },
+        });
+        res.status(500).json({ error: "Unexpected placement error" });
+        return;
+      default: {
+        const _exhaustive: never = result;
+        void _exhaustive;
+        res.status(500).json({ error: "Unknown placement error" });
+        return;
+      }
+    }
+  }
+
+  if (result.status !== "placed") {
+    // Inbound bridge never schedules — we didn't pass scheduledFor.
+    Sentry.captureMessage("place_call_unexpected_status_for_inbound_bridge", {
+      level: "error",
+      extra: { status: result.status, businessId, leadId },
+    });
+    res.status(500).json({ error: "Unexpected placement status" });
+    return;
+  }
+
+  // Slice 3A pillar 2: fire-and-forget callback_starting SMS. The call
+  // is more important than the SMS — outer safety net swallows.
+  if (leadRow?.contact_phone && result.fromCallerId) {
+    const contactPhone = leadRow.contact_phone;
+    const reason = leadRow.reason ?? "";
+    const fromPhone = result.fromCallerId;
+    const leadCallIdForSms = result.leadCallId;
+    (async () => {
+      try {
+        const { data: bizRow } = await supabase
+          .from("business_configs")
+          .select("business_name")
+          .eq("business_id", businessId)
+          .maybeSingle();
+        const businessName = (bizRow as { business_name?: string } | null)?.business_name || "the team";
+        await sendLeadSms({
+          supabase,
+          businessId,
+          leadId,
+          to: contactPhone,
+          template: "callback_starting",
+          context: {
+            business_name: businessName,
+            brief_reason: briefReason(reason),
+            from_phone: fromPhone,
+          },
+          locale: "en",
+        });
+      } catch (smsErr: any) {
+        Sentry.captureException(smsErr, {
+          extra: { route: "lead-calls callback_starting sms", leadId, leadCallId: leadCallIdForSms },
+        });
+      }
+    })().catch(() => { /* outer safety net */ });
+  }
 
   res.json({
     success: true,
-    call_sid: callSid,
-    lead_call_id: leadCallId,
-    from_caller_id: callerId.from,
-    customer_phone: leadRow.contact_phone,
+    call_sid: result.callSid,
+    lead_call_id: result.leadCallId,
+    from_caller_id: result.fromCallerId ?? null,
+    customer_phone: leadRow?.contact_phone ?? null,
   });
 }
 

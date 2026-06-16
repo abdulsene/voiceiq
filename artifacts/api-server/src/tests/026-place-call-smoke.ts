@@ -267,9 +267,13 @@ async function T1() {
     if (r.status !== "placed") failures.push(`status=${r.status}`);
     if (r.provider !== "twilio") failures.push(`provider=${r.provider}`);
     if (!r.callSid) failures.push("no callSid");
+    // resolveOutboundCallerId prefers the business main line over the
+    // Twilio fallback — callerIdData() sets phone_number=+14155551111.
+    if (r.status === "placed" && r.fromCallerId !== "+14155551111")
+      failures.push(`fromCallerId=${r.fromCallerId}`);
   }
   if (placeCallInvocations[0]?.providerKind !== "twilio") failures.push(`provider invoked=${placeCallInvocations[0]?.providerKind}`);
-  record("T1 inbound_bridge immediate", failures.length === 0, failures.join("; ") || "ok, status=placed, twilio");
+  record("T1 inbound_bridge immediate", failures.length === 0, failures.join("; ") || "ok, status=placed, twilio, fromCallerId set");
 }
 
 async function T2() {
@@ -292,8 +296,10 @@ async function T2() {
   const failures: string[] = [];
   if (!r.ok) failures.push(`!ok: ${JSON.stringify(r)}`);
   if (r.ok && r.provider !== "twilio") failures.push(`provider=${r.provider}`);
+  if (r.ok && r.status === "placed" && r.fromCallerId !== "+14155556677")
+    failures.push(`fromCallerId=${r.fromCallerId}`);
   if (placeCallInvocations[0]?.providerKind !== "twilio") failures.push(`invoked=${placeCallInvocations[0]?.providerKind}`);
-  record("T2 outbound_automated twilio", failures.length === 0, failures.join("; ") || "ok, twilio provider invoked");
+  record("T2 outbound_automated twilio", failures.length === 0, failures.join("; ") || "ok, twilio provider invoked, fromCallerId set");
 }
 
 async function T3() {
@@ -311,8 +317,12 @@ async function T3() {
   const failures: string[] = [];
   if (!r.ok) failures.push(`!ok: ${JSON.stringify(r)}`);
   if (r.ok && r.provider !== "elevenlabs_hosted") failures.push(`provider=${r.provider}`);
+  // ElevenLabs hosted resolves from-number from phone_number_id; placeCall
+  // does not surface it. fromCallerId MUST be undefined here.
+  if (r.ok && r.status === "placed" && r.fromCallerId !== undefined)
+    failures.push(`fromCallerId should be undefined for elevenlabs, got ${r.fromCallerId}`);
   if (placeCallInvocations[0]?.providerKind !== "elevenlabs_hosted") failures.push(`invoked=${placeCallInvocations[0]?.providerKind}`);
-  record("T3 outbound_automated elevenlabs_hosted (default)", failures.length === 0, failures.join("; ") || "ok, elevenlabs_hosted invoked");
+  record("T3 outbound_automated elevenlabs_hosted (default)", failures.length === 0, failures.join("; ") || "ok, elevenlabs_hosted invoked, fromCallerId omitted");
 }
 
 async function T4() {
@@ -707,8 +717,11 @@ async function T18() {
   const failures: string[] = [];
   if (!r.ok) failures.push(`!ok: ${JSON.stringify(r)}`);
   if (r.ok && r.provider !== "twilio") failures.push(`provider=${r.provider}`);
+  // Same as T1 — business_main_line wins per resolveOutboundCallerId.
+  if (r.ok && r.status === "placed" && r.fromCallerId !== "+14155551111")
+    failures.push(`fromCallerId=${r.fromCallerId}`);
   if (placeCallInvocations[0]?.providerKind !== "twilio") failures.push(`invoked=${placeCallInvocations[0]?.providerKind}`);
-  record("T18 inbound_bridge always uses twilio", failures.length === 0, failures.join("; ") || "twilio used despite ElevenLabs override");
+  record("T18 inbound_bridge always uses twilio", failures.length === 0, failures.join("; ") || "twilio used despite ElevenLabs override, fromCallerId set");
 }
 
 async function main() {
