@@ -23,7 +23,12 @@ if (process.env.SENTRY_API_DSN) {
 }
 
 import app from "./app";
-import { scheduleBriefings, scheduleRetentionCron, scheduleOutboundCallWorker } from "./cron";
+import {
+  scheduleBriefings,
+  scheduleRetentionCron,
+  scheduleOutboundCallWorker,
+  scheduleCampaignExpansionWorker,
+} from "./cron";
 import { runReconciliation } from "./lib/twilio-reconciliation";
 
 const rawPort = process.env["PORT"];
@@ -108,6 +113,7 @@ app.listen(port, () => {
   scheduleBriefings();
   scheduleRetentionCron();
   scheduleOutboundCallWorker();
+  scheduleCampaignExpansionWorker();
   // Fire-and-forget — scheduleTwilioReconciliation logs internally
   // and never throws to the caller.
   scheduleTwilioReconciliation().catch((err) => {
