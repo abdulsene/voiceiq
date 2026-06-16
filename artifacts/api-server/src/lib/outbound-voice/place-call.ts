@@ -50,10 +50,43 @@
  *   MUST NOT skip this second check thinking "we already checked
  *   at insert." That would be a TCPA exposure.
  *
+ * Phase 1.5 — existingLeadCallId mode:
+ *   The scheduled-call worker locks a row via UPDATE...RETURNING
+ *   (status='scheduled' → 'processing'), then calls placeCall with
+ *   `existingLeadCallId` set to that row's id. In this mode:
+ *     - Idempotency check (step 5) is SKIPPED — worker already chose
+ *       the row.
+ *     - Pre-insert (step 6) is REPLACED with a cooperative-lock
+ *       verification: we SELECT the row, assert status='processing'
+ *       and lead_id matches. Mismatches return db_error step=
+ *       'existing_row_not_locked' / 'existing_row_lead_mismatch' /
+ *       'existing_row_not_found'.
+ *     - scheduledFor in the request is IGNORED — the worker fires
+ *       NOW; isScheduled is forced to false.
+ *     - Success UPDATE (step 12) extends to also set status='initiated'
+ *       and started_at — the existing row was 'processing' with no
+ *       started_at.
+ *     - On any non-ok return EXCEPT provider_failed (step 11 already
+ *       UPDATEd) and db_error (left 'processing' for stuck-row
+ *       recovery / ops triage), the outer wrapper UPDATEs the row to
+ *       status='failed' with an appropriate end_reason so the worker
+ *       doesn't re-pick it next tick.
+ *
+ * 'processing' status semantics:
+ *   'processing' is an INTERNAL transient state set by the Phase 1.5
+ *   scheduled-call worker between lock acquisition and placement
+ *   completion. Any consumer querying lead_calls.status that needs to
+ *   be exhaustive across "active call states" must include
+ *   'processing' alongside 'initiated', 'ringing', 'in_progress'.
+ *   Anything that treats {initiated, ringing, in_progress, completed,
+ *   failed} as a closed set will silently miss in-flight scheduled
+ *   placements.
+ *
  * In scope for 1.3: this file + tests/026-place-call-smoke.ts +
  * barrel re-export in outbound-voice/index.ts.
- * Out of scope: 1.4 handleInitiateCall refactor (Phase 1.4),
- * 1.5 worker, 1.6 voicemail, 1.7 dashboard.
+ * Phase 1.4: handleInitiateCall refactor (landed).
+ * Phase 1.5a: existingLeadCallId mode (landing in THIS commit).
+ * Out of scope: 1.5b worker + cron, 1.6 voicemail, 1.7 dashboard.
  */
 
 import type { SupabaseClient } from "@supabase/supabase-js";
@@ -116,6 +149,17 @@ export interface PlaceCallRequest {
   requestMeta?: { ipAddress?: string | null; userAgent?: string | null; sessionId?: string | null };
   /** Set true when the route caller has admin privileges. Surfaces 'admin_raw' as audit source. */
   isAdmin?: boolean;
+  /**
+   * Phase 1.5: when the scheduled-call worker fires, it passes the
+   * pre-locked lead_calls.id here. placeCall then skips pre-insert,
+   * verifies the row is in status='processing', and on terminal exit
+   * UPDATEs the row instead of inserting a fresh one. See the
+   * file-level "existingLeadCallId mode" JSDoc.
+   *
+   * Pre-1.5 callers (route handler, dashboard) must NOT set this —
+   * they want pre-insert behavior.
+   */
+  existingLeadCallId?: string;
 }
 
 export type PlaceCallResponse =
@@ -149,7 +193,91 @@ export type PlaceCallResponse =
 
 // ── Main entry ──────────────────────────────────────────────────────
 
+/**
+ * Maps a placeCall failure reason → end_reason value used to UPDATE
+ * the existing scheduled row when existingLeadCallId is set. Returns
+ * null when the wrapper should NOT UPDATE:
+ *   - provider_failed: step 11 already UPDATEd the row to 'failed'.
+ *   - db_error: leave row in 'processing' for stuck-row recovery /
+ *               manual ops triage. Worker can re-detect on its next
+ *               tick if the DB recovers (phase 2 will add automated
+ *               recovery sweep).
+ *   - staff_ring_number_missing / caller_id_unresolvable: not
+ *               legitimately reachable for outbound_automated, and
+ *               outbound_automated is the only direction the worker
+ *               fires. Defensive null.
+ */
+function reasonToEndReason(
+  reason:
+    | "lead_not_found"
+    | "lead_phone_invalid"
+    | "business_not_found"
+    | "staff_ring_number_missing"
+    | "caller_id_unresolvable"
+    | "tenant_outbound_disabled"
+    | "non_nanp_number_no_tz_inference"
+    | "compliance_blocked"
+    | "provider_failed"
+    | "db_error",
+): string | null {
+  switch (reason) {
+    case "compliance_blocked":
+      return "compliance_blocked";
+    case "lead_not_found":
+      return "lead_not_found_at_fire_time";
+    case "lead_phone_invalid":
+      return "lead_phone_invalid_at_fire_time";
+    case "business_not_found":
+      return "business_not_found";
+    case "tenant_outbound_disabled":
+      return "tenant_outbound_disabled";
+    case "non_nanp_number_no_tz_inference":
+      return "non_nanp_phone";
+    case "provider_failed":
+    case "db_error":
+    case "staff_ring_number_missing":
+    case "caller_id_unresolvable":
+      return null;
+  }
+}
+
 export async function placeCall(
+  supabase: SupabaseClient,
+  req: PlaceCallRequest,
+): Promise<PlaceCallResponse> {
+  const response = await placeCallCore(supabase, req);
+
+  // Phase 1.5: existingLeadCallId mode — when the worker fired this
+  // call, it has already UPDATEd the row to status='processing'. On
+  // any non-ok terminal response (other than provider_failed which
+  // step 11 already handled, and db_error which intentionally leaves
+  // 'processing' for stuck-row recovery), UPDATE the row to a
+  // terminal failed state so the worker doesn't re-pick it next tick.
+  if (req.existingLeadCallId && !response.ok) {
+    const endReason = reasonToEndReason(response.reason);
+    if (endReason) {
+      try {
+        await supabase
+          .from("lead_calls")
+          .update({ status: "failed", end_reason: endReason })
+          .eq("id", req.existingLeadCallId);
+      } catch (e: any) {
+        Sentry.captureMessage("place_call_existing_row_failed_update_failed", {
+          level: "warning",
+          extra: {
+            leadCallId: req.existingLeadCallId,
+            endReason,
+            error: e?.message,
+          },
+        });
+      }
+    }
+  }
+
+  return response;
+}
+
+async function placeCallCore(
   supabase: SupabaseClient,
   req: PlaceCallRequest,
 ): Promise<PlaceCallResponse> {
@@ -281,7 +409,8 @@ export async function placeCall(
   // (5) Idempotency on scheduled inserts — return existing leadCallId
   // when (leadId, callObjective, scheduledFor) already matches a
   // status='scheduled' row. See design A5.
-  if (req.scheduledFor && req.direction === "outbound_automated") {
+  // Skipped when existingLeadCallId is set (worker already chose the row).
+  if (!req.existingLeadCallId && req.scheduledFor && req.direction === "outbound_automated") {
     try {
       const { data: existing } = await supabase
         .from("lead_calls")
@@ -306,44 +435,87 @@ export async function placeCall(
     }
   }
 
-  // (6) Pre-insert lead_calls row.
+  // (6) Pre-insert lead_calls row — OR verify the worker-locked row
+  // when existingLeadCallId is set.
   const nowIso = new Date().toISOString();
-  const isScheduled = !!(req.scheduledFor && req.scheduledFor.getTime() > Date.now());
-  const preInsertRow: Record<string, unknown> = {
-    lead_id: req.leadId,
-    direction: req.direction,
-    customer_phone: customerPhone,
-    status: isScheduled ? "scheduled" : "initiated",
-    attempt_number: req.attemptNumber ?? 1,
-    retry_count: req.retryCount ?? 0,
-  };
-  if (req.direction === "inbound_bridge") {
-    preInsertRow.staff_user_id = req.staffUserId;
-    preInsertRow.staff_ring_number = req.staffRingNumber;
-    preInsertRow.from_caller_id = bridgeCallerIdFrom;
-    preInsertRow.started_at = nowIso;
-  } else {
-    preInsertRow.call_objective = req.callObjective;
-    if (req.campaignId) preInsertRow.campaign_id = req.campaignId;
-    if (req.scheduledFor) preInsertRow.scheduled_for = req.scheduledFor.toISOString();
-    if (!isScheduled) preInsertRow.started_at = nowIso;
-  }
+  // existingLeadCallId implies the worker is firing NOW — ignore any
+  // scheduledFor in the request. isScheduled stays false so we fall
+  // through to step 8 instead of deferring.
+  const isScheduled =
+    !req.existingLeadCallId &&
+    !!(req.scheduledFor && req.scheduledFor.getTime() > Date.now());
+
   let leadCallId: string;
-  try {
-    const { data, error } = await supabase
-      .from("lead_calls")
-      .insert(preInsertRow)
-      .select("id")
-      .single();
-    if (error || !data) {
-      return { ok: false, reason: "db_error", step: "pre_insert", error: error?.message || "insert returned no row" };
+  if (req.existingLeadCallId) {
+    // Cooperative-lock verification. Worker set status='processing'
+    // before invoking placeCall; assert we still own that lock and
+    // the row matches the request's leadId.
+    try {
+      const { data: existing, error: existErr } = await supabase
+        .from("lead_calls")
+        .select("id, status, lead_id")
+        .eq("id", req.existingLeadCallId)
+        .maybeSingle();
+      if (existErr) {
+        return { ok: false, reason: "db_error", step: "existing_row_lookup", error: existErr.message };
+      }
+      const eRow = existing as { id: string; status: string; lead_id: string } | null;
+      if (!eRow) {
+        return { ok: false, reason: "db_error", step: "existing_row_not_found", error: "row not found" };
+      }
+      if (eRow.lead_id !== req.leadId) {
+        return { ok: false, reason: "db_error", step: "existing_row_lead_mismatch", error: "lead_id mismatch" };
+      }
+      if (eRow.status !== "processing") {
+        return {
+          ok: false,
+          reason: "db_error",
+          step: "existing_row_not_locked",
+          error: `expected status='processing', got '${eRow.status}'`,
+        };
+      }
+      leadCallId = req.existingLeadCallId;
+    } catch (err: any) {
+      return { ok: false, reason: "db_error", step: "existing_row_lookup", error: err?.message || String(err) };
     }
-    leadCallId = (data as { id: string }).id;
-  } catch (err: any) {
-    return { ok: false, reason: "db_error", step: "pre_insert", error: err?.message || String(err) };
+  } else {
+    const preInsertRow: Record<string, unknown> = {
+      lead_id: req.leadId,
+      direction: req.direction,
+      customer_phone: customerPhone,
+      status: isScheduled ? "scheduled" : "initiated",
+      attempt_number: req.attemptNumber ?? 1,
+      retry_count: req.retryCount ?? 0,
+    };
+    if (req.direction === "inbound_bridge") {
+      preInsertRow.staff_user_id = req.staffUserId;
+      preInsertRow.staff_ring_number = req.staffRingNumber;
+      preInsertRow.from_caller_id = bridgeCallerIdFrom;
+      preInsertRow.started_at = nowIso;
+    } else {
+      preInsertRow.call_objective = req.callObjective;
+      if (req.campaignId) preInsertRow.campaign_id = req.campaignId;
+      if (req.scheduledFor) preInsertRow.scheduled_for = req.scheduledFor.toISOString();
+      if (!isScheduled) preInsertRow.started_at = nowIso;
+    }
+    try {
+      const { data, error } = await supabase
+        .from("lead_calls")
+        .insert(preInsertRow)
+        .select("id")
+        .single();
+      if (error || !data) {
+        return { ok: false, reason: "db_error", step: "pre_insert", error: error?.message || "insert returned no row" };
+      }
+      leadCallId = (data as { id: string }).id;
+    } catch (err: any) {
+      return { ok: false, reason: "db_error", step: "pre_insert", error: err?.message || String(err) };
+    }
   }
 
   // (7) Defer placement when scheduled in the future.
+  // existingLeadCallId forced isScheduled=false above; this branch is
+  // skipped naturally for the worker path.
   if (isScheduled) {
     return { ok: true, leadCallId, callSid: null, provider: null, status: "scheduled" };
   }
@@ -427,10 +599,19 @@ export async function placeCall(
 
   // (12) Success — UPDATE call_sid. Failure here is non-fatal (call IS
   // placed; orphaned CallSid is recoverable from Twilio side).
+  // existingLeadCallId mode: also transition status='processing' →
+  // 'initiated' and stamp started_at (the worker-locked row was
+  // created at scheduling time with status='scheduled' and no
+  // started_at; this UPDATE completes the state machine).
+  const successUpdate: Record<string, unknown> = { call_sid: result.callSid };
+  if (req.existingLeadCallId) {
+    successUpdate.status = "initiated";
+    successUpdate.started_at = nowIso;
+  }
   try {
     await supabase
       .from("lead_calls")
-      .update({ call_sid: result.callSid })
+      .update(successUpdate)
       .eq("id", leadCallId);
   } catch (err: any) {
     Sentry.captureMessage("place_call_callsid_update_failed", {

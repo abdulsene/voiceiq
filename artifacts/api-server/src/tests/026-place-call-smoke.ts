@@ -1,5 +1,5 @@
 /**
- * Phase 1.3 — place-call.ts smoke. 18 cases.
+ * Phase 1.3 — place-call.ts smoke. 20 cases (18 from 1.3 + T19/T20 from 1.5a).
  *
  * Happy paths (4):
  *   T1  inbound_bridge immediate placement
@@ -32,6 +32,10 @@
  * Inbound bridge specifics (2):
  *   T17 inbound_bridge missing staffRingNumber → staff_ring_number_missing
  *   T18 inbound_bridge ignores business_configs.outbound_provider='elevenlabs_hosted'
+ *
+ * Phase 1.5a — existingLeadCallId path (2):
+ *   T19 worker-locked row succeeds — no INSERT, UPDATE call_sid + status='initiated' + started_at
+ *   T20 worker-locked row hits DNC at fire time — wrapper UPDATEs row to failed + compliance_blocked
  *
  * Strategy: FakeSupabaseClient with .from(...).select(...).eq(...).maybeSingle()
  * + .insert(...).select(...).single() + .update(...).eq(...) chains.
@@ -724,6 +728,130 @@ async function T18() {
   record("T18 inbound_bridge always uses twilio", failures.length === 0, failures.join("; ") || "twilio used despite ElevenLabs override, fromCallerId set");
 }
 
+// ── Phase 1.5a: existingLeadCallId path ─────────────────────────────
+
+async function T19() {
+  // Worker has locked an existing row (status='processing'). placeCall
+  // should NOT INSERT — it should verify the lock, run compliance,
+  // place the call, and UPDATE the row to call_sid + status='initiated'
+  // + started_at.
+  placeCallInvocations.length = 0;
+  providerShouldFail = null;
+  const fake = new FakeSupabaseClient();
+  fake.on((c) => c.op === "select" && c.table === "leads", {
+    data: { id: LEAD, business_id: BIZ, contact_phone: PHONE, reason: "T19" },
+  });
+  fake.on(
+    (c) => c.op === "select" && c.table === "business_configs" && c.selectColumns.includes("outbound_provider"),
+    { data: bizConfigDataForPlaceCall() },
+  );
+  fake.on(
+    (c) => c.op === "select" && c.table === "business_configs" && c.selectColumns.includes("outbound_calling_hours_start"),
+    { data: bizConfigDataForCompliance() },
+  );
+  fake.on(
+    (c) => c.op === "select" && c.table === "business_configs" && c.selectColumns.includes("voice_consent_default"),
+    { data: { voice_consent_default: true } },
+  );
+  fake.on((c) => c.op === "select" && c.table === "dnc_list", { data: null });
+  fake.on((c) => c.op === "select" && c.table === "voice_consent_records", { data: null });
+  // Cooperative-lock SELECT — return the locked row.
+  fake.on(
+    (c) =>
+      c.op === "select" &&
+      c.table === "lead_calls" &&
+      c.selectColumns.includes("status") &&
+      c.eqFilters.some((f) => f.column === "id" && f.value === "lc_existing"),
+    { data: { id: "lc_existing", status: "processing", lead_id: LEAD } },
+  );
+  fake.on((c) => c.op === "update" && c.table === "lead_calls", { data: null });
+  fake.on((c) => c.op === "insert" && c.table === "lead_activities", { data: null });
+  fake.on((c) => c.op === "insert" && c.table === "audit_logs", { data: null });
+
+  const r = await placeCall(asClient(fake), {
+    businessId: BIZ,
+    leadId: LEAD,
+    direction: "outbound_automated",
+    callObjective: "appointment_reminder",
+    existingLeadCallId: "lc_existing",
+  });
+
+  const failures: string[] = [];
+  if (!r.ok) failures.push(`!ok: ${JSON.stringify(r)}`);
+  if (r.ok) {
+    if (r.status !== "placed") failures.push(`status=${r.status}`);
+    if (r.leadCallId !== "lc_existing") failures.push(`leadCallId=${r.leadCallId}`);
+  }
+  // No INSERT into lead_calls — only UPDATEs.
+  const inserts = fake.calls.filter((c) => c.op === "insert" && c.table === "lead_calls");
+  if (inserts.length !== 0) failures.push(`unexpected ${inserts.length} lead_calls INSERT`);
+  // Success UPDATE includes call_sid + status='initiated' + started_at.
+  const successUpd = fake.calls.find(
+    (c) => c.op === "update" && c.table === "lead_calls" && c.payload?.call_sid && c.payload?.status === "initiated" && c.payload?.started_at,
+  );
+  if (!successUpd) failures.push("success UPDATE missing call_sid/status/started_at");
+  if (placeCallInvocations.length !== 1) failures.push(`provider called ${placeCallInvocations.length}x (expected 1)`);
+  record("T19 existingLeadCallId success path", failures.length === 0, failures.join("; ") || "no INSERT, UPDATE sets call_sid + initiated + started_at");
+}
+
+async function T20() {
+  // Worker locked an existing row, but DNC was added in the gap →
+  // compliance now blocks. placeCall must UPDATE the existing row to
+  // status='failed' + end_reason='compliance_blocked' so the worker
+  // doesn't re-pick it next tick.
+  placeCallInvocations.length = 0;
+  providerShouldFail = null;
+  const fake = new FakeSupabaseClient();
+  fake.on((c) => c.op === "select" && c.table === "leads", {
+    data: { id: LEAD, business_id: BIZ, contact_phone: PHONE, reason: "T20" },
+  });
+  fake.on(
+    (c) => c.op === "select" && c.table === "business_configs" && c.selectColumns.includes("outbound_provider"),
+    { data: bizConfigDataForPlaceCall() },
+  );
+  fake.on(
+    (c) => c.op === "select" && c.table === "business_configs" && c.selectColumns.includes("outbound_calling_hours_start"),
+    { data: bizConfigDataForCompliance() },
+  );
+  fake.on(
+    (c) => c.op === "select" && c.table === "business_configs" && c.selectColumns.includes("voice_consent_default"),
+    { data: { voice_consent_default: true } },
+  );
+  // DNC now BLOCKS — entry added in the gap.
+  fake.on((c) => c.op === "select" && c.table === "dnc_list", {
+    data: { source: "manual", reason: "customer_request", created_at: "2026-06-15T00:00:00Z" },
+  });
+  fake.on((c) => c.op === "select" && c.table === "voice_consent_records", { data: null });
+  fake.on((c) => c.op === "update" && c.table === "lead_calls", { data: null });
+
+  const r = await placeCall(asClient(fake), {
+    businessId: BIZ,
+    leadId: LEAD,
+    direction: "outbound_automated",
+    callObjective: "appointment_reminder",
+    existingLeadCallId: "lc_existing_blocked",
+  });
+
+  const failures: string[] = [];
+  if (r.ok) failures.push("ok=true unexpectedly");
+  if (!r.ok && r.reason !== "compliance_blocked") failures.push(`reason=${r.reason}`);
+  if (!r.ok && r.reason === "compliance_blocked" && r.blocked_by !== "dnc")
+    failures.push(`blocked_by=${r.blocked_by}`);
+  // Provider must NOT be invoked when compliance blocks.
+  if (placeCallInvocations.length !== 0) failures.push(`provider invoked ${placeCallInvocations.length}x on compliance block`);
+  // Outer wrapper UPDATEd row to failed + compliance_blocked.
+  const failUpdate = fake.calls.find(
+    (c) =>
+      c.op === "update" &&
+      c.table === "lead_calls" &&
+      c.payload?.status === "failed" &&
+      c.payload?.end_reason === "compliance_blocked" &&
+      c.eqFilters.some((f) => f.column === "id" && f.value === "lc_existing_blocked"),
+  );
+  if (!failUpdate) failures.push("missing terminal UPDATE to failed/compliance_blocked");
+  record("T20 existingLeadCallId compliance-blocked", failures.length === 0, failures.join("; ") || "compliance_blocked + row UPDATEd to failed/compliance_blocked");
+}
+
 async function main() {
   await T1();
   await T2();
@@ -743,6 +871,8 @@ async function main() {
   await T16();
   await T17();
   await T18();
+  await T19();
+  await T20();
 
   // Restore for cleanliness.
   __setProviderFactoryForTesting(null);
