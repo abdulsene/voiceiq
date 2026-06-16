@@ -74,11 +74,6 @@ async function scheduleTwilioReconciliation(): Promise<void> {
 
   let cron: { schedule: (expr: string, fn: () => void | Promise<void>) => unknown };
   try {
-    // @ts-expect-error node-cron is declared in package.json under
-    // Batch C but may not be in node_modules yet on a fresh checkout
-    // — pnpm install fetches it. The expect-error annotation becomes
-    // a "remove me" warning once the install lands, which is the
-    // intended cleanup signal.
     cron = (await import("node-cron")).default;
   } catch (err) {
     console.error(
