@@ -174,12 +174,14 @@ const AUTH_BYPASS_PATTERNS = [
   /^\/api\/twilio\/recording-status$/,
   /^\/api\/twilio\/call-status$/,
   // Phase 0 Commit 0-D: outbound voice TwiML, AMD, status webhooks.
+  // Phase 1.6: added /voicemail for the AMD-machine redirect target.
   // Tight entries match Slice 2A precedent (documenting intent even
   // though the catch-all /^\/api\/twilio\// below would cover these).
   // Each handler verifies X-Twilio-Signature internally.
   /^\/api\/twilio\/outbound-voice\/twiml$/,
   /^\/api\/twilio\/outbound-voice\/amd$/,
   /^\/api\/twilio\/outbound-voice\/status$/,
+  /^\/api\/twilio\/outbound-voice\/voicemail$/,
   /^\/api\/business\/disclosure-audio\/[^/]+\/(staff|customer)$/,
   /^\/api\/auth\/google/,
   /^\/api\/auth\/microsoft/,

@@ -72,6 +72,31 @@ export function buildEmptyResponseTwiml(): string {
   return `${XML_HEADER}<Response/>`;
 }
 
+/**
+ * Phase 1.6 — voicemail leave-behind TwiML.
+ *
+ * Fires when the AMD handler detects an answering machine and the
+ * tenant has business_configs.outbound_voicemail_text configured.
+ * Twilio redirects the in-flight call to the /voicemail route, which
+ * returns this TwiML. Twilio plays the <Say> then hangs up; if
+ * voicemailText is null, returns a bare <Hangup/> (agent disconnects
+ * without leaving a message — "voicemail not configured for tenant").
+ *
+ * voice="alice" is Twilio's standard female TTS voice. Per-tenant
+ * voice selection is deferred (Phase 2+ if a tenant requests it).
+ *
+ * Path A note: only fires for Path B (outbound_provider='twilio').
+ * Path A (elevenlabs_hosted) routes through ElevenLabs's own TwiML
+ * — our AMD redirect never reaches this builder. Path A voicemail
+ * is an ElevenLabs ops configuration concern, out of scope here.
+ */
+export function buildVoicemailTwiml(voicemailText: string | null): string {
+  if (!voicemailText || voicemailText.trim().length === 0) {
+    return `${XML_HEADER}<Response><Hangup/></Response>`;
+  }
+  return `${XML_HEADER}<Response><Say voice="alice">${xmlEscape(voicemailText)}</Say><Hangup/></Response>`;
+}
+
 function xmlEscape(s: string): string {
   return s
     .replace(/&/g, "&amp;")

@@ -1,5 +1,5 @@
 /**
- * Phase 0 Commit 0-D — outbound voice routes smoke.
+ * Phase 0 Commit 0-D + Phase 1.6 — outbound voice routes smoke. 13 cases.
  *
  *   TwiML route (T1-T3)
  *     T1 — outbound_automated lead_call → <Connect><Stream> with
@@ -10,8 +10,9 @@
  *   AMD route (T4-T5)
  *     T4 — AnsweredBy=human → answered_by='human', voicemail_left=FALSE,
  *          UPDATE keyed on answered_by IS NULL (idempotent)
- *     T5 — AnsweredBy=machine_end_beep → answered_by='machine_end_beep',
- *          voicemail_left=FALSE
+ *     T5 — AnsweredBy=machine_end_beep, voicemail_text NULL →
+ *          answered_by='machine_end_beep', voicemail_left=FALSE
+ *          (regression for Phase 0 'agent talks until line drops')
  *
  *   Status route (T6-T8)
  *     T6 — completed → lead_calls.status='completed', ended_at +
@@ -24,9 +25,23 @@
  *     T8 — no-answer / busy / failed → leads.outbound_attempt_count + 1,
  *          last_outbound_attempt_at set
  *
+ *   Phase 1.6 — voicemail redirect + voicemail TwiML route (T9-T13)
+ *     T9  — AMD machine_end_beep + voicemail_text configured →
+ *           client.calls(sid).update({url: voicemailUrl}) issued AND
+ *           lead_calls.voicemail_left=TRUE
+ *     T10 — AMD machine_end_silence + voicemail_text NULL → no
+ *           client.calls.update; voicemail_left stays FALSE
+ *     T11 — AMD human → no client.calls.update (only machine_* redirects)
+ *     T12 — /voicemail TwiML with voicemail_text='Hi, please call back'
+ *           → <Response><Say voice="alice">Hi, please call back</Say>
+ *           <Hangup/></Response>
+ *     T13 — /voicemail TwiML with NULL voicemail_text →
+ *           <Response><Hangup/></Response>
+ *
  * Strategy: FakeSupabaseClient (extended from 023 with UPDATE chain
- * support) + global.fetch mock for the signed-URL fetch. Routes
- * dispatched via Express's app.handle pattern (same as 020/021/022).
+ * support) + global.fetch mock for the signed-URL fetch + FakeTwilioClient
+ * for the AMD voicemail redirect. Routes dispatched via Express's
+ * app.handle pattern (same as 020/021/022).
  *
  * TWILIO_WEBHOOK_VERIFY=0 bypasses signature verification.
  *
@@ -130,12 +145,35 @@ class FakeSupabaseClient {
   }
 }
 
+// ── FakeTwilioClient (Phase 1.6 — for AMD voicemail redirect) ─────────
+
+interface TwilioUpdateInvocation {
+  sid: string;
+  url: string;
+}
+
+class FakeTwilioClient {
+  invocations: TwilioUpdateInvocation[] = [];
+  shouldFail = false;
+  calls(sid: string) {
+    return {
+      update: async (opts: { url: string }) => {
+        if (this.shouldFail) throw new Error("twilio_call_update_failed");
+        this.invocations.push({ sid, url: opts.url });
+        return { sid, status: "in-progress" };
+      },
+    };
+  }
+}
+
 // ── Build test app ────────────────────────────────────────────────────
 
 let setSupabaseForTesting: (c: any) => void;
+let setTwilioClientForTesting: (c: any) => void;
 async function buildApp(): Promise<Express> {
   const mod = await import("../routes/twilio-outbound-voice");
   setSupabaseForTesting = mod.__setSupabaseForTesting;
+  setTwilioClientForTesting = mod.__setTwilioClientForTesting;
   const app = express();
   app.use(express.urlencoded({ extended: false }));
   app.use(express.json());
@@ -461,14 +499,176 @@ async function runT6_T8(app: Express) {
   }
 }
 
+async function runT9_T11(app: Express) {
+  // T9 — AMD machine_end_beep + voicemail_text configured → redirect issued.
+  {
+    const fake = new FakeSupabaseClient();
+    setSupabaseForTesting(fake);
+    const twilio = new FakeTwilioClient();
+    setTwilioClientForTesting(twilio);
+    // AMD UPDATE returns the row with call_sid populated.
+    fake.on(
+      (c) => c.op === "update" && c.table === "lead_calls" && c.updatePayload?.answered_by === "machine_end_beep",
+      { data: [{ id: LEAD_CALL, call_sid: "CAtest_t9", campaign_id: null, status: "in_progress" }] },
+    );
+    // Redirect helper queries lead_id from lead_calls (selectColumns === "lead_id").
+    fake.on(
+      (c) => c.op === "select" && c.table === "lead_calls" && c.selectColumns === "lead_id",
+      { data: { lead_id: LEAD } },
+    );
+    fake.on(
+      (c) => c.op === "select" && c.table === "leads" && c.selectColumns === "business_id",
+      { data: { business_id: BIZ } },
+    );
+    fake.on(
+      (c) => c.op === "select" && c.table === "business_configs" && c.selectColumns === "outbound_voicemail_text",
+      { data: { outbound_voicemail_text: "Hi, please call back" } },
+    );
+    // Final voicemail_left=true UPDATE.
+    fake.on(
+      (c) => c.op === "update" && c.table === "lead_calls" && c.updatePayload?.voicemail_left === true,
+      { data: null },
+    );
+
+    const r = await dispatch(app, `/twilio/outbound-voice/amd?lead_call_id=${LEAD_CALL}`, {
+      AnsweredBy: "machine_end_beep",
+    });
+    const failures: string[] = [];
+    if (r.status !== 200) failures.push(`status=${r.status}`);
+    if (twilio.invocations.length !== 1) failures.push(`twilio update calls=${twilio.invocations.length}`);
+    if (twilio.invocations[0]?.sid !== "CAtest_t9") failures.push(`sid=${twilio.invocations[0]?.sid}`);
+    if (!twilio.invocations[0]?.url.includes("/api/twilio/outbound-voice/voicemail"))
+      failures.push(`url=${twilio.invocations[0]?.url}`);
+    if (!twilio.invocations[0]?.url.includes(`lead_call_id=${LEAD_CALL}`))
+      failures.push(`url missing lead_call_id`);
+    const voicemailLeftUpd = fake.calls.find(
+      (c) => c.op === "update" && c.table === "lead_calls" && c.updatePayload?.voicemail_left === true,
+    );
+    if (!voicemailLeftUpd) failures.push("missing voicemail_left=true UPDATE");
+    record("T9 AMD machine + voicemail_text → redirect + voicemail_left=true", failures.length === 0, failures.join("; ") || "twilio.calls.update issued, voicemail_left UPDATE issued");
+  }
+
+  // T10 — AMD machine + NULL voicemail_text → no redirect.
+  {
+    const fake = new FakeSupabaseClient();
+    setSupabaseForTesting(fake);
+    const twilio = new FakeTwilioClient();
+    setTwilioClientForTesting(twilio);
+    fake.on(
+      (c) => c.op === "update" && c.table === "lead_calls" && c.updatePayload?.answered_by === "machine_end_silence",
+      { data: [{ id: LEAD_CALL, call_sid: "CAtest_t10", campaign_id: null, status: "in_progress" }] },
+    );
+    fake.on(
+      (c) => c.op === "select" && c.table === "lead_calls" && c.selectColumns === "lead_id",
+      { data: { lead_id: LEAD } },
+    );
+    fake.on(
+      (c) => c.op === "select" && c.table === "leads" && c.selectColumns === "business_id",
+      { data: { business_id: BIZ } },
+    );
+    fake.on(
+      (c) => c.op === "select" && c.table === "business_configs" && c.selectColumns === "outbound_voicemail_text",
+      { data: { outbound_voicemail_text: null } },
+    );
+
+    const r = await dispatch(app, `/twilio/outbound-voice/amd?lead_call_id=${LEAD_CALL}`, {
+      AnsweredBy: "machine_end_silence",
+    });
+    const failures: string[] = [];
+    if (r.status !== 200) failures.push(`status=${r.status}`);
+    if (twilio.invocations.length !== 0) failures.push(`unexpected ${twilio.invocations.length} twilio update calls`);
+    const voicemailLeftUpd = fake.calls.find(
+      (c) => c.op === "update" && c.table === "lead_calls" && c.updatePayload?.voicemail_left === true,
+    );
+    if (voicemailLeftUpd) failures.push("unexpected voicemail_left=true UPDATE");
+    record("T10 AMD machine + NULL voicemail_text → no redirect", failures.length === 0, failures.join("; ") || "no twilio update, voicemail_left stays false");
+  }
+
+  // T11 — AMD human → no redirect (regression — machine_ branch skipped).
+  {
+    const fake = new FakeSupabaseClient();
+    setSupabaseForTesting(fake);
+    const twilio = new FakeTwilioClient();
+    setTwilioClientForTesting(twilio);
+    fake.on(
+      (c) => c.op === "update" && c.table === "lead_calls" && c.updatePayload?.answered_by === "human",
+      { data: [{ id: LEAD_CALL, call_sid: "CAtest_t11", campaign_id: null, status: "in_progress" }] },
+    );
+
+    const r = await dispatch(app, `/twilio/outbound-voice/amd?lead_call_id=${LEAD_CALL}`, {
+      AnsweredBy: "human",
+    });
+    const failures: string[] = [];
+    if (r.status !== 200) failures.push(`status=${r.status}`);
+    if (twilio.invocations.length !== 0) failures.push(`unexpected ${twilio.invocations.length} twilio update calls on human`);
+    record("T11 AMD human → no redirect", failures.length === 0, failures.join("; ") || "no twilio update on human");
+  }
+}
+
+async function runT12_T13(app: Express) {
+  // T12 — /voicemail TwiML with text → <Say> + <Hangup/>.
+  {
+    const fake = new FakeSupabaseClient();
+    setSupabaseForTesting(fake);
+    fake.on(
+      (c) => c.op === "select" && c.table === "lead_calls" && c.selectColumns === "lead_id",
+      { data: { lead_id: LEAD } },
+    );
+    fake.on(
+      (c) => c.op === "select" && c.table === "leads" && c.selectColumns === "business_id",
+      { data: { business_id: BIZ } },
+    );
+    fake.on(
+      (c) => c.op === "select" && c.table === "business_configs" && c.selectColumns === "outbound_voicemail_text",
+      { data: { outbound_voicemail_text: "Hi, please call back" } },
+    );
+
+    const r = await dispatch(app, `/twilio/outbound-voice/voicemail?lead_call_id=${LEAD_CALL}`);
+    const failures: string[] = [];
+    if (r.status !== 200) failures.push(`status=${r.status}`);
+    if (!r.body.includes(`<Say voice="alice">Hi, please call back</Say>`))
+      failures.push("missing <Say voice=alice>...");
+    if (!r.body.includes("<Hangup/>")) failures.push("missing <Hangup/>");
+    record("T12 voicemail TwiML with text → <Say>+<Hangup/>", failures.length === 0, failures.join("; ") || `body=${r.body.slice(0, 120)}`);
+  }
+
+  // T13 — /voicemail TwiML with NULL text → bare <Hangup/>.
+  {
+    const fake = new FakeSupabaseClient();
+    setSupabaseForTesting(fake);
+    fake.on(
+      (c) => c.op === "select" && c.table === "lead_calls" && c.selectColumns === "lead_id",
+      { data: { lead_id: LEAD } },
+    );
+    fake.on(
+      (c) => c.op === "select" && c.table === "leads" && c.selectColumns === "business_id",
+      { data: { business_id: BIZ } },
+    );
+    fake.on(
+      (c) => c.op === "select" && c.table === "business_configs" && c.selectColumns === "outbound_voicemail_text",
+      { data: { outbound_voicemail_text: null } },
+    );
+
+    const r = await dispatch(app, `/twilio/outbound-voice/voicemail?lead_call_id=${LEAD_CALL}`);
+    const failures: string[] = [];
+    if (r.status !== 200) failures.push(`status=${r.status}`);
+    if (!r.body.includes("<Hangup/>")) failures.push("missing <Hangup/>");
+    if (r.body.includes("<Say")) failures.push("unexpected <Say> for NULL voicemail_text");
+    record("T13 voicemail TwiML with NULL text → bare <Hangup/>", failures.length === 0, failures.join("; ") || `body=${r.body.slice(0, 120)}`);
+  }
+}
+
 async function main() {
   const app = await buildApp();
   await runT1_T3(app);
   await runT4_T5(app);
   await runT6_T8(app);
+  await runT9_T11(app);
+  await runT12_T13(app);
 
   // Restore so other harnesses running in-process see the real client.
   setSupabaseForTesting(null);
+  setTwilioClientForTesting(null);
 
   const fails = results.filter((r) => !r.pass);
   console.log(`\n${results.length - fails.length}/${results.length} passed`);

@@ -1,5 +1,6 @@
 /**
  * Phase 0 Commit 0-D — outbound voice Twilio webhook routes.
+ * Phase 1.6 — voicemail leave-behind + AMD-machine redirect.
  *
  *   POST /api/twilio/outbound-voice/twiml?lead_call_id=...
  *     Twilio's voice URL for outbound_automated calls. Verifies
@@ -12,10 +13,32 @@
  *   POST /api/twilio/outbound-voice/amd?lead_call_id=...
  *     Async AMD callback. Idempotent UPDATE of
  *     lead_calls.answered_by + voicemail_left=FALSE, only when
- *     answered_by IS NULL. Phase 0 doesn't leave voicemails on
- *     machine detection — the agent just talks until the line drops.
- *     Phase 1 will branch on machine_end_beep to redirect to a
- *     voicemail-leave TwiML.
+ *     answered_by IS NULL.
+ *
+ *     Phase 1.6: when AnsweredBy starts with "machine" AND the
+ *     tenant has business_configs.outbound_voicemail_text
+ *     configured, redirect the in-flight Twilio call to the
+ *     /voicemail route via client.calls(sid).update({url:...}).
+ *     On successful redirect, UPDATE voicemail_left=TRUE.
+ *
+ *     CRITICAL PATH-A NOTE: This redirect mechanic only works for
+ *     Path B (outbound_provider='twilio') where Twilio is the call
+ *     orchestrator and our /twiml URL is the active resource. For
+ *     Path A (elevenlabs_hosted), ElevenLabs hosts the call media
+ *     end-to-end via their own TwiML — our /amd webhook may never
+ *     fire (depending on ElevenLabs config), and even if it does,
+ *     client.calls(sid).update() targets a CallSid Twilio controls,
+ *     not ElevenLabs's leg. Path A voicemail is configured on the
+ *     ElevenLabs side as a separate ops concern. Phase 1.6 ships
+ *     only Path B voicemail.
+ *
+ *   POST /api/twilio/outbound-voice/voicemail?lead_call_id=...   (Phase 1.6)
+ *     Returns the voicemail leave-behind TwiML for the redirected
+ *     call. <Say voice="alice">{outbound_voicemail_text}</Say>
+ *     <Hangup/>, or bare <Hangup/> if the tenant didn't configure
+ *     voicemail text. Always 2xx (200 + TwiML); even DB lookup
+ *     failure returns <Hangup/> rather than 5xx (same 2xx-always
+ *     posture as the other outbound-voice routes).
  *
  *   POST /api/twilio/outbound-voice/status?lead_call_id=...
  *     Voice call status callback. Idempotent state transitions:
@@ -50,7 +73,17 @@ import {
   buildEmptyResponseTwiml,
   buildHangupTwiml,
   buildOutboundAutomatedTwiml,
+  buildVoicemailTwiml,
 } from "../lib/outbound-voice/twiml-builder";
+import { getPublicApiBase } from "../lib/public-url";
+import { getTwilioClient } from "../sms";
+
+// Minimal Twilio client shape we need for the AMD voicemail redirect.
+// Matches twilio-rest-provider's TwilioClient — narrow surface so test
+// stubs are tiny.
+interface TwilioClientLike {
+  calls(sid: string): { update(opts: { url: string }): Promise<unknown> };
+}
 
 const router = Router();
 
@@ -70,6 +103,19 @@ function getSupabase(): SupabaseClient | null {
   const key = process.env.SUPABASE_SERVICE_KEY;
   if (!url || !key) return null;
   return createClient(url, key, { auth: { persistSession: false } });
+}
+
+// Phase 1.6 — Twilio client seam. Same DI pattern as the supabase
+// seam above. Tests inject a fake client so we can assert on
+// client.calls(sid).update({url}) calls without hitting Twilio.
+let _twilioClientOverride: TwilioClientLike | null = null;
+export function __setTwilioClientForTesting(client: TwilioClientLike | null): void {
+  _twilioClientOverride = client;
+}
+
+function getTwilio(): TwilioClientLike {
+  if (_twilioClientOverride) return _twilioClientOverride;
+  return getTwilioClient() as unknown as TwilioClientLike;
 }
 
 function sendTwiml(res: Response, body: string, status = 200): void {
@@ -231,32 +277,170 @@ router.post("/twilio/outbound-voice/amd", async (req: Request, res: Response) =>
   try {
     // Idempotent: only set answered_by when it's still NULL. A retry of
     // the AMD callback finds a non-null answered_by and no-ops.
+    // The is(answered_by, null) guard also gives us "fire exactly once
+    // per call" — the voicemail redirect logic below benefits from
+    // that (no risk of double-redirecting on AMD retries).
     const { data: updated } = await supabase
       .from("lead_calls")
       .update({ answered_by: answeredBy, voicemail_left: false })
       .eq("id", leadCallId)
       .is("answered_by", null)
-      .select("id, campaign_id, status");
-    const rows = (updated as Array<{ id: string; campaign_id: string | null; status: string | null }>) || [];
+      .select("id, call_sid, campaign_id, status");
+    const rows = (updated as Array<{ id: string; call_sid: string | null; campaign_id: string | null; status: string | null }>) || [];
     if (rows.length === 0) {
       // Already set OR row doesn't exist. Either way no-op.
       sendTwiml(res, buildEmptyResponseTwiml());
       return;
     }
 
+    const row = rows[0];
+
     // If the call has already completed by the time AMD lands (race),
     // increment the campaign counter slice that the status handler
     // intentionally deferred. See campaign-counters helper.
-    const row = rows[0];
     if (row.campaign_id && row.status === "completed") {
       await incrementCampaignTerminalCounter(supabase, row.campaign_id, answeredBy);
     }
+
+    // Phase 1.6 — voicemail redirect on machine detection.
+    // Only Path B (TwilioRestProvider) reaches this branch; Path A
+    // (elevenlabs_hosted) routes media through ElevenLabs and our
+    // client.calls(sid).update would target a CallSid Twilio doesn't
+    // own. See file-level JSDoc.
+    if (answeredBy.startsWith("machine") && row.call_sid) {
+      await tryRedirectToVoicemail(supabase, row.id, row.call_sid, leadCallId);
+    }
+
     sendTwiml(res, buildEmptyResponseTwiml());
   } catch (err: any) {
     Sentry.captureException(err, {
       extra: { route: "/api/twilio/outbound-voice/amd", leadCallId },
     });
     sendTwiml(res, buildEmptyResponseTwiml());
+  }
+});
+
+async function tryRedirectToVoicemail(
+  supabase: SupabaseClient,
+  leadCallRowId: string,
+  callSid: string,
+  leadCallIdQueryParam: string,
+): Promise<void> {
+  try {
+    // Load business_id via leads JOIN — lead_calls has no business_id.
+    const { data: rowWithLead } = await supabase
+      .from("lead_calls")
+      .select("lead_id")
+      .eq("id", leadCallRowId)
+      .maybeSingle();
+    const leadId = (rowWithLead as { lead_id?: string } | null)?.lead_id;
+    if (!leadId) return;
+    const { data: leadRow } = await supabase
+      .from("leads")
+      .select("business_id")
+      .eq("id", leadId)
+      .maybeSingle();
+    const businessId = (leadRow as { business_id?: string } | null)?.business_id;
+    if (!businessId) return;
+    const { data: bizRow } = await supabase
+      .from("business_configs")
+      .select("outbound_voicemail_text")
+      .eq("business_id", businessId)
+      .maybeSingle();
+    const voicemailText = (bizRow as { outbound_voicemail_text?: string | null } | null)?.outbound_voicemail_text;
+    if (!voicemailText || voicemailText.trim().length === 0) {
+      // Tenant didn't configure voicemail. Agent disconnects gracefully
+      // when the line drops; voicemail_left stays FALSE.
+      return;
+    }
+
+    const voicemailUrl =
+      `${getPublicApiBase()}/api/twilio/outbound-voice/voicemail` +
+      `?lead_call_id=${encodeURIComponent(leadCallIdQueryParam)}`;
+    try {
+      await getTwilio().calls(callSid).update({ url: voicemailUrl });
+    } catch (twilioErr: any) {
+      Sentry.captureException(twilioErr, {
+        extra: { route: "/api/twilio/outbound-voice/amd.voicemailRedirect", leadCallRowId, callSid },
+      });
+      return;
+    }
+    try {
+      await supabase
+        .from("lead_calls")
+        .update({ voicemail_left: true })
+        .eq("id", leadCallRowId);
+    } catch (e: any) {
+      Sentry.captureMessage("amd_voicemail_left_update_failed", {
+        level: "warning",
+        extra: { leadCallRowId, error: e?.message },
+      });
+    }
+  } catch (err: any) {
+    Sentry.captureException(err, {
+      extra: { route: "/api/twilio/outbound-voice/amd.tryRedirectToVoicemail", leadCallRowId },
+    });
+  }
+}
+
+// ── POST /api/twilio/outbound-voice/voicemail ─────────────────────────
+// Phase 1.6. Reached when the AMD handler redirects an in-flight call
+// here because AnsweredBy was machine_* AND the tenant has voicemail
+// text configured. Returns <Say> + <Hangup/> TwiML, or bare <Hangup/>
+// if the lookup chain fails. Always 2xx (same posture as other
+// outbound-voice routes — never 5xx to Twilio).
+
+router.post("/twilio/outbound-voice/voicemail", async (req: Request, res: Response) => {
+  if (!verifyTwilioSignature(req)) {
+    res.status(403).type("text/xml").send(buildHangupTwiml());
+    return;
+  }
+  const leadCallId = typeof req.query.lead_call_id === "string" ? req.query.lead_call_id : null;
+  if (!leadCallId) {
+    sendTwiml(res, buildVoicemailTwiml(null));
+    return;
+  }
+  const supabase = getSupabase();
+  if (!supabase) {
+    Sentry.captureMessage("voicemail_twiml_no_supabase", { level: "error" });
+    sendTwiml(res, buildVoicemailTwiml(null));
+    return;
+  }
+
+  try {
+    const { data: callRow } = await supabase
+      .from("lead_calls")
+      .select("lead_id")
+      .eq("id", leadCallId)
+      .maybeSingle();
+    const leadId = (callRow as { lead_id?: string } | null)?.lead_id;
+    if (!leadId) {
+      sendTwiml(res, buildVoicemailTwiml(null));
+      return;
+    }
+    const { data: leadRow } = await supabase
+      .from("leads")
+      .select("business_id")
+      .eq("id", leadId)
+      .maybeSingle();
+    const businessId = (leadRow as { business_id?: string } | null)?.business_id;
+    if (!businessId) {
+      sendTwiml(res, buildVoicemailTwiml(null));
+      return;
+    }
+    const { data: bizRow } = await supabase
+      .from("business_configs")
+      .select("outbound_voicemail_text")
+      .eq("business_id", businessId)
+      .maybeSingle();
+    const voicemailText = (bizRow as { outbound_voicemail_text?: string | null } | null)?.outbound_voicemail_text ?? null;
+    sendTwiml(res, buildVoicemailTwiml(voicemailText));
+  } catch (err: any) {
+    Sentry.captureException(err, {
+      extra: { route: "/api/twilio/outbound-voice/voicemail", leadCallId },
+    });
+    // 2xx + Hangup so Twilio doesn't retry.
+    sendTwiml(res, buildVoicemailTwiml(null));
   }
 });
 
