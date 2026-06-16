@@ -20,6 +20,7 @@ import voicesRouter from "./voices";
 import transferRouter from "./transfer";
 import leadsRouter from "./leads";
 import leadCallsRouter from "./lead-calls";
+import campaignsRouter from "./campaigns";
 import leadOutcomesRouter from "./lead-outcomes";
 import publicLeadRouter from "./public-lead";
 import twilioCallbacksRouter from "./twilio-callbacks";
@@ -96,6 +97,11 @@ router.use(leadsRouter);
 // Mounted before the catch-all so /api/business/leads/:id/call is
 // claimed here, not by the legacy /lead handler in api.ts.
 router.use(leadCallsRouter);
+// Phase 2.6a: outbound campaigns CRUD (/api/business/campaigns*).
+// Mounted alongside leadCallsRouter — same /business/* resource tree
+// and same requireAuth + requirePermission gating. Before the catch-
+// all apiRouter so /api/business/campaigns is claimed here.
+router.use(campaignsRouter);
 // Slice 3A pillar 1: outcome capture per lead-call.
 //   POST /api/business/leads/:id/calls/:callSid/outcome
 // Mounted alongside leadCallsRouter — both deal with the same

@@ -1,0 +1,760 @@
+/**
+ * Phase 2.6a — campaigns CRUD endpoints.
+ *
+ *   GET    /api/business/campaigns                — list (paginated)
+ *   GET    /api/business/campaigns/:id            — detail
+ *   POST   /api/business/campaigns                — create draft
+ *   PATCH  /api/business/campaigns/:id            — partial update
+ *   DELETE /api/business/campaigns/:id            — atomic delete via RPC
+ *   POST   /api/business/campaigns/preview        — dry-run segment+schedule
+ *   GET    /api/business/campaigns/:id/leads      — paginated junction view
+ *
+ * Tenant scoping: every route resolves businessId from `req.businessId`
+ * (set by requireAuth based on the user's active business). URL :id
+ * params are scoped via WHERE id=$1 AND business_id=$tenantBizId in
+ * every read/write so cross-tenant access returns 404 (not 403 — we
+ * don't leak existence).
+ *
+ * Validation: POST/PATCH bodies run through parseSegmentDefinition and
+ * parseScheduleDefinition (from lib/outbound-campaigns/*) on the JSON
+ * fields. Both are hand-written validators matching the Phase 2.2.5
+ * convention; failures return 400 with the specific error string.
+ *
+ * Preview: POST /campaigns/preview is a dry-run that resolves the
+ * proposed segment + schedule without inserting anything. Returns 200
+ * (even on parse error) with the error string in `segment_error` or
+ * `schedule_error` so the dashboard's live-preview can render the
+ * error inline as the user types.
+ *
+ * DELETE delegates to the migration 033 RPC
+ * (delete_campaign_with_cancellations) which atomically: SELECT FOR
+ * UPDATE locks the campaign, cancels any 'scheduled' lead_calls, then
+ * DELETEs the campaign (cascade wipes junction rows). Returns the
+ * counts so the success toast can report "Canceled X scheduled calls."
+ *
+ * Handlers are exported as functions so the 034 smoke can invoke them
+ * directly with a mock req/res + FakeSupabaseClient (same pattern as
+ * 028 schedule-call handler).
+ */
+
+import { Router, type Request, type Response } from "express";
+import { createClient, type SupabaseClient } from "@supabase/supabase-js";
+import * as Sentry from "@sentry/node";
+
+import { requireAuth, requirePermission } from "../middlewares/auth";
+import {
+  parseSegmentDefinition,
+  resolveSegment,
+  type SegmentDefinition,
+} from "../lib/outbound-campaigns/segment-resolver";
+import {
+  parseScheduleDefinition,
+  resolveSchedule,
+  type ScheduleDefinition,
+} from "../lib/outbound-campaigns/schedule-resolver";
+
+const router = Router();
+
+const NAME_MAX = 200;
+const OBJECTIVE_MAX = 100;
+const VOICEMAIL_OVERRIDE_MAX = 2000;
+const AGENT_ID_MAX = 200;
+const VALID_STATUSES = ["draft", "queued", "active", "paused", "completed", "cancelled"] as const;
+const VALID_STRATEGIES = ["bulk", "time_relative"] as const;
+const DEFAULT_LIST_LIMIT = 50;
+const MAX_LIST_LIMIT = 200;
+const PREVIEW_SAMPLE_LIMIT = 10;
+
+function getSupabase(): SupabaseClient | null {
+  const url = process.env.SUPABASE_URL;
+  const key = process.env.SUPABASE_SERVICE_KEY;
+  if (!url || !key) return null;
+  return createClient(url, key, { auth: { persistSession: false } });
+}
+
+// ── Body parsing / validation ────────────────────────────────────────
+
+interface ParsedCreateBody {
+  name: string;
+  call_objective: string;
+  status?: string;
+  agent_id?: string | null;
+  voicemail_text_override?: string | null;
+  segment_definition?: SegmentDefinition | null;
+  schedule_definition?: ScheduleDefinition | null;
+  schedule_strategy?: string;
+  daily_cap?: number | null;
+  starts_at?: string | null;
+  ends_at?: string | null;
+}
+
+interface ParsedPatchBody {
+  name?: string;
+  call_objective?: string;
+  status?: string;
+  agent_id?: string | null;
+  voicemail_text_override?: string | null;
+  segment_definition?: SegmentDefinition | null;
+  schedule_definition?: ScheduleDefinition | null;
+  schedule_strategy?: string;
+  daily_cap?: number | null;
+  starts_at?: string | null;
+  ends_at?: string | null;
+}
+
+function validateString(v: unknown, field: string, max: number, required: boolean): string | null | { error: string } {
+  if (v === undefined || v === null || v === "") {
+    if (required) return { error: `${field} is required` };
+    return null;
+  }
+  if (typeof v !== "string") return { error: `${field} must be a string` };
+  const trimmed = v.trim();
+  if (required && trimmed.length === 0) return { error: `${field} is required` };
+  if (trimmed.length > max) return { error: `${field} exceeds ${max} characters` };
+  return trimmed;
+}
+
+function validateOptionalInt(v: unknown, field: string): number | null | { error: string } {
+  if (v === undefined || v === null) return null;
+  if (typeof v !== "number" || !Number.isFinite(v) || Math.floor(v) !== v) {
+    return { error: `${field} must be an integer` };
+  }
+  if (v < 0) return { error: `${field} must be non-negative` };
+  return v;
+}
+
+function validateStatus(v: unknown): string | null | { error: string } {
+  if (v === undefined || v === null) return null;
+  if (typeof v !== "string" || !(VALID_STATUSES as readonly string[]).includes(v)) {
+    return { error: `status must be one of ${VALID_STATUSES.join(", ")}` };
+  }
+  return v;
+}
+
+function validateStrategy(v: unknown): string | null | { error: string } {
+  if (v === undefined || v === null) return null;
+  if (typeof v !== "string" || !(VALID_STRATEGIES as readonly string[]).includes(v)) {
+    return { error: `schedule_strategy must be one of ${VALID_STRATEGIES.join(", ")}` };
+  }
+  return v;
+}
+
+function validateOptionalIsoString(v: unknown, field: string): string | null | { error: string } {
+  if (v === undefined || v === null || v === "") return null;
+  if (typeof v !== "string") return { error: `${field} must be a string` };
+  const d = new Date(v);
+  if (isNaN(d.getTime())) return { error: `${field} must be a valid ISO 8601 timestamp` };
+  return v;
+}
+
+function validateSegmentField(v: unknown): SegmentDefinition | null | { error: string } {
+  if (v === undefined || v === null) return null;
+  const parsed = parseSegmentDefinition(v);
+  if ("error" in parsed) return { error: `segment_definition: ${parsed.error}` };
+  return parsed;
+}
+
+function validateScheduleField(v: unknown): ScheduleDefinition | null | { error: string } {
+  if (v === undefined || v === null) return null;
+  const parsed = parseScheduleDefinition(v);
+  if ("error" in parsed) return { error: `schedule_definition: ${parsed.error}` };
+  return parsed;
+}
+
+export function parseCreateBody(body: any): ParsedCreateBody | { error: string } {
+  if (!body || typeof body !== "object") return { error: "Request body required" };
+  const name = validateString(body.name, "name", NAME_MAX, true);
+  if (typeof name === "object" && name && "error" in name) return name;
+  if (name === null) return { error: "name is required" };
+  const call_objective = validateString(body.call_objective, "call_objective", OBJECTIVE_MAX, true);
+  if (typeof call_objective === "object" && call_objective && "error" in call_objective) return call_objective;
+  if (call_objective === null) return { error: "call_objective is required" };
+  const status = validateStatus(body.status);
+  if (typeof status === "object" && status && "error" in status) return status;
+  const agent_id = validateString(body.agent_id, "agent_id", AGENT_ID_MAX, false);
+  if (typeof agent_id === "object" && agent_id && "error" in agent_id) return agent_id;
+  const voicemail = validateString(body.voicemail_text_override, "voicemail_text_override", VOICEMAIL_OVERRIDE_MAX, false);
+  if (typeof voicemail === "object" && voicemail && "error" in voicemail) return voicemail;
+  const segment = validateSegmentField(body.segment_definition);
+  if (segment && typeof segment === "object" && "error" in segment) return segment;
+  const schedule = validateScheduleField(body.schedule_definition);
+  if (schedule && typeof schedule === "object" && "error" in schedule) return schedule;
+  const strategy = validateStrategy(body.schedule_strategy);
+  if (typeof strategy === "object" && strategy && "error" in strategy) return strategy;
+  const daily_cap = validateOptionalInt(body.daily_cap, "daily_cap");
+  if (typeof daily_cap === "object" && daily_cap && "error" in daily_cap) return daily_cap;
+  const starts_at = validateOptionalIsoString(body.starts_at, "starts_at");
+  if (typeof starts_at === "object" && starts_at && "error" in starts_at) return starts_at;
+  const ends_at = validateOptionalIsoString(body.ends_at, "ends_at");
+  if (typeof ends_at === "object" && ends_at && "error" in ends_at) return ends_at;
+
+  return {
+    name: name as string,
+    call_objective: call_objective as string,
+    status: (status as string | null) ?? undefined,
+    agent_id: (agent_id as string | null) ?? null,
+    voicemail_text_override: (voicemail as string | null) ?? null,
+    segment_definition: (segment as SegmentDefinition | null) ?? null,
+    schedule_definition: (schedule as ScheduleDefinition | null) ?? null,
+    schedule_strategy: (strategy as string | null) ?? undefined,
+    daily_cap: (daily_cap as number | null) ?? null,
+    starts_at: (starts_at as string | null) ?? null,
+    ends_at: (ends_at as string | null) ?? null,
+  };
+}
+
+export function parsePatchBody(body: any): ParsedPatchBody | { error: string } {
+  if (!body || typeof body !== "object") return { error: "Request body required" };
+  const out: ParsedPatchBody = {};
+
+  if ("name" in body) {
+    const v = validateString(body.name, "name", NAME_MAX, true);
+    if (typeof v === "object" && v && "error" in v) return v;
+    if (v === null) return { error: "name cannot be empty when provided" };
+    out.name = v as string;
+  }
+  if ("call_objective" in body) {
+    const v = validateString(body.call_objective, "call_objective", OBJECTIVE_MAX, true);
+    if (typeof v === "object" && v && "error" in v) return v;
+    if (v === null) return { error: "call_objective cannot be empty when provided" };
+    out.call_objective = v as string;
+  }
+  if ("status" in body) {
+    const v = validateStatus(body.status);
+    if (typeof v === "object" && v && "error" in v) return v;
+    if (v) out.status = v as string;
+  }
+  if ("agent_id" in body) {
+    const v = validateString(body.agent_id, "agent_id", AGENT_ID_MAX, false);
+    if (typeof v === "object" && v && "error" in v) return v;
+    out.agent_id = (v as string | null) ?? null;
+  }
+  if ("voicemail_text_override" in body) {
+    const v = validateString(body.voicemail_text_override, "voicemail_text_override", VOICEMAIL_OVERRIDE_MAX, false);
+    if (typeof v === "object" && v && "error" in v) return v;
+    out.voicemail_text_override = (v as string | null) ?? null;
+  }
+  if ("segment_definition" in body) {
+    const v = validateSegmentField(body.segment_definition);
+    if (v && typeof v === "object" && "error" in v) return v;
+    out.segment_definition = (v as SegmentDefinition | null) ?? null;
+  }
+  if ("schedule_definition" in body) {
+    const v = validateScheduleField(body.schedule_definition);
+    if (v && typeof v === "object" && "error" in v) return v;
+    out.schedule_definition = (v as ScheduleDefinition | null) ?? null;
+  }
+  if ("schedule_strategy" in body) {
+    const v = validateStrategy(body.schedule_strategy);
+    if (typeof v === "object" && v && "error" in v) return v;
+    if (v) out.schedule_strategy = v as string;
+  }
+  if ("daily_cap" in body) {
+    const v = validateOptionalInt(body.daily_cap, "daily_cap");
+    if (typeof v === "object" && v && "error" in v) return v;
+    out.daily_cap = (v as number | null) ?? null;
+  }
+  if ("starts_at" in body) {
+    const v = validateOptionalIsoString(body.starts_at, "starts_at");
+    if (typeof v === "object" && v && "error" in v) return v;
+    out.starts_at = (v as string | null) ?? null;
+  }
+  if ("ends_at" in body) {
+    const v = validateOptionalIsoString(body.ends_at, "ends_at");
+    if (typeof v === "object" && v && "error" in v) return v;
+    out.ends_at = (v as string | null) ?? null;
+  }
+
+  return out;
+}
+
+// ── Handler functions (exported for 034 smoke direct testing) ────────
+
+export async function handleListCampaigns(
+  supabase: SupabaseClient,
+  businessId: string,
+  query: { offset?: number; limit?: number; status?: string; objective?: string },
+): Promise<{ ok: true; campaigns: any[]; total: number } | { ok: false; status: number; error: string }> {
+  const offset = Math.max(0, query.offset ?? 0);
+  const limit = Math.min(MAX_LIST_LIMIT, Math.max(1, query.limit ?? DEFAULT_LIST_LIMIT));
+  try {
+    let q = supabase
+      .from("outbound_campaigns")
+      .select(
+        "id, business_id, name, call_objective, status, agent_id, target_count, completed_count, succeeded_count, failed_count, voicemail_count, daily_cap, voicemail_text_override, schedule_strategy, last_expansion_at, created_at, updated_at",
+        { count: "exact" },
+      )
+      .eq("business_id", businessId)
+      .order("created_at", { ascending: false })
+      .range(offset, offset + limit - 1);
+    if (query.status) q = q.eq("status", query.status);
+    if (query.objective) q = q.eq("call_objective", query.objective);
+    const { data, error, count } = await q;
+    if (error) {
+      Sentry.captureMessage("campaigns_list_failed", { level: "error", extra: { businessId, error: error.message } });
+      return { ok: false, status: 500, error: "Database error" };
+    }
+    return { ok: true, campaigns: (data as any[]) ?? [], total: count ?? 0 };
+  } catch (err: any) {
+    return { ok: false, status: 500, error: err?.message || "Database error" };
+  }
+}
+
+export async function handleGetCampaign(
+  supabase: SupabaseClient,
+  businessId: string,
+  campaignId: string,
+): Promise<{ ok: true; campaign: any } | { ok: false; status: number; error: string }> {
+  try {
+    const { data, error } = await supabase
+      .from("outbound_campaigns")
+      .select("*")
+      .eq("id", campaignId)
+      .eq("business_id", businessId)
+      .maybeSingle();
+    if (error) {
+      Sentry.captureMessage("campaign_detail_failed", { level: "error", extra: { campaignId, error: error.message } });
+      return { ok: false, status: 500, error: "Database error" };
+    }
+    if (!data) return { ok: false, status: 404, error: "Campaign not found" };
+    return { ok: true, campaign: data };
+  } catch (err: any) {
+    return { ok: false, status: 500, error: err?.message || "Database error" };
+  }
+}
+
+export async function handleCreateCampaign(
+  supabase: SupabaseClient,
+  businessId: string,
+  userId: string,
+  body: ParsedCreateBody,
+): Promise<{ ok: true; campaign: any } | { ok: false; status: number; error: string }> {
+  const row: Record<string, unknown> = {
+    business_id: businessId,
+    name: body.name,
+    call_objective: body.call_objective,
+    status: body.status ?? "draft",
+    created_by: userId,
+  };
+  if (body.agent_id !== undefined) row.agent_id = body.agent_id;
+  if (body.voicemail_text_override !== undefined) row.voicemail_text_override = body.voicemail_text_override;
+  if (body.segment_definition !== undefined) row.segment_definition = body.segment_definition;
+  if (body.schedule_definition !== undefined) row.schedule_definition = body.schedule_definition;
+  if (body.schedule_strategy !== undefined) row.schedule_strategy = body.schedule_strategy;
+  if (body.daily_cap !== undefined) row.daily_cap = body.daily_cap;
+  if (body.starts_at !== undefined) row.starts_at = body.starts_at;
+  if (body.ends_at !== undefined) row.ends_at = body.ends_at;
+
+  try {
+    const { data, error } = await supabase
+      .from("outbound_campaigns")
+      .insert(row)
+      .select("*")
+      .single();
+    if (error || !data) {
+      Sentry.captureMessage("campaign_create_failed", { level: "error", extra: { businessId, error: error?.message } });
+      return { ok: false, status: 500, error: error?.message || "Insert failed" };
+    }
+    return { ok: true, campaign: data };
+  } catch (err: any) {
+    return { ok: false, status: 500, error: err?.message || "Database error" };
+  }
+}
+
+export async function handlePatchCampaign(
+  supabase: SupabaseClient,
+  businessId: string,
+  campaignId: string,
+  body: ParsedPatchBody,
+): Promise<{ ok: true; campaign: any } | { ok: false; status: number; error: string }> {
+  if (Object.keys(body).length === 0) {
+    return { ok: false, status: 400, error: "No fields to update" };
+  }
+  const updateRow: Record<string, unknown> = { ...body, updated_at: new Date().toISOString() };
+  try {
+    const { data, error } = await supabase
+      .from("outbound_campaigns")
+      .update(updateRow)
+      .eq("id", campaignId)
+      .eq("business_id", businessId)
+      .select("*")
+      .single();
+    if (error) {
+      const msg = error.message || "Update failed";
+      // PostgREST returns PGRST116 for "no rows updated" when single() is used.
+      if (/no.*row|PGRST116/i.test(msg)) {
+        return { ok: false, status: 404, error: "Campaign not found" };
+      }
+      Sentry.captureMessage("campaign_patch_failed", { level: "error", extra: { campaignId, error: msg } });
+      return { ok: false, status: 500, error: "Database error" };
+    }
+    if (!data) return { ok: false, status: 404, error: "Campaign not found" };
+    return { ok: true, campaign: data };
+  } catch (err: any) {
+    return { ok: false, status: 500, error: err?.message || "Database error" };
+  }
+}
+
+export async function handleDeleteCampaign(
+  supabase: SupabaseClient,
+  businessId: string,
+  campaignId: string,
+): Promise<
+  | { ok: true; canceled_call_count: number; deleted_junction_count: number }
+  | { ok: false; status: number; error: string }
+> {
+  try {
+    const { data, error } = await supabase.rpc("delete_campaign_with_cancellations", {
+      p_campaign_id: campaignId,
+      p_business_id: businessId,
+    });
+    if (error) {
+      Sentry.captureMessage("campaign_delete_rpc_failed", {
+        level: "error",
+        extra: { campaignId, error: error.message },
+      });
+      return { ok: false, status: 500, error: "Database error" };
+    }
+    const rows = (data as Array<{ canceled_call_count: number; deleted_junction_count: number }>) ?? [];
+    if (rows.length === 0) {
+      return { ok: false, status: 404, error: "Campaign not found" };
+    }
+    const row = rows[0];
+    return {
+      ok: true,
+      canceled_call_count: row.canceled_call_count ?? 0,
+      deleted_junction_count: row.deleted_junction_count ?? 0,
+    };
+  } catch (err: any) {
+    return { ok: false, status: 500, error: err?.message || "Database error" };
+  }
+}
+
+interface PreviewSampleRow {
+  id: string;
+  contact_name: string | null;
+  contact_phone: string | null;
+  scheduledFor?: string;
+}
+
+interface PreviewResponse {
+  count: number;
+  sample: PreviewSampleRow[];
+  segment_error?: string;
+  schedule_error?: string;
+}
+
+export async function handlePreviewCampaign(
+  supabase: SupabaseClient,
+  businessId: string,
+  body: { segment_definition?: unknown; schedule_definition?: unknown },
+): Promise<PreviewResponse> {
+  // (1) Parse segment.
+  const segParsed = parseSegmentDefinition(body.segment_definition);
+  if ("error" in segParsed) {
+    return { count: 0, sample: [], segment_error: segParsed.error };
+  }
+  // (2) Resolve segment.
+  const segResult = await resolveSegment(supabase, businessId, segParsed as SegmentDefinition);
+  if (segResult.error) {
+    return { count: 0, sample: [], segment_error: segResult.error };
+  }
+  const allLeadIds = segResult.leadIds;
+  const count = allLeadIds.length;
+  const sampleIds = allLeadIds.slice(0, PREVIEW_SAMPLE_LIMIT);
+
+  // (3) Fetch sample lead contact info.
+  let sample: PreviewSampleRow[] = [];
+  if (sampleIds.length > 0) {
+    try {
+      const { data: leadRows } = await supabase
+        .from("leads")
+        .select("id, contact_name, contact_phone")
+        .eq("business_id", businessId)
+        .in("id", sampleIds);
+      sample = ((leadRows as PreviewSampleRow[]) ?? []).map((r) => ({
+        id: r.id,
+        contact_name: r.contact_name,
+        contact_phone: r.contact_phone,
+      }));
+    } catch {
+      // Best-effort; sample stays empty but count is correct.
+    }
+  }
+
+  // (4) Optionally resolve schedule.
+  if (body.schedule_definition !== undefined && body.schedule_definition !== null) {
+    const schedParsed = parseScheduleDefinition(body.schedule_definition);
+    if ("error" in schedParsed) {
+      return { count, sample, schedule_error: schedParsed.error };
+    }
+    const schedResult = await resolveSchedule(
+      supabase,
+      businessId,
+      sampleIds,
+      schedParsed as ScheduleDefinition,
+    );
+    if (schedResult.error) {
+      return { count, sample, schedule_error: schedResult.error };
+    }
+    // Merge scheduledFor onto sample rows.
+    sample = sample.map((row) => {
+      const sf = schedResult.scheduledFor.get(row.id);
+      return sf ? { ...row, scheduledFor: sf.toISOString() } : row;
+    });
+  }
+
+  return { count, sample };
+}
+
+export async function handleGetCampaignLeads(
+  supabase: SupabaseClient,
+  businessId: string,
+  campaignId: string,
+  query: { offset?: number; limit?: number; state?: string; skip_reason?: string },
+): Promise<
+  | { ok: true; rows: any[]; total: number }
+  | { ok: false; status: number; error: string }
+> {
+  // Verify the campaign belongs to this tenant first.
+  const owner = await supabase
+    .from("outbound_campaigns")
+    .select("id")
+    .eq("id", campaignId)
+    .eq("business_id", businessId)
+    .maybeSingle();
+  if (!owner.data) return { ok: false, status: 404, error: "Campaign not found" };
+
+  const offset = Math.max(0, query.offset ?? 0);
+  const limit = Math.min(MAX_LIST_LIMIT, Math.max(1, query.limit ?? DEFAULT_LIST_LIMIT));
+  try {
+    let q = supabase
+      .from("outbound_campaign_leads")
+      .select(
+        "id, lead_id, state, skip_reason, scheduled_call_id, scheduled_for, completed_at, created_at, updated_at, leads!inner(contact_name, contact_phone)",
+        { count: "exact" },
+      )
+      .eq("campaign_id", campaignId)
+      .order("created_at", { ascending: false })
+      .range(offset, offset + limit - 1);
+    if (query.state) q = q.eq("state", query.state);
+    if (query.skip_reason) q = q.eq("skip_reason", query.skip_reason);
+    const { data, error, count } = await q;
+    if (error) {
+      Sentry.captureMessage("campaign_leads_list_failed", {
+        level: "error",
+        extra: { campaignId, error: error.message },
+      });
+      return { ok: false, status: 500, error: "Database error" };
+    }
+    return { ok: true, rows: (data as any[]) ?? [], total: count ?? 0 };
+  } catch (err: any) {
+    return { ok: false, status: 500, error: err?.message || "Database error" };
+  }
+}
+
+// ── Route registrations ─────────────────────────────────────────────
+
+router.get(
+  "/business/campaigns",
+  requireAuth,
+  requirePermission("calls", "read"),
+  async (req: Request, res: Response) => {
+    const supabase = getSupabase();
+    if (!supabase) {
+      res.status(500).json({ error: "Database not configured" });
+      return;
+    }
+    const businessId = req.businessId;
+    if (!businessId) {
+      res.status(400).json({ error: "No active business" });
+      return;
+    }
+    const result = await handleListCampaigns(supabase, businessId, {
+      offset: req.query.offset !== undefined ? parseInt(String(req.query.offset), 10) : undefined,
+      limit: req.query.limit !== undefined ? parseInt(String(req.query.limit), 10) : undefined,
+      status: typeof req.query.status === "string" ? req.query.status : undefined,
+      objective: typeof req.query.objective === "string" ? req.query.objective : undefined,
+    });
+    if (!result.ok) {
+      res.status(result.status).json({ error: result.error });
+      return;
+    }
+    res.json({ campaigns: result.campaigns, total: result.total });
+  },
+);
+
+// POST /preview MUST be registered BEFORE the GET /:id route so the
+// path "preview" isn't interpreted as a campaign id.
+router.post(
+  "/business/campaigns/preview",
+  requireAuth,
+  requirePermission("calls", "read"),
+  async (req: Request, res: Response) => {
+    const supabase = getSupabase();
+    if (!supabase) {
+      res.status(500).json({ error: "Database not configured" });
+      return;
+    }
+    const businessId = req.businessId;
+    if (!businessId) {
+      res.status(400).json({ error: "No active business" });
+      return;
+    }
+    const body = (req.body || {}) as { segment_definition?: unknown; schedule_definition?: unknown };
+    const result = await handlePreviewCampaign(supabase, businessId, body);
+    // 200 always — parse/runtime errors come back inline so the live-
+    // preview dashboard component can render them as the user types.
+    res.json(result);
+  },
+);
+
+router.post(
+  "/business/campaigns",
+  requireAuth,
+  requirePermission("calls", "write"),
+  async (req: Request, res: Response) => {
+    const supabase = getSupabase();
+    if (!supabase) {
+      res.status(500).json({ error: "Database not configured" });
+      return;
+    }
+    const businessId = req.businessId;
+    if (!businessId) {
+      res.status(400).json({ error: "No active business" });
+      return;
+    }
+    const userId = req.userId;
+    if (!userId) {
+      res.status(401).json({ error: "Authentication required" });
+      return;
+    }
+    const parsed = parseCreateBody(req.body);
+    if ("error" in parsed) {
+      res.status(400).json({ error: parsed.error });
+      return;
+    }
+    const result = await handleCreateCampaign(supabase, businessId, userId, parsed);
+    if (!result.ok) {
+      res.status(result.status).json({ error: result.error });
+      return;
+    }
+    res.status(201).json({ campaign: result.campaign });
+  },
+);
+
+router.get(
+  "/business/campaigns/:id",
+  requireAuth,
+  requirePermission("calls", "read"),
+  async (req: Request, res: Response) => {
+    const supabase = getSupabase();
+    if (!supabase) {
+      res.status(500).json({ error: "Database not configured" });
+      return;
+    }
+    const businessId = req.businessId;
+    if (!businessId) {
+      res.status(400).json({ error: "No active business" });
+      return;
+    }
+    const campaignId = String(req.params.id);
+    const result = await handleGetCampaign(supabase, businessId, campaignId);
+    if (!result.ok) {
+      res.status(result.status).json({ error: result.error });
+      return;
+    }
+    res.json({ campaign: result.campaign });
+  },
+);
+
+router.patch(
+  "/business/campaigns/:id",
+  requireAuth,
+  requirePermission("calls", "write"),
+  async (req: Request, res: Response) => {
+    const supabase = getSupabase();
+    if (!supabase) {
+      res.status(500).json({ error: "Database not configured" });
+      return;
+    }
+    const businessId = req.businessId;
+    if (!businessId) {
+      res.status(400).json({ error: "No active business" });
+      return;
+    }
+    const campaignId = String(req.params.id);
+    const parsed = parsePatchBody(req.body);
+    if ("error" in parsed) {
+      res.status(400).json({ error: parsed.error });
+      return;
+    }
+    const result = await handlePatchCampaign(supabase, businessId, campaignId, parsed);
+    if (!result.ok) {
+      res.status(result.status).json({ error: result.error });
+      return;
+    }
+    res.json({ campaign: result.campaign });
+  },
+);
+
+router.delete(
+  "/business/campaigns/:id",
+  requireAuth,
+  requirePermission("calls", "write"),
+  async (req: Request, res: Response) => {
+    const supabase = getSupabase();
+    if (!supabase) {
+      res.status(500).json({ error: "Database not configured" });
+      return;
+    }
+    const businessId = req.businessId;
+    if (!businessId) {
+      res.status(400).json({ error: "No active business" });
+      return;
+    }
+    const campaignId = String(req.params.id);
+    const result = await handleDeleteCampaign(supabase, businessId, campaignId);
+    if (!result.ok) {
+      res.status(result.status).json({ error: result.error });
+      return;
+    }
+    res.json({
+      success: true,
+      canceled_call_count: result.canceled_call_count,
+      deleted_junction_count: result.deleted_junction_count,
+    });
+  },
+);
+
+router.get(
+  "/business/campaigns/:id/leads",
+  requireAuth,
+  requirePermission("calls", "read"),
+  async (req: Request, res: Response) => {
+    const supabase = getSupabase();
+    if (!supabase) {
+      res.status(500).json({ error: "Database not configured" });
+      return;
+    }
+    const businessId = req.businessId;
+    if (!businessId) {
+      res.status(400).json({ error: "No active business" });
+      return;
+    }
+    const campaignId = String(req.params.id);
+    const result = await handleGetCampaignLeads(supabase, businessId, campaignId, {
+      offset: req.query.offset !== undefined ? parseInt(String(req.query.offset), 10) : undefined,
+      limit: req.query.limit !== undefined ? parseInt(String(req.query.limit), 10) : undefined,
+      state: typeof req.query.state === "string" ? req.query.state : undefined,
+      skip_reason: typeof req.query.skip_reason === "string" ? req.query.skip_reason : undefined,
+    });
+    if (!result.ok) {
+      res.status(result.status).json({ error: result.error });
+      return;
+    }
+    res.json({ rows: result.rows, total: result.total });
+  },
+);
+
+export default router;
