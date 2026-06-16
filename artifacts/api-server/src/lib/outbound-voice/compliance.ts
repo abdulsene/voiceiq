@@ -89,3 +89,88 @@ export async function checkCompliance(
 
   return { allowed: true, checks };
 }
+
+// ── Phase 2.3: checkCampaignEligibility ──────────────────────────────
+//
+// Composes `already_in_campaign` (cheap, single SELECT) with
+// checkCompliance (DNC + consent + calling_hours) for the Phase 2.4
+// expansion worker's per-lead eligibility decision.
+//
+// Order: already_in_campaign first (single-row primary-key-style
+// lookup on outbound_campaign_leads), then delegate to checkCompliance
+// for the remaining three checks. Reuses checkCompliance so DNC/
+// consent/calling_hours stays in sync with placeCall step 3 — no fork.
+//
+// NOT checked here: daily_cap. placeCall step 5.5 handles it at the
+// actual call placement boundary. Adding it here would duplicate the
+// count query + create double-counting concerns when the worker
+// triggers placeCall right after.
+//
+// `opted_out` (Phase 3 reserved state on outbound_campaign_leads) is
+// not a skip_reason vocabulary entry — no current code path triggers
+// it. The state CHECK includes it for future-proofing.
+
+export type CampaignSkipReason =
+  | "dnc"
+  | "consent"
+  | "calling_hours"
+  | "already_in_campaign";
+
+export interface CheckCampaignEligibilityOptions {
+  campaignId: string;
+  businessId: string;
+  leadId: string;
+  /** E.164 — for DNC + consent + recipient-tz lookups via checkCompliance. */
+  phone: string;
+  /** = campaign.call_objective. Threaded to checkVoiceConsent. */
+  consentType: string;
+  /** IANA name e.g. 'America/New_York'. Caller resolves via lib/phone-timezone. */
+  recipientTimezone: string;
+  /** When the call would fire. Used for calling_hours window check. */
+  scheduledFor: Date;
+}
+
+export type CampaignEligibilityResult =
+  | { eligible: true }
+  | { eligible: false; skip_reason: CampaignSkipReason };
+
+export async function checkCampaignEligibility(
+  supabase: SupabaseClient,
+  opts: CheckCampaignEligibilityOptions,
+): Promise<CampaignEligibilityResult> {
+  // 1. already_in_campaign — cheap single-row lookup via the UNIQUE
+  //    index. We treat ANY active state (pending or scheduled) as
+  //    "already in campaign"; terminal states (completed, skipped,
+  //    opted_out) don't block re-enrollment.
+  try {
+    const { data: existing } = await supabase
+      .from("outbound_campaign_leads")
+      .select("id")
+      .eq("campaign_id", opts.campaignId)
+      .eq("lead_id", opts.leadId)
+      .in("state", ["pending", "scheduled"])
+      .maybeSingle();
+    if (existing) {
+      return { eligible: false, skip_reason: "already_in_campaign" };
+    }
+  } catch {
+    // DB error on the eligibility lookup is treated as already-in-
+    // campaign defensively — we'd rather skip a lead than double-
+    // schedule. Worker can retry next tick when the DB recovers.
+    return { eligible: false, skip_reason: "already_in_campaign" };
+  }
+
+  // 2-4. DNC + consent + calling_hours via the parallel checkCompliance.
+  const decision = await checkCompliance(supabase, {
+    businessId: opts.businessId,
+    phone: opts.phone,
+    leadId: opts.leadId,
+    consentType: opts.consentType,
+    recipientTimezone: opts.recipientTimezone,
+    now: opts.scheduledFor,
+  });
+  if (!decision.allowed) {
+    return { eligible: false, skip_reason: decision.blocked_by! };
+  }
+  return { eligible: true };
+}
