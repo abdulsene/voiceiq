@@ -161,6 +161,9 @@ const AUTH_BYPASS_PATTERNS = [
   // endpoint ElevenLabs's agent POSTs to mid-conversation. The token in
   // the Authorization header (ELEVENLABS_TOOL_SECRET) IS the credential.
   /^\/api\/leads\/capture$/,
+  // Phase 2.2.5: /api/leads/record-appointment is the record_appointment
+  // tool endpoint. Same Bearer-token auth via ELEVENLABS_TOOL_SECRET.
+  /^\/api\/leads\/record-appointment$/,
   // Slice 3A pillar 3: customer trust portal. GET /api/public/lead/:token
   // and POST /api/public/lead/:token/action. Token IS the credential
   // (HS256-signed by lib/trust-portal-token.ts). Tight regex so future

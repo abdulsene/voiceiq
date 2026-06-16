@@ -31,11 +31,14 @@ export type TransferConfig = {
 
 const TRANSFER_TOOL_NAME = 'transfer_to_number';
 const REQUEST_CALLBACK_TOOL_NAME = 'request_callback';
+// Phase 2.2.5 — record_appointment tool name + URL.
+const RECORD_APPOINTMENT_TOOL_NAME = 'record_appointment';
 // Default capture URL. Override per environment via LEADS_CAPTURE_URL.
 // Baked into the ElevenLabs agent config at PATCH time, so changing this
 // requires re-running updateAgentTools for every agent — a one-shot
 // resync script is cheap.
 const DEFAULT_LEADS_CAPTURE_URL = 'https://voice-i-q.replit.app/api/leads/capture';
+const DEFAULT_RECORD_APPOINTMENT_URL = 'https://voice-i-q.replit.app/api/leads/record-appointment';
 
 // NL description shown to the LLM. Tells it WHEN to invoke and what to
 // confirm with the caller before invoking. Kept as a module constant so
@@ -58,6 +61,26 @@ Before invoking this tool, confirm with the caller:
 Do not invoke this tool silently. Tell the caller you are capturing their request and that someone from the team will follow up shortly. After the tool returns success, confirm: "I've passed that on to the team. Someone will get back to you via {preferred_channel}."
 
 If the tool returns an error, apologize and offer to take a message verbally for the team to call back manually.`;
+
+// Phase 2.2.5 — record_appointment tool description.
+// Heavy on the "confirm back to caller" instruction because appointment-
+// booking failures are high-cost (missed appointment, customer trust).
+// The LLM should over-confirm date/time/reason before firing the tool.
+const RECORD_APPOINTMENT_DESCRIPTION = `Use this tool to record an appointment when the caller wants to book one. Invoke this tool when:
+
+- The caller wants to schedule an appointment, booking, or visit
+- The caller has agreed to a specific date and time you proposed
+- The caller wants to reschedule an existing appointment to a new date and time
+
+Before invoking this tool, you MUST confirm out loud with the caller:
+1. The date AND time of the appointment ("So that's Tuesday, March twentieth, at two thirty in the afternoon — is that right?")
+2. The reason for the appointment ("And this is for a haircut — correct?")
+3. The duration if relevant ("It should take about thirty minutes — does that work?")
+4. The caller's phone number if you don't already have it, so we can call back if anything changes
+
+Pass appointment_datetime in ISO 8601 format with timezone (e.g. 2026-06-20T14:30:00-04:00 for 2:30pm Eastern). Pass reason as a 1-2 sentence summary in plain English. Pass duration_minutes if you know it; otherwise omit. Pass notes for anything additional the staff or AI should know (preferences, accommodations).
+
+Do not invoke this tool silently. Tell the caller you are recording their appointment. After the tool returns success, confirm: "I've got that down — your appointment is confirmed for {date} at {time}." If the tool returns an error, apologize, do NOT promise the appointment is booked, and offer to take a message for the team to call back.`;
 
 /**
  * Build the tools-array entry for the transfer_to_number system tool.
@@ -208,6 +231,93 @@ export function buildRequestCallbackTool(opts: {
             type: 'string',
             enum: ['text', 'call', 'email', 'voice_callback'],
             description: "How the caller wants to be reached. 'text' = SMS. 'call' = phone call from the team. 'email' = email. 'voice_callback' = an AI-initiated automated callback. Ask the caller explicitly: \"Would you prefer a text, a call, or an email?\"",
+          },
+        },
+      },
+    },
+  };
+}
+
+/**
+ * Phase 2.2.5 — build the tools-array entry for the record_appointment
+ * webhook tool. Same shape as buildRequestCallbackTool (above): webhook
+ * type, Bearer-token auth via shared secret, business_id baked via
+ * constant_value at PATCH time.
+ *
+ * Conditionally registered by updateAgentTools when
+ * business_configs.record_appointment_enabled = TRUE. Default FALSE
+ * gates rollout per-tenant.
+ *
+ * Description-heavy on the "confirm date/time/reason out loud BEFORE
+ * firing the tool" instruction because the cost of an incorrect
+ * appointment row (missed booking, customer trust breach) is high. The
+ * LLM over-confirms by design.
+ *
+ * Required params: business_id (constant), conversation_id (the
+ * ElevenLabs session ID for lead lookup), appointment_datetime (ISO
+ * 8601 with timezone), reason.
+ * Optional params: duration_minutes, notes, contact_phone (used to
+ * resolve the lead if the conversation_id → calls.call_sid lookup
+ * hasn't sync'd yet).
+ */
+export function buildRecordAppointmentTool(opts: {
+  businessId: string;
+  recordAppointmentUrl: string;
+  toolSecret: string;
+}): unknown {
+  return {
+    type: 'webhook',
+    name: RECORD_APPOINTMENT_TOOL_NAME,
+    description: RECORD_APPOINTMENT_DESCRIPTION,
+    response_timeout_secs: 30,
+    disable_interruptions: false,
+    pre_tool_speech: 'force',
+    tool_error_handling_mode: 'summarized',
+    execution_mode: 'immediate',
+    api_schema: {
+      url: opts.recordAppointmentUrl,
+      method: 'POST',
+      content_type: 'application/json',
+      request_headers: {
+        Authorization: `Bearer ${opts.toolSecret}`,
+        'Content-Type': 'application/json',
+      },
+      request_body_schema: {
+        type: 'object',
+        required: [
+          'business_id',
+          'conversation_id',
+          'appointment_datetime',
+          'reason',
+        ],
+        properties: {
+          business_id: {
+            type: 'string',
+            constant_value: opts.businessId,
+          },
+          conversation_id: {
+            type: 'string',
+            description: 'The current ElevenLabs conversation ID. Use the value provided to you in this conversation; do not invent one.',
+          },
+          appointment_datetime: {
+            type: 'string',
+            description: "The appointment date AND time in ISO 8601 format with timezone offset (e.g. 2026-06-20T14:30:00-04:00 for 2:30pm Eastern). Confirm the date and time back to the caller out loud before submitting. Must be in the future.",
+          },
+          duration_minutes: {
+            type: 'number',
+            description: 'Optional. Appointment duration in minutes. Default is 30 if you omit. Ask the caller if you don\'t know and the appointment type clearly needs a specific duration.',
+          },
+          reason: {
+            type: 'string',
+            description: 'A 1-2 sentence summary of what the appointment is for, in plain English (e.g. "Haircut and beard trim", "Annual physical exam", "Follow-up consultation"). Capture only what the caller said they wanted.',
+          },
+          notes: {
+            type: 'string',
+            description: 'Optional. Any context the staff or AI should know going in (e.g. "Customer prefers afternoon slots", "Allergic to fragrance", "First-time visitor"). Leave blank if not provided.',
+          },
+          contact_phone: {
+            type: 'string',
+            description: "Optional. The caller's phone in E.164 format (e.g. +14105551234). Provide if this is the caller's first interaction with the AI in this session AND they have not previously asked for a callback. If they previously asked for a callback in this conversation, you may omit and the system will use the captured phone.",
           },
         },
       },
@@ -389,7 +499,7 @@ export async function updateAgentTools(
   try {
     const { data: biz, error: readErr } = await supabase
       .from('business_configs')
-      .select('agent_id, business_name, transfer_enabled, transfer_to_phone, transfer_conditions, transfer_wait_message, transfer_warm_message')
+      .select('agent_id, business_name, transfer_enabled, transfer_to_phone, transfer_conditions, transfer_wait_message, transfer_warm_message, record_appointment_enabled')
       .eq('business_id', businessId)
       .maybeSingle();
     if (readErr) {
@@ -410,6 +520,7 @@ export async function updateAgentTools(
       transfer_conditions: string | null;
       transfer_wait_message: string | null;
       transfer_warm_message: string | null;
+      record_appointment_enabled: boolean | null;
     };
     if (!row.agent_id) {
       // No ElevenLabs agent yet (business hasn't completed onboarding).
@@ -449,6 +560,7 @@ export async function updateAgentTools(
     const remainingTools = existingTools.filter((t: any) => {
       if (t?.name === TRANSFER_TOOL_NAME || t?.params?.system_tool_type === 'transfer_to_number') return false;
       if (t?.name === REQUEST_CALLBACK_TOOL_NAME) return false;
+      if (t?.name === RECORD_APPOINTMENT_TOOL_NAME) return false;
       return true;
     });
 
@@ -492,6 +604,22 @@ export async function updateAgentTools(
         toolSecret,
       }),
     );
+
+    // Phase 2.2.5 — record_appointment tool. Conditionally registered
+    // when business_configs.record_appointment_enabled = TRUE. Default
+    // FALSE gates rollout per-tenant. Reuses ELEVENLABS_TOOL_SECRET
+    // (single shared secret for all webhook tools — one rotation path).
+    if (row.record_appointment_enabled) {
+      const recordAppointmentUrl =
+        process.env.RECORD_APPOINTMENT_URL || DEFAULT_RECORD_APPOINTMENT_URL;
+      nextTools.push(
+        buildRecordAppointmentTool({
+          businessId,
+          recordAppointmentUrl,
+          toolSecret,
+        }),
+      );
+    }
 
     const promptBody: any = { tools: nextTools };
     if (typeof currentPromptText === 'string') {

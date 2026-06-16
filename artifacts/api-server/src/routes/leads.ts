@@ -590,4 +590,350 @@ router.get(
   },
 );
 
+// ── POST /api/leads/record-appointment (Phase 2.2.5) ──────────────────
+//
+// The AI receptionist's record_appointment webhook tool POSTs here when
+// the caller books an appointment. Verifies Bearer secret (same as
+// /api/leads/capture). Resolves the caller's lead via:
+//   1. conversation_id → calls.call_sid → calls.id → leads.source_call_id
+//   2. contact_phone fallback → leads.contact_phone WHERE business_id=$1
+//   3. stub lead creation (source='ai_appointment_booking') if both miss
+// then INSERTs the appointment with status='confirmed',
+// source='ai_receptionist', lead_id set. lead_activities row is
+// best-effort.
+//
+// Gated by business_configs.record_appointment_enabled at the agent-
+// registration layer (updateAgentTools only registers the tool when the
+// flag is TRUE), but we ALSO check here as a belt-and-suspenders for the
+// case where the flag was flipped FALSE after the agent was last sync'd.
+
+type RecordAppointmentPayload = {
+  business_id: string;
+  conversation_id: string;
+  appointment_datetime: string;  // ISO 8601 with TZ
+  reason: string;
+  duration_minutes?: number;
+  notes?: string;
+  contact_phone?: string;
+};
+
+const NOTES_MAX = 2000;
+const APPT_REASON_MAX = 500;
+const DURATION_MAX = 24 * 60;  // 24 hours upper bound
+
+// Exported for the 031 smoke — direct unit-tests of validation.
+export function parseRecordAppointmentPayload(body: any): RecordAppointmentPayload | { error: string } {
+  if (!body || typeof body !== "object") return { error: "Request body required" };
+  const requireStr = (k: string, max: number): string | { error: string } => {
+    const v = body[k];
+    if (typeof v !== "string" || !v.trim()) return { error: `${k} is required` };
+    if (v.length > max) return { error: `${k} exceeds ${max} characters` };
+    return v.trim();
+  };
+  const optionalStr = (k: string, max: number): string | undefined | { error: string } => {
+    const v = body[k];
+    if (v == null || v === "") return undefined;
+    if (typeof v !== "string") return { error: `${k} must be a string when provided` };
+    if (v.length > max) return { error: `${k} exceeds ${max} characters` };
+    return v.trim();
+  };
+
+  const businessId = requireStr("business_id", 100);
+  if (typeof businessId !== "string") return businessId;
+  const conversationId = requireStr("conversation_id", CONVERSATION_ID_MAX);
+  if (typeof conversationId !== "string") return conversationId;
+
+  // R1 — appointment_datetime is required (production column is nullable
+  // but Phase 2 semantics require it). Reject at the route boundary.
+  const apptRaw = body.appointment_datetime;
+  if (typeof apptRaw !== "string" || !apptRaw.trim()) {
+    return { error: "appointment_datetime is required" };
+  }
+  const apptDate = new Date(apptRaw);
+  if (isNaN(apptDate.getTime())) {
+    return { error: "appointment_datetime must be a valid ISO 8601 timestamp" };
+  }
+  if (apptDate.getTime() <= Date.now()) {
+    return { error: "appointment_datetime must be in the future" };
+  }
+
+  const reason = requireStr("reason", APPT_REASON_MAX);
+  if (typeof reason !== "string") return reason;
+
+  const notes = optionalStr("notes", NOTES_MAX);
+  if (typeof notes === "object") return notes;
+
+  let durationMinutes: number | undefined;
+  if (body.duration_minutes != null) {
+    const n = typeof body.duration_minutes === "number"
+      ? body.duration_minutes
+      : parseInt(String(body.duration_minutes), 10);
+    if (!Number.isFinite(n) || n <= 0 || n > DURATION_MAX) {
+      return { error: `duration_minutes must be a positive number, max ${DURATION_MAX}` };
+    }
+    durationMinutes = Math.round(n);
+  }
+
+  const contactPhone = optionalStr("contact_phone", PHONE_MAX);
+  if (typeof contactPhone === "object") return contactPhone;
+  if (contactPhone && !E164_RE.test(contactPhone)) {
+    return { error: "contact_phone must be E.164 format if provided (e.g. +14105551234)" };
+  }
+
+  return {
+    business_id: businessId,
+    conversation_id: conversationId,
+    appointment_datetime: apptDate.toISOString(),
+    reason,
+    duration_minutes: durationMinutes,
+    notes,
+    contact_phone: contactPhone,
+  };
+}
+
+interface RecordAppointmentSuccess {
+  ok: true;
+  appointmentId: number;
+  scheduledAt: string;
+  leadId: string | null;
+}
+interface RecordAppointmentFailure {
+  ok: false;
+  status: number;
+  error: string;
+}
+type RecordAppointmentResult = RecordAppointmentSuccess | RecordAppointmentFailure;
+
+// Exported for the 031 smoke — direct handler invocation with mock
+// req/res + FakeSupabaseClient (mirrors handleScheduleCall in routes/
+// lead-calls.ts).
+export async function handleRecordAppointment(
+  supabase: SupabaseClient,
+  payload: RecordAppointmentPayload,
+): Promise<RecordAppointmentResult> {
+  // Confirm business + per-tenant flag.
+  const { data: biz, error: bizErr } = await supabase
+    .from("business_configs")
+    .select("business_id, record_appointment_enabled")
+    .eq("business_id", payload.business_id)
+    .maybeSingle();
+  if (bizErr) {
+    Sentry.captureMessage("record_appointment_business_lookup_failed", {
+      level: "error",
+      extra: { businessId: payload.business_id, error: bizErr.message },
+    });
+    return { ok: false, status: 500, error: "Database error" };
+  }
+  const bizRow = biz as { business_id: string; record_appointment_enabled: boolean | null } | null;
+  if (!bizRow) {
+    return { ok: false, status: 404, error: "Business not found" };
+  }
+  if (bizRow.record_appointment_enabled !== true) {
+    // Belt-and-suspenders: the agent should not have the tool registered
+    // when the flag is FALSE, but a stale agent config could still call
+    // through. Refuse and surface a message the LLM can apologize for.
+    return {
+      ok: false,
+      status: 400,
+      error: "Appointment recording is not enabled for this business",
+    };
+  }
+
+  // (1) Lead resolution chain — conversation_id → calls → leads.source_call_id.
+  let leadId: string | null = null;
+  let leadContactName: string | null = null;
+  let leadContactPhone: string | null = null;
+  try {
+    const { data: callRow } = await supabase
+      .from("calls")
+      .select("id")
+      .eq("call_sid", payload.conversation_id)
+      .maybeSingle();
+    const sourceCallId = (callRow as { id?: string } | null)?.id ?? null;
+    if (sourceCallId) {
+      const { data: leadByCall } = await supabase
+        .from("leads")
+        .select("id, contact_name, contact_phone")
+        .eq("source_call_id", sourceCallId)
+        .eq("business_id", payload.business_id)
+        .maybeSingle();
+      const row = leadByCall as { id: string; contact_name: string | null; contact_phone: string | null } | null;
+      if (row) {
+        leadId = row.id;
+        leadContactName = row.contact_name;
+        leadContactPhone = row.contact_phone;
+      }
+    }
+  } catch {
+    /* best-effort; fall through */
+  }
+
+  // (2) contact_phone fallback if (1) missed.
+  if (!leadId && payload.contact_phone) {
+    try {
+      const { data: leadByPhone } = await supabase
+        .from("leads")
+        .select("id, contact_name, contact_phone")
+        .eq("business_id", payload.business_id)
+        .eq("contact_phone", payload.contact_phone)
+        .maybeSingle();
+      const row = leadByPhone as { id: string; contact_name: string | null; contact_phone: string | null } | null;
+      if (row) {
+        leadId = row.id;
+        leadContactName = row.contact_name;
+        leadContactPhone = row.contact_phone;
+      }
+    } catch {
+      /* best-effort; fall through */
+    }
+  }
+
+  // (3) Stub-lead creation if both (1) and (2) missed.
+  // Per R-Call2 — source='ai_appointment_booking' (distinct from
+  // 'ai_receptionist' which is the APPOINTMENT's source). Best-effort:
+  // if the stub INSERT fails, the appointment still lands with lead_id
+  // NULL (verified by smoke T12).
+  if (!leadId) {
+    try {
+      const { data: newLead, error: stubErr } = await supabase
+        .from("leads")
+        .insert({
+          business_id: payload.business_id,
+          source: "ai_appointment_booking",
+          contact_name: null,
+          contact_phone: payload.contact_phone ?? null,
+          reason: payload.reason,
+          urgency: "medium",
+          preferred_channel: "call",
+          status: "new",
+        })
+        .select("id, contact_name, contact_phone")
+        .single();
+      if (!stubErr && newLead) {
+        const row = newLead as { id: string; contact_name: string | null; contact_phone: string | null };
+        leadId = row.id;
+        leadContactName = row.contact_name;
+        leadContactPhone = row.contact_phone;
+      } else if (stubErr) {
+        Sentry.captureMessage("record_appointment_stub_lead_failed", {
+          level: "warning",
+          extra: { businessId: payload.business_id, error: stubErr.message },
+        });
+      }
+    } catch (err: any) {
+      Sentry.captureMessage("record_appointment_stub_lead_threw", {
+        level: "warning",
+        extra: { businessId: payload.business_id, error: err?.message },
+      });
+    }
+  }
+
+  // (4) INSERT appointment. status='confirmed' per R-Call3.
+  let appointmentId: number;
+  try {
+    const { data: appt, error: apptErr } = await supabase
+      .from("appointments")
+      .insert({
+        business_id: payload.business_id,
+        lead_id: leadId,
+        appointment_datetime: payload.appointment_datetime,
+        duration_minutes: payload.duration_minutes ?? 30,
+        status: "confirmed",
+        source: "ai_receptionist",
+        reason: payload.reason,
+        notes: payload.notes ?? null,
+        caller_name: leadContactName,
+        caller_phone: leadContactPhone ?? payload.contact_phone ?? null,
+      })
+      .select("id, appointment_datetime")
+      .single();
+    if (apptErr || !appt) {
+      Sentry.captureMessage("record_appointment_insert_failed", {
+        level: "error",
+        extra: { businessId: payload.business_id, leadId, error: apptErr?.message },
+      });
+      return {
+        ok: false,
+        status: 500,
+        error: "Could not save the appointment right now.",
+      };
+    }
+    appointmentId = (appt as { id: number }).id;
+  } catch (err: any) {
+    Sentry.captureMessage("record_appointment_insert_threw", {
+      level: "error",
+      extra: { businessId: payload.business_id, leadId, error: err?.message },
+    });
+    return {
+      ok: false,
+      status: 500,
+      error: "Could not save the appointment right now.",
+    };
+  }
+
+  // (5) lead_activities — best-effort per R3. Don't fail the booking on
+  // audit-log failure. Skipped entirely if no lead_id (the row has no
+  // home to attach to in the timeline).
+  if (leadId) {
+    try {
+      await supabase.from("lead_activities").insert({
+        lead_id: leadId,
+        actor_id: null,
+        actor_type: "ai_agent",
+        action: "appointment_booked",
+        metadata: {
+          appointment_id: appointmentId,
+          appointment_datetime: payload.appointment_datetime,
+          reason: payload.reason,
+          duration_minutes: payload.duration_minutes ?? 30,
+          conversation_id: payload.conversation_id,
+          source: "ai_receptionist",
+        },
+      });
+    } catch (err: any) {
+      Sentry.captureException(err, {
+        extra: { route: "record-appointment.lead_activities_insert", appointmentId, leadId },
+      });
+    }
+  }
+
+  return {
+    ok: true,
+    appointmentId,
+    scheduledAt: payload.appointment_datetime,
+    leadId,
+  };
+}
+
+router.post("/leads/record-appointment", async (req: Request, res: Response) => {
+  if (!verifyToolSecret(req)) {
+    res.status(401).json({ success: false, error: "Invalid or missing bearer token" });
+    return;
+  }
+  const supabase = getSupabase();
+  if (!supabase) {
+    res.status(500).json({ success: false, error: "Database not configured" });
+    return;
+  }
+
+  const parsed = parseRecordAppointmentPayload(req.body);
+  if ("error" in parsed) {
+    res.status(400).json({ success: false, error: parsed.error });
+    return;
+  }
+
+  const result = await handleRecordAppointment(supabase, parsed);
+  if (!result.ok) {
+    res.status(result.status).json({ success: false, error: result.error });
+    return;
+  }
+
+  res.json({
+    success: true,
+    appointment_id: result.appointmentId,
+    scheduled_at: result.scheduledAt,
+    lead_id: result.leadId,
+  });
+});
+
 export default router;
