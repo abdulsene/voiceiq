@@ -85,8 +85,42 @@
  * In scope for 1.3: this file + tests/026-place-call-smoke.ts +
  * barrel re-export in outbound-voice/index.ts.
  * Phase 1.4: handleInitiateCall refactor (landed).
- * Phase 1.5a: existingLeadCallId mode (landing in THIS commit).
- * Out of scope: 1.5b worker + cron, 1.6 voicemail, 1.7 dashboard.
+ * Phase 1.5a: existingLeadCallId mode (landed).
+ * Phase 2.1: daily cap enforcement (landing in THIS commit).
+ *
+ * Phase 2.1 — daily cap enforcement:
+ *   business_configs.max_outbound_calls_per_day is now enforced at
+ *   step 3.5 (between compliance and idempotency). Behavior:
+ *     - direction='inbound_bridge': cap is not checked (staff-
+ *       initiated bridges aren't part of automated outreach).
+ *     - cap === 0: kill-switch. Immediate rejection without a count
+ *       query. A tenant setting max=0 in the UI expects calls to
+ *       STOP, not "no cap effective".
+ *     - cap > 0: count outbound_automated lead_calls for THIS
+ *       tenant on the target day (scheduledFor's date if scheduled,
+ *       else today). All statuses count — including 'scheduled',
+ *       'failed', 'completed'. The count is conservative; rare
+ *       end_reason='daily_cap_exceeded' rows count too, but pollution
+ *       is rare at pilot scale.
+ *     - count >= cap: return daily_cap_exceeded with cap, currentCount,
+ *       targetDay surfaced.
+ *
+ *   Race condition: two concurrent placeCall invocations against the
+ *   same tenant can both pass the count check, both INSERT, and end
+ *   up at count+2. We accept the race for 2.1 (pilot scale; cap is a
+ *   soft tenant-set throttle, not a regulatory ceiling). A post-INSERT
+ *   verification fires Sentry "daily_cap_race_observed" when the
+ *   observed count exceeds cap — gives us monitoring data without
+ *   serialization cost. If this fires in production, Phase 2.2/2.3
+ *   promotes to atomic counter (business_configs.outbound_calls_today
+ *   + atomic UPDATE..RETURNING + daily reset cron).
+ *
+ *   Fail-open posture: if the count query errors transiently, we log
+ *   + proceed. Cap is a soft cap (asymmetric to compliance which
+ *   fails-closed for TCPA safety).
+ *
+ * Out of scope: 1.5b worker (landed), 1.6 voicemail (landed),
+ * 1.7 dashboard (landed), 2.2 appointments table, 2.3+ campaigns.
  */
 
 import type { SupabaseClient } from "@supabase/supabase-js";
@@ -189,7 +223,16 @@ export type PlaceCallResponse =
   | { ok: false; reason: "non_nanp_number_no_tz_inference" }
   | { ok: false; reason: "compliance_blocked"; blocked_by: "dnc" | "consent" | "calling_hours"; checks: ComplianceDecision["checks"] }
   | { ok: false; reason: "provider_failed"; provider: CallProvider; providerError: string; twilioCode?: number }
-  | { ok: false; reason: "db_error"; step: string; error: string };
+  | { ok: false; reason: "db_error"; step: string; error: string }
+  /**
+   * Phase 2.1 — tenant's business_configs.max_outbound_calls_per_day
+   * was reached for the target day. `cap` is the tenant's limit,
+   * `currentCount` is the count we observed (zero when cap===0 kill-
+   * switch fires), `targetDay` is the ISO date string the count
+   * applies to (scheduledFor's date when scheduling future, today
+   * otherwise).
+   */
+  | { ok: false; reason: "daily_cap_exceeded"; cap: number; currentCount: number; targetDay: string };
 
 // ── Main entry ──────────────────────────────────────────────────────
 
@@ -218,7 +261,8 @@ function reasonToEndReason(
     | "non_nanp_number_no_tz_inference"
     | "compliance_blocked"
     | "provider_failed"
-    | "db_error",
+    | "db_error"
+    | "daily_cap_exceeded",
 ): string | null {
   switch (reason) {
     case "compliance_blocked":
@@ -233,11 +277,91 @@ function reasonToEndReason(
       return "tenant_outbound_disabled";
     case "non_nanp_number_no_tz_inference":
       return "non_nanp_phone";
+    case "daily_cap_exceeded":
+      // Worker fired and cap was exceeded. Mark terminal — the row
+      // shouldn't be re-picked next tick (cap stays full all day in
+      // most realistic scenarios). Ops can investigate via end_reason.
+      return "daily_cap_exceeded";
     case "provider_failed":
     case "db_error":
     case "staff_ring_number_missing":
     case "caller_id_unresolvable":
       return null;
+  }
+}
+
+/**
+ * Phase 2.1 — count outbound_automated lead_calls for a tenant on the
+ * target day. Used by step 3.5 (cap check) and step 6.5 (post-insert
+ * race detector).
+ *
+ * The "target day" for a scheduled call is scheduledFor's date; for an
+ * immediate call it's today. The count includes ALL statuses — scheduled
+ * rows that will fire on the target day count toward that day's cap, as
+ * do already-placed (initiated|ringing|in_progress|completed|failed)
+ * rows. Conservative: never over-schedule.
+ *
+ * Two parallel queries because the supabase-js builder can't express
+ * `COALESCE(scheduled_for::date, created_at::date) = $target` cleanly.
+ * The two queries are mutually exclusive (one filters scheduled_for IS
+ * NOT NULL within the window, the other IS NULL + created_at within the
+ * window). Sum = total day count.
+ *
+ * Returns { count: number } on success, { count: null, error: string }
+ * on failure. Callers handle fail-open posture themselves.
+ *
+ * TODO(2.4): convert day-window computation to tenant-local timezone.
+ * Pilot scale (EZ Rentals in Eastern) is essentially UTC-aligned; PST
+ * tenants will see cap rollover at 4pm local under UTC math, which is
+ * acceptable for pilot but not for general availability. Pull tenant
+ * tz from a new business_configs.tz column (Phase 2.4) and bound in
+ * tenant-local.
+ */
+async function countOutboundCallsForDay(
+  supabase: SupabaseClient,
+  businessId: string,
+  targetDay: Date,
+): Promise<{ count: number | null; error?: string }> {
+  const dayStart = new Date(Date.UTC(
+    targetDay.getUTCFullYear(),
+    targetDay.getUTCMonth(),
+    targetDay.getUTCDate(),
+  )).toISOString();
+  const dayEnd = new Date(Date.UTC(
+    targetDay.getUTCFullYear(),
+    targetDay.getUTCMonth(),
+    targetDay.getUTCDate() + 1,
+  )).toISOString();
+  try {
+    const [scheduledQ, immediateQ] = await Promise.all([
+      supabase
+        .from("lead_calls")
+        .select("id, leads!inner(business_id)", { count: "exact", head: true })
+        .eq("leads.business_id", businessId)
+        .eq("direction", "outbound_automated")
+        .gte("scheduled_for", dayStart)
+        .lt("scheduled_for", dayEnd),
+      supabase
+        .from("lead_calls")
+        .select("id, leads!inner(business_id)", { count: "exact", head: true })
+        .eq("leads.business_id", businessId)
+        .eq("direction", "outbound_automated")
+        .is("scheduled_for", null)
+        .gte("created_at", dayStart)
+        .lt("created_at", dayEnd),
+    ]);
+    if (scheduledQ.error || immediateQ.error) {
+      return {
+        count: null,
+        error:
+          scheduledQ.error?.message ||
+          immediateQ.error?.message ||
+          "count query returned error",
+      };
+    }
+    return { count: (scheduledQ.count ?? 0) + (immediateQ.count ?? 0) };
+  } catch (err: any) {
+    return { count: null, error: err?.message || String(err) };
   }
 }
 
@@ -332,6 +456,7 @@ async function placeCallCore(
     business_name: string | null;
     twilio_phone_number: string | null;
     elevenlabs_phone_number_id: string | null;
+    max_outbound_calls_per_day: number | null;
   };
   let businessRow: BusinessRow | null = null;
   if (req.direction === "outbound_automated") {
@@ -339,7 +464,7 @@ async function placeCallCore(
       const { data, error } = await supabase
         .from("business_configs")
         .select(
-          "outbound_voice_enabled, outbound_provider, record_outbound_calls, agent_id, business_name, twilio_phone_number, elevenlabs_phone_number_id",
+          "outbound_voice_enabled, outbound_provider, record_outbound_calls, agent_id, business_name, twilio_phone_number, elevenlabs_phone_number_id, max_outbound_calls_per_day",
         )
         .eq("business_id", req.businessId)
         .maybeSingle();
@@ -395,6 +520,65 @@ async function placeCallCore(
         blocked_by: compliance.blocked_by!,
         checks: compliance.checks,
       };
+    }
+
+    // (3.5) Phase 2.1 — daily cap enforcement.
+    // outbound_automated only; inbound_bridge bypasses (staff-initiated
+    // callbacks are not part of automated outreach).
+    //
+    // Order: AFTER compliance, BEFORE idempotency. Compliance is the
+    // more semantically meaningful gate (TCPA exposure); reporting
+    // compliance over cap when both apply matches the "more severe
+    // issue first" intuition.
+    {
+      const cap = businessRow!.max_outbound_calls_per_day;
+      const targetDayDate = req.scheduledFor ?? new Date();
+      const targetDayStr = targetDayDate.toISOString().slice(0, 10);
+
+      // R6 — cap === 0 is a kill-switch (principle of least surprise).
+      // Short-circuit BEFORE the count query so an intentional kill
+      // doesn't incur DB cost on every call attempt.
+      if (cap === 0) {
+        return {
+          ok: false,
+          reason: "daily_cap_exceeded",
+          cap: 0,
+          currentCount: 0,
+          targetDay: targetDayStr,
+        };
+      }
+
+      // cap > 0 path — count outbound_automated lead_calls for the
+      // target day. NULL cap is treated as "no cap" — fall through.
+      if (cap !== null && cap > 0) {
+        const { count: dayCount, error: countErr } = await countOutboundCallsForDay(
+          supabase,
+          req.businessId,
+          targetDayDate,
+        );
+        if (countErr || dayCount === null) {
+          // Fail-open: log + proceed. Cap is a soft tenant-set throttle,
+          // not a TCPA regulatory ceiling. A flaky count query should
+          // not drop calls. (Asymmetric to compliance which fails-closed
+          // because TCPA exposure is real.)
+          Sentry.captureMessage("daily_cap_count_query_failed", {
+            level: "warning",
+            extra: {
+              businessId: req.businessId,
+              error: countErr,
+              targetDay: targetDayStr,
+            },
+          });
+        } else if (dayCount >= cap) {
+          return {
+            ok: false,
+            reason: "daily_cap_exceeded",
+            cap,
+            currentCount: dayCount,
+            targetDay: targetDayStr,
+          };
+        }
+      }
     }
   }
 
@@ -511,6 +695,49 @@ async function placeCallCore(
     } catch (err: any) {
       return { ok: false, reason: "db_error", step: "pre_insert", error: err?.message || String(err) };
     }
+  }
+
+  // (6.5) Phase 2.1 — post-insert race detector for the daily cap.
+  // Re-runs the count query AFTER the row is in lead_calls. If the
+  // observed count exceeds cap, two concurrent placeCall invocations
+  // raced past the pre-insert check. Fire a Sentry warning so we have
+  // production monitoring data — if this fires regularly, Phase 2.2/2.3
+  // promotes to an atomic counter. Observability only; we don't roll
+  // back the INSERT.
+  //
+  // Skipped for inbound_bridge (no cap) and for existingLeadCallId mode
+  // (worker fired an already-counted scheduled row; no fresh INSERT
+  // happened here).
+  if (
+    req.direction === "outbound_automated" &&
+    !req.existingLeadCallId &&
+    businessRow !== null &&
+    businessRow.max_outbound_calls_per_day !== null &&
+    businessRow.max_outbound_calls_per_day > 0
+  ) {
+    const cap = businessRow.max_outbound_calls_per_day;
+    const targetDayDate = req.scheduledFor ?? new Date();
+    const { count: observedCount, error: raceErr } = await countOutboundCallsForDay(
+      supabase,
+      req.businessId,
+      targetDayDate,
+    );
+    if (!raceErr && observedCount !== null && observedCount > cap) {
+      Sentry.captureMessage("daily_cap_race_observed", {
+        level: "warning",
+        extra: {
+          businessId: req.businessId,
+          cap,
+          observedCount,
+          targetDay: targetDayDate.toISOString().slice(0, 10),
+          leadCallId,
+        },
+      });
+    }
+    // raceErr we don't surface — the cap check already passed and we're
+    // not going to refuse a placed call because the verification query
+    // flaked. Sentry already captured the original count-query error if
+    // there was one.
   }
 
   // (7) Defer placement when scheduled in the future.

@@ -1,5 +1,6 @@
 /**
- * Phase 1.3 — place-call.ts smoke. 20 cases (18 from 1.3 + T19/T20 from 1.5a).
+ * Phase 1.3 — place-call.ts smoke. 28 cases.
+ * 18 from 1.3 + T19/T20 from 1.5a + T21-T28 from 2.1 (daily cap).
  *
  * Happy paths (4):
  *   T1  inbound_bridge immediate placement
@@ -37,6 +38,16 @@
  *   T19 worker-locked row succeeds — no INSERT, UPDATE call_sid + status='initiated' + started_at
  *   T20 worker-locked row hits DNC at fire time — wrapper UPDATEs row to failed + compliance_blocked
  *
+ * Phase 2.1 — daily cap enforcement (8):
+ *   T21 cap=100, today=50 → placeCall proceeds (under cap)
+ *   T22 cap=100, today=100 → daily_cap_exceeded with cap+currentCount+targetDay
+ *   T23 cap=100, today=99 → placeCall proceeds (boundary; >= cap, not > cap)
+ *   T24 inbound_bridge with cap=0 → placeCall proceeds (cap NOT checked for bridge)
+ *   T25 cap=100, today=100 but scheduledFor=tomorrow (tomorrow=50) → proceeds (target-day count)
+ *   T26 existingLeadCallId + cap=100 + count=100 → daily_cap_exceeded + wrapper UPDATEs row terminal
+ *   T27 cap=100, count query errors → fail-open + Sentry, placeCall proceeds
+ *   T28 cap=0 kill-switch → daily_cap_exceeded WITHOUT running the count query (short-circuit)
+ *
  * Strategy: FakeSupabaseClient with .from(...).select(...).eq(...).maybeSingle()
  * + .insert(...).select(...).single() + .update(...).eq(...) chains.
  * Provider mocked via injection into getProvider's options (test stub).
@@ -70,23 +81,40 @@ type FakeCall = {
   eqFilters: Array<{ column: string; value: any }>;
   isFilters: Array<{ column: string; value: any }>;
   notFilters: Array<{ column: string; op: string; value: any }>;
+  // Phase 2.1 — daily cap count queries use .gte/.lt for date windows.
+  gteFilters: Array<{ column: string; value: any }>;
+  ltFilters: Array<{ column: string; value: any }>;
+  // Phase 2.1 — count mode + head-only (no rows) for the cap count query:
+  //   .select(cols, { count: "exact", head: true })
+  countMode?: "exact" | "planned" | "estimated";
+  headMode?: boolean;
   payload?: any;
 };
 type FakeResponse = {
   match: (call: FakeCall) => boolean;
   data?: any;
+  // Phase 2.1 — count value returned when the SELECT was in count mode.
+  count?: number | null;
   error?: { message: string } | null;
 };
 
 class FakeBuilder {
   constructor(private fake: FakeSupabaseClient, private call: FakeCall) {}
-  select(cols: string) { this.call.selectColumns = cols; return this; }
+  // .select(cols) OR .select(cols, { count, head }) — supabase-js overloads.
+  select(cols: string, opts?: { count?: "exact" | "planned" | "estimated"; head?: boolean }) {
+    this.call.selectColumns = cols;
+    if (opts?.count) this.call.countMode = opts.count;
+    if (opts?.head) this.call.headMode = opts.head;
+    return this;
+  }
   insert(payload: any) { this.call.op = "insert"; this.call.payload = payload; return this; }
   update(payload: any) { this.call.op = "update"; this.call.payload = payload; return this; }
   eq(c: string, v: any) { this.call.eqFilters.push({ column: c, value: v }); return this; }
   is(c: string, v: any) { this.call.isFilters.push({ column: c, value: v }); return this; }
   neq(c: string, v: any) { this.call.notFilters.push({ column: c, op: "neq", value: v }); return this; }
   not(c: string, op: string, v: any) { this.call.notFilters.push({ column: c, op, value: v }); return this; }
+  gte(c: string, v: any) { this.call.gteFilters.push({ column: c, value: v }); return this; }
+  lt(c: string, v: any) { this.call.ltFilters.push({ column: c, value: v }); return this; }
   order() { return this; }
   limit() { return this; }
   async maybeSingle() { return this.fake.resolveCall(this.call); }
@@ -109,14 +137,20 @@ class FakeSupabaseClient {
       eqFilters: [],
       isFilters: [],
       notFilters: [],
+      gteFilters: [],
+      ltFilters: [],
     };
     this.calls.push(call);
     return new FakeBuilder(this, call);
   }
   async resolveCall(call: FakeCall) {
     const r = this.responses.find((rr) => rr.match(call));
-    if (!r) return { data: null, error: null };
-    return { data: r.data ?? null, error: r.error ?? null };
+    if (!r) return { data: null, count: null, error: null };
+    return {
+      data: r.data ?? null,
+      count: r.count ?? null,
+      error: r.error ?? null,
+    };
   }
   // auditLog uses (supabase as any).from("audit_logs") — implemented above.
   // Stub auth.admin.getUserById for any code path that needs it (not used here).
@@ -173,6 +207,8 @@ interface BizConfigOverrides {
   hoursStart?: string;
   hoursEnd?: string;
   hoursDays?: number[];
+  // Phase 2.1 — tenant daily cap. null = no cap. 0 = kill-switch.
+  maxOutboundCallsPerDay?: number | null;
 }
 
 function bizConfigDataForCompliance(o: BizConfigOverrides = {}) {
@@ -192,6 +228,9 @@ function bizConfigDataForPlaceCall(o: BizConfigOverrides = {}) {
     business_name: "T026 Biz",
     twilio_phone_number: o.twilioPhone ?? "+14155556677",
     elevenlabs_phone_number_id: o.elevenlabsPhoneNumberId ?? "phnum_test_026",
+    // Phase 2.1 — daily cap. null = no cap (existing tests pre-2.1).
+    max_outbound_calls_per_day:
+      o.maxOutboundCallsPerDay === undefined ? null : o.maxOutboundCallsPerDay,
   };
 }
 
@@ -852,6 +891,364 @@ async function T20() {
   record("T20 existingLeadCallId compliance-blocked", failures.length === 0, failures.join("; ") || "compliance_blocked + row UPDATEd to failed/compliance_blocked");
 }
 
+// ── Phase 2.1: daily cap enforcement (T21-T28) ───────────────────────
+
+// Helper — stage the parallel scheduled/immediate count-query responses
+// for a given target day. Matches on countMode + headMode + gte filter
+// column to disambiguate "scheduled_for window query" from "created_at
+// window query" and to support T25's today-vs-tomorrow distinction.
+function stageCapCount(
+  fake: FakeSupabaseClient,
+  targetDay: Date,
+  opts: { scheduledCount: number; immediateCount: number; error?: { message: string } },
+) {
+  const dayStart = new Date(Date.UTC(
+    targetDay.getUTCFullYear(),
+    targetDay.getUTCMonth(),
+    targetDay.getUTCDate(),
+  )).toISOString();
+  // Scheduled-rows query: gte("scheduled_for", dayStart)
+  fake.on(
+    (c) =>
+      c.op === "select" &&
+      c.table === "lead_calls" &&
+      c.countMode === "exact" &&
+      c.headMode === true &&
+      c.gteFilters.some((f) => f.column === "scheduled_for" && f.value === dayStart),
+    opts.error
+      ? { data: null, count: null, error: opts.error }
+      : { data: null, count: opts.scheduledCount },
+  );
+  // Immediate-rows query: is("scheduled_for", null) + gte("created_at", dayStart)
+  fake.on(
+    (c) =>
+      c.op === "select" &&
+      c.table === "lead_calls" &&
+      c.countMode === "exact" &&
+      c.headMode === true &&
+      c.gteFilters.some((f) => f.column === "created_at" && f.value === dayStart),
+    opts.error
+      ? { data: null, count: null, error: opts.error }
+      : { data: null, count: opts.immediateCount },
+  );
+}
+
+async function T21() {
+  // cap=100, current=50 → proceeds normally.
+  placeCallInvocations.length = 0;
+  providerShouldFail = null;
+  const fake = new FakeSupabaseClient();
+  setupSuccessfulOutboundFake(fake);
+  // Override the bizConfigForPlaceCall response so it carries a cap of 100.
+  fake.responses.unshift({
+    match: (c) =>
+      c.op === "select" &&
+      c.table === "business_configs" &&
+      c.selectColumns.includes("outbound_provider"),
+    data: bizConfigDataForPlaceCall({ maxOutboundCallsPerDay: 100 }),
+  });
+  stageCapCount(fake, new Date(), { scheduledCount: 20, immediateCount: 30 });  // total 50
+
+  const r = await placeCall(asClient(fake), {
+    businessId: BIZ,
+    leadId: LEAD,
+    direction: "outbound_automated",
+    callObjective: "appointment_reminder",
+  });
+  const failures: string[] = [];
+  if (!r.ok) failures.push(`!ok: ${JSON.stringify(r)}`);
+  if (r.ok && r.status !== "placed") failures.push(`status=${r.status}`);
+  record("T21 cap=100, under cap → proceeds", failures.length === 0, failures.join("; ") || "placed normally with cap=100 count=50");
+}
+
+async function T22() {
+  // cap=100, current=100 → daily_cap_exceeded.
+  placeCallInvocations.length = 0;
+  providerShouldFail = null;
+  const fake = new FakeSupabaseClient();
+  setupSuccessfulOutboundFake(fake);
+  fake.responses.unshift({
+    match: (c) =>
+      c.op === "select" &&
+      c.table === "business_configs" &&
+      c.selectColumns.includes("outbound_provider"),
+    data: bizConfigDataForPlaceCall({ maxOutboundCallsPerDay: 100 }),
+  });
+  stageCapCount(fake, new Date(), { scheduledCount: 50, immediateCount: 50 });  // total 100
+
+  const r = await placeCall(asClient(fake), {
+    businessId: BIZ,
+    leadId: LEAD,
+    direction: "outbound_automated",
+    callObjective: "appointment_reminder",
+  });
+  const failures: string[] = [];
+  if (r.ok) failures.push("ok=true unexpectedly");
+  if (!r.ok) {
+    if (r.reason !== "daily_cap_exceeded") failures.push(`reason=${r.reason}`);
+    if (r.reason === "daily_cap_exceeded") {
+      if (r.cap !== 100) failures.push(`cap=${r.cap}`);
+      if (r.currentCount !== 100) failures.push(`currentCount=${r.currentCount}`);
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(r.targetDay)) failures.push(`targetDay=${r.targetDay}`);
+    }
+  }
+  // Provider must NOT be invoked when cap blocks.
+  if (placeCallInvocations.length !== 0) failures.push(`provider invoked ${placeCallInvocations.length}x on cap`);
+  // No INSERT either.
+  const inserts = fake.calls.filter((c) => c.op === "insert" && c.table === "lead_calls");
+  if (inserts.length !== 0) failures.push(`${inserts.length} unexpected lead_calls INSERTs`);
+  record("T22 cap=100, hit → daily_cap_exceeded", failures.length === 0, failures.join("; ") || "daily_cap_exceeded, cap=100, currentCount=100, targetDay set");
+}
+
+async function T23() {
+  // cap=100, current=99 → boundary, proceeds (>= cap, not > cap).
+  placeCallInvocations.length = 0;
+  providerShouldFail = null;
+  const fake = new FakeSupabaseClient();
+  setupSuccessfulOutboundFake(fake);
+  fake.responses.unshift({
+    match: (c) =>
+      c.op === "select" &&
+      c.table === "business_configs" &&
+      c.selectColumns.includes("outbound_provider"),
+    data: bizConfigDataForPlaceCall({ maxOutboundCallsPerDay: 100 }),
+  });
+  stageCapCount(fake, new Date(), { scheduledCount: 50, immediateCount: 49 });  // total 99
+
+  const r = await placeCall(asClient(fake), {
+    businessId: BIZ,
+    leadId: LEAD,
+    direction: "outbound_automated",
+    callObjective: "appointment_reminder",
+  });
+  const failures: string[] = [];
+  if (!r.ok) failures.push(`!ok: ${JSON.stringify(r)}`);
+  if (r.ok && r.status !== "placed") failures.push(`status=${r.status}`);
+  record("T23 cap=100, boundary count=99 → proceeds", failures.length === 0, failures.join("; ") || "placed at count=99 (99 < 100)");
+}
+
+async function T24() {
+  // inbound_bridge bypasses the cap entirely. cap=0 would normally kill;
+  // here we set cap=0 on the BIZ but use direction='inbound_bridge'.
+  // outbound_automated would short-circuit; inbound_bridge skips the
+  // whole step 3 block including cap.
+  placeCallInvocations.length = 0;
+  providerShouldFail = null;
+  const fake = new FakeSupabaseClient();
+  // Bridge needs: lead lookup + caller-ID lookup + insert + activity + audit.
+  fake.on((c) => c.op === "select" && c.table === "leads", {
+    data: { id: LEAD, business_id: BIZ, contact_phone: PHONE, reason: "T24" },
+  });
+  // resolveOutboundCallerId queries business_configs for phone_number.
+  fake.on(
+    (c) => c.op === "select" && c.table === "business_configs" && c.selectColumns.includes("phone_number"),
+    { data: { business_id: BIZ, phone_number: "+14155551111", twilio_phone_number: "+14155556677" } },
+  );
+  fake.on((c) => c.op === "insert" && c.table === "lead_calls", { data: { id: "lc_t24" } });
+  fake.on((c) => c.op === "update" && c.table === "lead_calls", { data: null });
+  fake.on((c) => c.op === "insert" && c.table === "lead_activities", { data: null });
+  fake.on((c) => c.op === "insert" && c.table === "audit_logs", { data: null });
+
+  const r = await placeCall(asClient(fake), {
+    businessId: BIZ,
+    leadId: LEAD,
+    direction: "inbound_bridge",
+    staffUserId: STAFF,
+    staffRingNumber: "+14105557777",
+  });
+  const failures: string[] = [];
+  if (!r.ok) failures.push(`!ok: ${JSON.stringify(r)}`);
+  if (r.ok && r.status !== "placed") failures.push(`status=${r.status}`);
+  // The whole outbound step 3 block (which contains the cap check)
+  // shouldn't have run — no count query should appear in fake.calls.
+  const countQueries = fake.calls.filter(
+    (c) => c.op === "select" && c.table === "lead_calls" && c.countMode === "exact",
+  );
+  if (countQueries.length !== 0) failures.push(`${countQueries.length} unexpected count queries on inbound_bridge`);
+  record("T24 inbound_bridge bypasses cap entirely", failures.length === 0, failures.join("; ") || "inbound_bridge placed, no count query ran");
+}
+
+async function T25() {
+  // Today's count is at cap (100), tomorrow's count is 50.
+  // scheduledFor=tomorrow → cap check queries tomorrow's count → proceeds.
+  placeCallInvocations.length = 0;
+  providerShouldFail = null;
+  const fake = new FakeSupabaseClient();
+  const tomorrow = new Date(Date.now() + 24 * 60 * 60 * 1000);
+  setupSuccessfulOutboundFake(fake, { scheduledFor: tomorrow });
+  fake.responses.unshift({
+    match: (c) =>
+      c.op === "select" &&
+      c.table === "business_configs" &&
+      c.selectColumns.includes("outbound_provider"),
+    data: bizConfigDataForPlaceCall({ maxOutboundCallsPerDay: 100 }),
+  });
+  // Today is FULL.
+  stageCapCount(fake, new Date(), { scheduledCount: 50, immediateCount: 50 });
+  // Tomorrow has 50.
+  stageCapCount(fake, tomorrow, { scheduledCount: 25, immediateCount: 25 });
+
+  const r = await placeCall(asClient(fake), {
+    businessId: BIZ,
+    leadId: LEAD,
+    direction: "outbound_automated",
+    callObjective: "appointment_reminder",
+    scheduledFor: tomorrow,
+  });
+  const failures: string[] = [];
+  if (!r.ok) failures.push(`!ok: ${JSON.stringify(r)}`);
+  if (r.ok && r.status !== "scheduled") failures.push(`status=${r.status}`);
+  // Confirm we queried tomorrow's window, not today's.
+  const tomorrowStart = new Date(Date.UTC(
+    tomorrow.getUTCFullYear(), tomorrow.getUTCMonth(), tomorrow.getUTCDate(),
+  )).toISOString();
+  const queriedTomorrow = fake.calls.some(
+    (c) =>
+      c.op === "select" &&
+      c.table === "lead_calls" &&
+      c.countMode === "exact" &&
+      c.gteFilters.some((f) => f.column === "scheduled_for" && f.value === tomorrowStart),
+  );
+  if (!queriedTomorrow) failures.push("did not query tomorrow's day window");
+  record("T25 scheduledFor=tomorrow counts tomorrow's cap, not today's", failures.length === 0, failures.join("; ") || "queried tomorrow's window, placed at count=50");
+}
+
+async function T26() {
+  // existingLeadCallId + cap exceeded at fire time → wrapper UPDATEs the
+  // existing row to status='failed' end_reason='daily_cap_exceeded'.
+  placeCallInvocations.length = 0;
+  providerShouldFail = null;
+  const fake = new FakeSupabaseClient();
+  fake.on((c) => c.op === "select" && c.table === "leads", {
+    data: { id: LEAD, business_id: BIZ, contact_phone: PHONE, reason: "T26" },
+  });
+  fake.on(
+    (c) => c.op === "select" && c.table === "business_configs" && c.selectColumns.includes("outbound_provider"),
+    { data: bizConfigDataForPlaceCall({ maxOutboundCallsPerDay: 100 }) },
+  );
+  fake.on(
+    (c) => c.op === "select" && c.table === "business_configs" && c.selectColumns.includes("outbound_calling_hours_start"),
+    { data: bizConfigDataForCompliance() },
+  );
+  fake.on(
+    (c) => c.op === "select" && c.table === "business_configs" && c.selectColumns.includes("voice_consent_default"),
+    { data: { voice_consent_default: true } },
+  );
+  fake.on((c) => c.op === "select" && c.table === "dnc_list", { data: null });
+  fake.on((c) => c.op === "select" && c.table === "voice_consent_records", { data: null });
+  // Cap is FULL.
+  stageCapCount(fake, new Date(), { scheduledCount: 50, immediateCount: 50 });
+  // Wrapper UPDATE to terminal failed.
+  fake.on(
+    (c) => c.op === "update" && c.table === "lead_calls" && c.payload?.status === "failed",
+    { data: null },
+  );
+
+  const r = await placeCall(asClient(fake), {
+    businessId: BIZ,
+    leadId: LEAD,
+    direction: "outbound_automated",
+    callObjective: "appointment_reminder",
+    existingLeadCallId: "lc_existing_t26",
+  });
+  const failures: string[] = [];
+  if (r.ok) failures.push("ok=true unexpectedly");
+  if (!r.ok && r.reason !== "daily_cap_exceeded") failures.push(`reason=${r.reason}`);
+  // Wrapper terminal UPDATE with end_reason='daily_cap_exceeded'.
+  const terminal = fake.calls.find(
+    (c) =>
+      c.op === "update" &&
+      c.table === "lead_calls" &&
+      c.payload?.status === "failed" &&
+      c.payload?.end_reason === "daily_cap_exceeded" &&
+      c.eqFilters.some((f) => f.column === "id" && f.value === "lc_existing_t26"),
+  );
+  if (!terminal) failures.push("missing wrapper UPDATE status=failed/end_reason=daily_cap_exceeded");
+  // Provider not invoked.
+  if (placeCallInvocations.length !== 0) failures.push(`provider invoked ${placeCallInvocations.length}x on cap`);
+  record("T26 existingLeadCallId + cap exceeded → wrapper terminalizes row", failures.length === 0, failures.join("; ") || "daily_cap_exceeded + row UPDATEd to failed/daily_cap_exceeded");
+}
+
+async function T27() {
+  // Count query errors → fail-open. Sentry fires; placeCall proceeds.
+  placeCallInvocations.length = 0;
+  providerShouldFail = null;
+  const fake = new FakeSupabaseClient();
+  setupSuccessfulOutboundFake(fake);
+  fake.responses.unshift({
+    match: (c) =>
+      c.op === "select" &&
+      c.table === "business_configs" &&
+      c.selectColumns.includes("outbound_provider"),
+    data: bizConfigDataForPlaceCall({ maxOutboundCallsPerDay: 100 }),
+  });
+  // Stage cap count to return an error from both parallel queries.
+  stageCapCount(fake, new Date(), {
+    scheduledCount: 0,
+    immediateCount: 0,
+    error: { message: "transient" },
+  });
+
+  const r = await placeCall(asClient(fake), {
+    businessId: BIZ,
+    leadId: LEAD,
+    direction: "outbound_automated",
+    callObjective: "appointment_reminder",
+  });
+  const failures: string[] = [];
+  if (!r.ok) failures.push(`!ok: ${JSON.stringify(r)} — expected fail-open`);
+  if (r.ok && r.status !== "placed") failures.push(`status=${r.status}`);
+  // The provider WAS invoked — fail-open path proceeded all the way.
+  if (placeCallInvocations.length !== 1) failures.push(`provider invoked ${placeCallInvocations.length}x (expected 1 on fail-open)`);
+  record("T27 count query errors → fail-open + proceeds", failures.length === 0, failures.join("; ") || "fail-open, placed normally");
+}
+
+async function T28() {
+  // cap=0 kill-switch — short-circuits BEFORE the count query.
+  placeCallInvocations.length = 0;
+  providerShouldFail = null;
+  const fake = new FakeSupabaseClient();
+  fake.on((c) => c.op === "select" && c.table === "leads", {
+    data: { id: LEAD, business_id: BIZ, contact_phone: PHONE, reason: "T28" },
+  });
+  fake.on(
+    (c) => c.op === "select" && c.table === "business_configs" && c.selectColumns.includes("outbound_provider"),
+    { data: bizConfigDataForPlaceCall({ maxOutboundCallsPerDay: 0 }) },
+  );
+  fake.on(
+    (c) => c.op === "select" && c.table === "business_configs" && c.selectColumns.includes("outbound_calling_hours_start"),
+    { data: bizConfigDataForCompliance() },
+  );
+  fake.on(
+    (c) => c.op === "select" && c.table === "business_configs" && c.selectColumns.includes("voice_consent_default"),
+    { data: { voice_consent_default: true } },
+  );
+  fake.on((c) => c.op === "select" && c.table === "dnc_list", { data: null });
+  fake.on((c) => c.op === "select" && c.table === "voice_consent_records", { data: null });
+  // DO NOT stage cap count — verifying it's never invoked.
+
+  const r = await placeCall(asClient(fake), {
+    businessId: BIZ,
+    leadId: LEAD,
+    direction: "outbound_automated",
+    callObjective: "appointment_reminder",
+  });
+  const failures: string[] = [];
+  if (r.ok) failures.push("ok=true unexpectedly");
+  if (!r.ok && r.reason !== "daily_cap_exceeded") failures.push(`reason=${r.reason}`);
+  if (!r.ok && r.reason === "daily_cap_exceeded") {
+    if (r.cap !== 0) failures.push(`cap=${r.cap}`);
+    if (r.currentCount !== 0) failures.push(`currentCount=${r.currentCount}`);
+  }
+  // The R6 kill-switch must short-circuit BEFORE the count query runs.
+  const countQueries = fake.calls.filter(
+    (c) => c.op === "select" && c.table === "lead_calls" && c.countMode === "exact",
+  );
+  if (countQueries.length !== 0) failures.push(`${countQueries.length} unexpected count queries (kill-switch should short-circuit)`);
+  if (placeCallInvocations.length !== 0) failures.push(`provider invoked ${placeCallInvocations.length}x on kill-switch`);
+  record("T28 cap=0 kill-switch short-circuits", failures.length === 0, failures.join("; ") || "daily_cap_exceeded, cap=0, no count query ran");
+}
+
 async function main() {
   await T1();
   await T2();
@@ -873,6 +1270,14 @@ async function main() {
   await T18();
   await T19();
   await T20();
+  await T21();
+  await T22();
+  await T23();
+  await T24();
+  await T25();
+  await T26();
+  await T27();
+  await T28();
 
   // Restore for cleanliness.
   __setProviderFactoryForTesting(null);
