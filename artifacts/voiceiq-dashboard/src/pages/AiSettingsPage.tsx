@@ -28,6 +28,7 @@ import { Link } from "wouter";
 import { ArrowLeft } from "lucide-react";
 
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { useTabQueryState } from "@/hooks/use-tab-query-state";
 
 import VoiceTab from "./AiSettings/VoiceTab";
 import PromptEditor from "./AiSettings/PromptEditor";
@@ -39,19 +40,15 @@ import HistoryViewer from "./AiSettings/HistoryViewer";
 // it sits before History but after the foundational Voice + Prompt tabs.
 type TabKey = "voice" | "prompt" | "transfer" | "history";
 
+const AI_SETTINGS_TABS = ["voice", "prompt", "transfer", "history"] as const;
+
 export default function AiSettingsPage() {
   const [toast, setToast] = useState<{ text: string; kind: "ok" | "err" } | null>(null);
-  // Controlled Tabs so we can hoist the active tab if we ever need to
-  // intercept switches. Tab-switch confirmation was cut from scope —
-  // beforeunload is the only guard for dirty prompt edits.
-  // Initial tab honors a ?tab= query param so deep links can land the
-  // customer directly on the relevant tab. Lazy initializer so
-  // window.location is only read once on mount.
-  const [tab, setTab] = useState<TabKey>(() => {
-    const params = new URLSearchParams(window.location.search);
-    const t = params.get("tab");
-    return t === "voice" || t === "prompt" || t === "transfer" || t === "history" ? t : "voice";
-  });
+  // Phase 2.7b: switched from a one-way ?tab= read-on-mount to the
+  // shared useTabQueryState hook so tab clicks now replaceState back
+  // into the URL — reload-resilient and back/forward-aware. Same
+  // external behavior; URL now stays in sync.
+  const [tab, setTab] = useTabQueryState<TabKey>(AI_SETTINGS_TABS, "voice");
 
   function showToast(text: string, kind: "ok" | "err"): void {
     setToast({ text, kind });

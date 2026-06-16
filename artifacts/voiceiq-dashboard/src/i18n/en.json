@@ -547,6 +547,10 @@
     "detail": {
       "backToList": "Back to campaigns",
       "namePlaceholder": "Campaign name",
+      "tabs": {
+        "editor": "Editor",
+        "reporting": "Reporting"
+      },
       "basic": {
         "title": "Basic info",
         "objective": "Call objective",
@@ -721,6 +725,70 @@
           "colWhen": "Scheduled for",
           "noMatches": "No sample leads have a resolvable scheduled time yet. Add a segment that matches leads with confirmed appointments."
         }
+      }
+    },
+    "reporting": {
+      "refresh": "Refresh",
+      "retry": "Retry",
+      "lastUpdated": "Updated {{when}}",
+      "counters": {
+        "target": "Target",
+        "pending": "Pending",
+        "scheduled": "Scheduled",
+        "completed": "Completed",
+        "succeeded": "Succeeded",
+        "failed": "Failed",
+        "voicemail": "Voicemail",
+        "skipped": "Skipped"
+      },
+      "rates": {
+        "connect": "Connect rate",
+        "connect_tooltip": "Successful calls ÷ (Completed − Voicemail). A voicemail counts as a delivery, not a conversation.",
+        "voicemail": "Voicemail rate",
+        "voicemail_tooltip": "Voicemail-left ÷ Completed.",
+        "skip": "Skip rate",
+        "skip_tooltip": "Skipped ÷ Target.",
+        "completion": "Completion rate",
+        "completion_tooltip": "Completed ÷ Scheduled."
+      },
+      "charts": {
+        "timeSeries": {
+          "title": "Call activity (last 30 days)",
+          "empty": "No call activity in the last 30 days."
+        },
+        "distribution": {
+          "title": "State distribution",
+          "empty": "No leads have been processed for this campaign yet.",
+          "totalLabel": "Total"
+        },
+        "skipPareto": {
+          "title": "Top skip reasons",
+          "empty": "No skipped leads — every targeted lead was processed.",
+          "countLabel": "Count"
+        }
+      },
+      "activity": {
+        "title": "Recent activity",
+        "empty": "No leads have been processed for this campaign yet.",
+        "filterState": "Filter by state",
+        "filterSkipReason": "Filter by skip reason",
+        "allStates": "All states",
+        "allReasons": "All reasons",
+        "loadMore": "Load more",
+        "showing": "Showing {{shown}} of {{total}}",
+        "col": {
+          "lead": "Lead",
+          "phone": "Phone",
+          "state": "State",
+          "skipReason": "Skip reason",
+          "scheduledFor": "Scheduled for"
+        }
+      },
+      "export": {
+        "button": "Export CSV",
+        "loading": "Exporting…",
+        "capped": "Export capped at 2000 rows. Contact support for larger exports.",
+        "failed": "Export failed. Try again."
       }
     }
   },

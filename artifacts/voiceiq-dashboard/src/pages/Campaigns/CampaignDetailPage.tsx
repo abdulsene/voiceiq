@@ -1,9 +1,13 @@
 /**
- * Phase 2.6b — Campaign detail/edit page.
+ * Phase 2.6b — Campaign detail/edit page. Phase 2.7b — wrapped in
+ * Tabs (Editor / Reporting). Editor tab keeps the original 2.6b
+ * editing layout (basic info → segment → schedule → limits → footer);
+ * Materialization counters + Recent activity moved out to the
+ * Reporting tab where they belong alongside the charts.
  *
- * Flat scroll layout: basic info → segment (SegmentBuilder) → schedule
- * (ScheduleBuilder) → limits → materialization counters → activity
- * table → footer actions.
+ * Tab state synced to ?tab=… via useTabQueryState (shared with
+ * AiSettingsPage as of 2.7b). Default tab is "editor" so deep links
+ * to /campaigns/:id without ?tab= land on the form.
  *
  * Live-preview integration: SegmentPreview triggers the debounced POST
  * to /api/business/campaigns/preview and reports the response upward
@@ -18,7 +22,7 @@
  * success toast.
  */
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useLocation, Link } from "wouter";
 import {
@@ -43,6 +47,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import {
   Dialog,
@@ -65,7 +70,12 @@ import {
   defaultBulkSchedule,
   type ScheduleDefinition,
 } from "@/components/ScheduleBuilder";
+import { useTabQueryState } from "@/hooks/use-tab-query-state";
 import { fetchApi } from "@/lib/api";
+import ReportingTab from "./ReportingTab";
+
+type CampaignTab = "editor" | "reporting";
+const CAMPAIGN_TABS = ["editor", "reporting"] as const;
 
 interface Campaign {
   id: string;
@@ -97,25 +107,11 @@ interface CampaignDetailPageProps {
 const OBJECTIVES = ["appointment_reminder", "winback", "follow_up", "review_request", "general"];
 const STATUSES = ["draft", "queued", "active", "paused", "completed", "cancelled"];
 
-function fmtRelative(iso: string | null, t: (k: string, opts?: Record<string, unknown>) => string): string {
-  if (!iso) return "—";
-  const then = new Date(iso).getTime();
-  if (Number.isNaN(then)) return "—";
-  const diffSec = Math.round((Date.now() - then) / 1000);
-  if (diffSec < 60) return t("leads.relative.justNow");
-  const min = Math.round(diffSec / 60);
-  if (min < 60) return t("leads.relative.minutesAgo", { count: min });
-  const hr = Math.round(min / 60);
-  if (hr < 24) return t("leads.relative.hoursAgo", { count: hr });
-  const day = Math.round(hr / 24);
-  if (day < 30) return t("leads.relative.daysAgo", { count: day });
-  const mo = Math.round(day / 30);
-  return t("leads.relative.monthsAgo", { count: mo });
-}
-
 export default function CampaignDetailPage({ campaignId }: CampaignDetailPageProps) {
   const { t } = useTranslation();
   const [, setLocation] = useLocation();
+
+  const [tab, setTab] = useTabQueryState<CampaignTab>(CAMPAIGN_TABS, "editor");
 
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -138,13 +134,6 @@ export default function CampaignDetailPage({ campaignId }: CampaignDetailPagePro
   const [saveError, setSaveError] = useState<string | null>(null);
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [deleting, setDeleting] = useState(false);
-
-  // Activity table state.
-  const [leadsRows, setLeadsRows] = useState<any[]>([]);
-  const [leadsTotal, setLeadsTotal] = useState(0);
-  const [leadsOffset, setLeadsOffset] = useState(0);
-  const [leadsLoading, setLeadsLoading] = useState(false);
-  const LEADS_PAGE = 20;
 
   const fetchSeqRef = useRef(0);
 
@@ -178,32 +167,6 @@ export default function CampaignDetailPage({ campaignId }: CampaignDetailPagePro
     })();
     return () => { cancelled = true; };
   }, [campaignId]);
-
-  // ── Load campaign-leads (activity) ────────────────────────────────
-  useEffect(() => {
-    let cancelled = false;
-    setLeadsLoading(true);
-    (async () => {
-      try {
-        const p = new URLSearchParams();
-        p.set("offset", String(leadsOffset));
-        p.set("limit", String(LEADS_PAGE));
-        const data = (await fetchApi(`/business/campaigns/${campaignId}/leads?${p.toString()}`)) as {
-          rows: any[];
-          total: number;
-        };
-        if (cancelled) return;
-        setLeadsRows(data.rows || []);
-        setLeadsTotal(data.total ?? 0);
-      } catch {
-        if (cancelled) return;
-        // Non-fatal — leave previous state.
-      } finally {
-        if (!cancelled) setLeadsLoading(false);
-      }
-    })();
-    return () => { cancelled = true; };
-  }, [campaignId, leadsOffset]);
 
   // ── Save (PATCH) ──────────────────────────────────────────────────
   async function handleSave() {
@@ -280,19 +243,6 @@ export default function CampaignDetailPage({ campaignId }: CampaignDetailPagePro
     }
   }
 
-  // ── Computed ──────────────────────────────────────────────────────
-  const counters = useMemo(() => {
-    if (!original) return null;
-    return [
-      { key: "target", value: original.target_count ?? 0 },
-      { key: "scheduled", value: original.scheduled_count ?? 0 },
-      { key: "completed", value: original.completed_count ?? 0 },
-      { key: "succeeded", value: original.succeeded_count ?? 0 },
-      { key: "failed", value: original.failed_count ?? 0 },
-      { key: "voicemail", value: original.voicemail_count ?? 0 },
-    ];
-  }, [original]);
-
   if (loading) {
     return (
       <div className="max-w-5xl mx-auto p-6 space-y-4">
@@ -340,6 +290,14 @@ export default function CampaignDetailPage({ campaignId }: CampaignDetailPagePro
           placeholder={t("campaigns.detail.namePlaceholder")}
         />
       </div>
+
+      <Tabs value={tab} onValueChange={(v) => setTab(v as CampaignTab)}>
+        <TabsList>
+          <TabsTrigger value="editor">{t("campaigns.detail.tabs.editor")}</TabsTrigger>
+          <TabsTrigger value="reporting">{t("campaigns.detail.tabs.reporting")}</TabsTrigger>
+        </TabsList>
+
+        <TabsContent value="editor" className="space-y-6 mt-6">
 
       {/* 1. Basic info */}
       <Card>
@@ -449,100 +407,7 @@ export default function CampaignDetailPage({ campaignId }: CampaignDetailPagePro
         </CardContent>
       </Card>
 
-      {/* 5. Materialization */}
-      <Card>
-        <CardHeader>
-          <CardTitle className="text-base">{t("campaigns.detail.materialization.title")}</CardTitle>
-        </CardHeader>
-        <CardContent>
-          <div className="grid grid-cols-2 md:grid-cols-6 gap-3 text-center">
-            {counters?.map((c) => (
-              <div key={c.key} className="rounded-lg border border-gray-200 bg-gray-50 px-3 py-2">
-                <div className="text-xl font-semibold tabular-nums text-gray-900">{c.value}</div>
-                <div className="text-[10px] uppercase tracking-wide text-gray-500 mt-1">
-                  {t(`campaigns.detail.materialization.counters.${c.key}`)}
-                </div>
-              </div>
-            ))}
-          </div>
-          <p className="text-xs text-gray-500 mt-3">
-            {t("campaigns.detail.materialization.lastExpansion")}:{" "}
-            <span className="font-medium">{fmtRelative(original?.last_expansion_at ?? null, t)}</span>
-          </p>
-        </CardContent>
-      </Card>
-
-      {/* 6. Activity */}
-      <Card>
-        <CardHeader>
-          <CardTitle className="text-base">{t("campaigns.detail.activity.title")}</CardTitle>
-        </CardHeader>
-        <CardContent>
-          {leadsLoading && leadsRows.length === 0 ? (
-            <div className="h-24 bg-gray-50 animate-pulse rounded" />
-          ) : leadsRows.length === 0 ? (
-            <p className="text-sm text-gray-500">{t("campaigns.detail.activity.empty")}</p>
-          ) : (
-            <div className="overflow-hidden rounded border border-gray-200">
-              <table className="min-w-full text-xs">
-                <thead className="bg-gray-50 text-left">
-                  <tr>
-                    <th className="px-3 py-2 font-medium text-gray-600">{t("campaigns.detail.activity.col.lead")}</th>
-                    <th className="px-3 py-2 font-medium text-gray-600">{t("campaigns.detail.activity.col.phone")}</th>
-                    <th className="px-3 py-2 font-medium text-gray-600">{t("campaigns.detail.activity.col.state")}</th>
-                    <th className="px-3 py-2 font-medium text-gray-600">{t("campaigns.detail.activity.col.skipReason")}</th>
-                    <th className="px-3 py-2 font-medium text-gray-600">{t("campaigns.detail.activity.col.scheduledFor")}</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {leadsRows.map((r) => (
-                    <tr key={r.id} className="border-t border-gray-100">
-                      <td className="px-3 py-1.5">{r.leads?.contact_name || "—"}</td>
-                      <td className="px-3 py-1.5 font-mono">{r.leads?.contact_phone || "—"}</td>
-                      <td className="px-3 py-1.5">{t(`campaigns.junctionState.${r.state}`, { defaultValue: r.state })}</td>
-                      <td className="px-3 py-1.5">{r.skip_reason ? t(`campaigns.skipReason.${r.skip_reason}`, { defaultValue: r.skip_reason }) : "—"}</td>
-                      <td className="px-3 py-1.5">{r.scheduled_for ? new Date(r.scheduled_for).toLocaleString() : "—"}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
-          {leadsTotal > LEADS_PAGE && (
-            <div className="flex items-center justify-between mt-3 text-xs text-gray-600">
-              <span>
-                {t("campaigns.list.showingRange", {
-                  from: leadsOffset + 1,
-                  to: Math.min(leadsOffset + LEADS_PAGE, leadsTotal),
-                  total: leadsTotal,
-                })}
-              </span>
-              <div className="flex gap-2">
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  disabled={leadsOffset === 0}
-                  onClick={() => setLeadsOffset(Math.max(0, leadsOffset - LEADS_PAGE))}
-                >
-                  {t("campaigns.list.prev")}
-                </Button>
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  disabled={leadsOffset + LEADS_PAGE >= leadsTotal}
-                  onClick={() => setLeadsOffset(leadsOffset + LEADS_PAGE)}
-                >
-                  {t("campaigns.list.next")}
-                </Button>
-              </div>
-            </div>
-          )}
-        </CardContent>
-      </Card>
-
-      {/* Footer actions */}
+      {/* Footer actions (Editor tab) */}
       {saveError && (
         <div className="rounded border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">{saveError}</div>
       )}
@@ -578,6 +443,13 @@ export default function CampaignDetailPage({ campaignId }: CampaignDetailPagePro
           {t("campaigns.detail.actions.save")}
         </Button>
       </div>
+
+        </TabsContent>
+
+        <TabsContent value="reporting" className="mt-6">
+          <ReportingTab campaignId={campaignId} campaignName={original?.name ?? name} />
+        </TabsContent>
+      </Tabs>
 
       {/* Delete confirmation */}
       <Dialog open={deleteOpen} onOpenChange={setDeleteOpen}>

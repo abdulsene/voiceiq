@@ -547,6 +547,10 @@
     "detail": {
       "backToList": "Volver a campañas",
       "namePlaceholder": "Nombre de la campaña",
+      "tabs": {
+        "editor": "Editor",
+        "reporting": "Informes"
+      },
       "basic": {
         "title": "Información básica",
         "objective": "Objetivo de la llamada",
@@ -721,6 +725,70 @@
           "colWhen": "Programada para",
           "noMatches": "Aún no hay leads de muestra con una hora programada resoluble. Agrega un segmento que coincida con leads que tengan citas confirmadas."
         }
+      }
+    },
+    "reporting": {
+      "refresh": "Actualizar",
+      "retry": "Reintentar",
+      "lastUpdated": "Actualizado {{when}}",
+      "counters": {
+        "target": "Objetivo",
+        "pending": "Pendientes",
+        "scheduled": "Programadas",
+        "completed": "Completadas",
+        "succeeded": "Exitosas",
+        "failed": "Fallidas",
+        "voicemail": "Buzón",
+        "skipped": "Omitidas"
+      },
+      "rates": {
+        "connect": "Tasa de conexión",
+        "connect_tooltip": "Llamadas exitosas ÷ (Completadas − Buzón). Un buzón cuenta como entrega, no como conversación.",
+        "voicemail": "Tasa de buzón",
+        "voicemail_tooltip": "Buzón dejado ÷ Completadas.",
+        "skip": "Tasa de omisión",
+        "skip_tooltip": "Omitidas ÷ Objetivo.",
+        "completion": "Tasa de finalización",
+        "completion_tooltip": "Completadas ÷ Programadas."
+      },
+      "charts": {
+        "timeSeries": {
+          "title": "Actividad de llamadas (últimos 30 días)",
+          "empty": "Sin actividad de llamadas en los últimos 30 días."
+        },
+        "distribution": {
+          "title": "Distribución por estado",
+          "empty": "Aún no se han procesado leads para esta campaña.",
+          "totalLabel": "Total"
+        },
+        "skipPareto": {
+          "title": "Razones de omisión principales",
+          "empty": "Sin leads omitidos — todos los leads objetivo se procesaron.",
+          "countLabel": "Cantidad"
+        }
+      },
+      "activity": {
+        "title": "Actividad reciente",
+        "empty": "Aún no se han procesado leads para esta campaña.",
+        "filterState": "Filtrar por estado",
+        "filterSkipReason": "Filtrar por razón de omisión",
+        "allStates": "Todos los estados",
+        "allReasons": "Todas las razones",
+        "loadMore": "Cargar más",
+        "showing": "Mostrando {{shown}} de {{total}}",
+        "col": {
+          "lead": "Lead",
+          "phone": "Teléfono",
+          "state": "Estado",
+          "skipReason": "Razón de omisión",
+          "scheduledFor": "Programada para"
+        }
+      },
+      "export": {
+        "button": "Exportar CSV",
+        "loading": "Exportando…",
+        "capped": "Exportación limitada a 2000 filas. Contacta a soporte para exportaciones más grandes.",
+        "failed": "La exportación falló. Inténtalo de nuevo."
       }
     }
   },
