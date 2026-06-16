@@ -553,6 +553,224 @@ export async function handleGetCampaignLeads(
   }
 }
 
+// ── Metrics (Phase 2.7a) ────────────────────────────────────────────
+//
+// Re-aggregates from outbound_campaign_leads at query time rather than
+// trusting outbound_campaigns.{target,scheduled,...}_count. The
+// precomputed columns are maintained by the expansion worker + post-
+// call writebacks; any drift surfaces here as a visible mismatch
+// rather than getting papered over. (Phase 2.7 intentionally does NOT
+// auto-reconcile — it surfaces. Auto-reconciliation can land later if
+// the drift turns out to be a real ops pattern.)
+
+export interface CampaignMetricsCounters {
+  target: number;
+  pending: number;
+  scheduled: number;
+  completed: number;
+  succeeded: number;
+  failed: number;
+  voicemail: number;
+  skipped: number;
+}
+
+export interface CampaignMetricsRates {
+  connect_rate: number;
+  voicemail_rate: number;
+  skip_rate: number;
+  completion_rate: number;
+}
+
+export interface CampaignMetricsTimeSeriesRow {
+  date: string;
+  scheduled: number;
+  succeeded: number;
+  failed: number;
+  voicemail: number;
+  skipped: number;
+}
+
+export interface CampaignMetricsResponse {
+  campaign_id: string;
+  counters: CampaignMetricsCounters;
+  rates: CampaignMetricsRates;
+  time_series: CampaignMetricsTimeSeriesRow[];
+  skip_reasons: Array<{ reason: string; count: number }>;
+  state_distribution: Array<{ state: string; count: number }>;
+}
+
+// Top 10 skip-reasons; tie-break alphabetically so the smoke can assert
+// deterministic ordering (T3).
+const SKIP_REASONS_LIMIT = 10;
+
+// State allowlist for the time-series pivot — anything else (legacy /
+// future states) folds into NO series and is silently ignored. The
+// junction's state column is a CHECK-constrained enum (see migration
+// 032), so this should never trip in practice, but the explicit list
+// keeps the wire shape stable when a new state is introduced.
+const TIME_SERIES_STATES = ["scheduled", "succeeded", "failed", "voicemail", "skipped"] as const;
+type TimeSeriesState = (typeof TIME_SERIES_STATES)[number];
+
+function safeRate(numerator: number, denominator: number): number {
+  if (denominator <= 0) return 0;
+  const r = numerator / denominator;
+  // Cap at [0, 1] — drift could theoretically push above 1 if counter
+  // semantics differ from junction reality; clamp so the UI doesn't
+  // render >100%. The drift itself is still visible via the counters.
+  if (!Number.isFinite(r)) return 0;
+  if (r < 0) return 0;
+  if (r > 1) return 1;
+  return r;
+}
+
+export async function handleGetCampaignMetrics(
+  supabase: SupabaseClient,
+  businessId: string,
+  campaignId: string,
+): Promise<
+  | { ok: true; metrics: CampaignMetricsResponse }
+  | { ok: false; status: number; error: string }
+> {
+  // (1) Tenant ownership gate — 404 (not 403) on cross-tenant, mirrors
+  //     handleGetCampaignLeads's pattern. No existence leak.
+  try {
+    const owner = await supabase
+      .from("outbound_campaigns")
+      .select("id")
+      .eq("id", campaignId)
+      .eq("business_id", businessId)
+      .maybeSingle();
+    if (!owner.data) return { ok: false, status: 404, error: "Campaign not found" };
+  } catch (err: any) {
+    return { ok: false, status: 500, error: err?.message || "Database error" };
+  }
+
+  // (2) Parallel data fetch: 2 supabase-js queries + 1 RPC.
+  //     - states: every junction row's `state` for the campaign. Used
+  //       to derive counters + state_distribution in Node (no separate
+  //       round-trip needed).
+  //     - skipReasons: only state='skipped' rows; group + top-10 in
+  //       Node after fetch.
+  //     - rpcTimeSeries: campaign_metrics_time_series RPC (migration
+  //       034) — returns (day, state, count) for the last 30 days.
+  try {
+    const [statesResp, skipReasonsResp, rpcResp] = await Promise.all([
+      supabase.from("outbound_campaign_leads").select("state").eq("campaign_id", campaignId),
+      supabase
+        .from("outbound_campaign_leads")
+        .select("skip_reason")
+        .eq("campaign_id", campaignId)
+        .eq("state", "skipped"),
+      supabase.rpc("campaign_metrics_time_series", { p_campaign_id: campaignId }),
+    ]);
+
+    if (statesResp.error) {
+      Sentry.captureMessage("campaign_metrics_states_failed", {
+        level: "error",
+        extra: { campaignId, error: statesResp.error.message },
+      });
+      return { ok: false, status: 500, error: "Database error" };
+    }
+    if (skipReasonsResp.error) {
+      Sentry.captureMessage("campaign_metrics_skip_reasons_failed", {
+        level: "error",
+        extra: { campaignId, error: skipReasonsResp.error.message },
+      });
+      return { ok: false, status: 500, error: "Database error" };
+    }
+    if (rpcResp.error) {
+      Sentry.captureMessage("campaign_metrics_time_series_failed", {
+        level: "error",
+        extra: { campaignId, error: rpcResp.error.message },
+      });
+      return { ok: false, status: 500, error: "Database error" };
+    }
+
+    // (2a) Counters from the state column.
+    const stateRows = (statesResp.data as Array<{ state: string | null }> | null) ?? [];
+    const stateCounts: Record<string, number> = {};
+    for (const r of stateRows) {
+      const s = r.state ?? "unknown";
+      stateCounts[s] = (stateCounts[s] ?? 0) + 1;
+    }
+    const counters: CampaignMetricsCounters = {
+      target: stateRows.length,
+      pending: stateCounts["pending"] ?? 0,
+      scheduled: stateCounts["scheduled"] ?? 0,
+      completed: stateCounts["completed"] ?? 0,
+      succeeded: stateCounts["succeeded"] ?? 0,
+      failed: stateCounts["failed"] ?? 0,
+      voicemail: stateCounts["voicemail"] ?? 0,
+      skipped: stateCounts["skipped"] ?? 0,
+    };
+
+    // (2b) state_distribution — derived from the same counts, sorted
+    //      by count desc so the donut renders biggest slice first.
+    const state_distribution = Object.entries(stateCounts)
+      .map(([state, count]) => ({ state, count }))
+      .sort((a, b) => (b.count - a.count) || a.state.localeCompare(b.state));
+
+    // (2c) Rates — guarded against div/0 + clamped to [0, 1].
+    //      connect_rate denom = (completed - voicemail) so voicemail
+    //      doesn't inflate the connect rate; a voicemail is a delivery,
+    //      not a conversation.
+    const rates: CampaignMetricsRates = {
+      connect_rate: safeRate(counters.succeeded, counters.completed - counters.voicemail),
+      voicemail_rate: safeRate(counters.voicemail, counters.completed),
+      skip_rate: safeRate(counters.skipped, counters.target),
+      completion_rate: safeRate(counters.completed, counters.scheduled),
+    };
+
+    // (2d) skip_reasons — group + top-10 by count desc, then
+    //      alphabetical on ties so T3 can assert deterministic order.
+    const skipRows = (skipReasonsResp.data as Array<{ skip_reason: string | null }> | null) ?? [];
+    const reasonCounts: Record<string, number> = {};
+    for (const r of skipRows) {
+      const reason = r.skip_reason ?? "unspecified";
+      reasonCounts[reason] = (reasonCounts[reason] ?? 0) + 1;
+    }
+    const skip_reasons = Object.entries(reasonCounts)
+      .map(([reason, count]) => ({ reason, count }))
+      .sort((a, b) => (b.count - a.count) || a.reason.localeCompare(b.reason))
+      .slice(0, SKIP_REASONS_LIMIT);
+
+    // (2e) time_series — pivot (day, state, count) rows into one
+    //      object per day with one field per state-series. Days appear
+    //      in ASC order (RPC's ORDER BY day ASC). The pivot intentionally
+    //      ignores unknown states (allowlist via TIME_SERIES_STATES).
+    type RawTsRow = { day: string; state: string; count: number | string };
+    const tsRows = (rpcResp.data as RawTsRow[] | null) ?? [];
+    const byDay = new Map<string, CampaignMetricsTimeSeriesRow>();
+    for (const r of tsRows) {
+      const dayStr = typeof r.day === "string" ? r.day : new Date(r.day).toISOString().slice(0, 10);
+      const cnt = typeof r.count === "number" ? r.count : parseInt(String(r.count), 10) || 0;
+      let row = byDay.get(dayStr);
+      if (!row) {
+        row = { date: dayStr, scheduled: 0, succeeded: 0, failed: 0, voicemail: 0, skipped: 0 };
+        byDay.set(dayStr, row);
+      }
+      if ((TIME_SERIES_STATES as readonly string[]).includes(r.state)) {
+        row[r.state as TimeSeriesState] = cnt;
+      }
+    }
+    const time_series = Array.from(byDay.values()).sort((a, b) => a.date.localeCompare(b.date));
+
+    return {
+      ok: true,
+      metrics: {
+        campaign_id: campaignId,
+        counters,
+        rates,
+        time_series,
+        skip_reasons,
+        state_distribution,
+      },
+    };
+  } catch (err: any) {
+    return { ok: false, status: 500, error: err?.message || "Database error" };
+  }
+}
+
 // ── Route registrations ─────────────────────────────────────────────
 
 router.get(
@@ -754,6 +972,35 @@ router.get(
       return;
     }
     res.json({ rows: result.rows, total: result.total });
+  },
+);
+
+// Phase 2.7a: GET /:id/metrics — aggregated counters, rates, time
+// series, and skip-reason pareto for the campaign. Tenant-scoped via
+// handleGetCampaignMetrics's ownership check; cross-tenant returns
+// 404 the same as the other detail routes.
+router.get(
+  "/business/campaigns/:id/metrics",
+  requireAuth,
+  requirePermission("calls", "read"),
+  async (req: Request, res: Response) => {
+    const supabase = getSupabase();
+    if (!supabase) {
+      res.status(500).json({ error: "Database not configured" });
+      return;
+    }
+    const businessId = req.businessId;
+    if (!businessId) {
+      res.status(400).json({ error: "No active business" });
+      return;
+    }
+    const campaignId = String(req.params.id);
+    const result = await handleGetCampaignMetrics(supabase, businessId, campaignId);
+    if (!result.ok) {
+      res.status(result.status).json({ error: result.error });
+      return;
+    }
+    res.json({ metrics: result.metrics });
   },
 );
 
