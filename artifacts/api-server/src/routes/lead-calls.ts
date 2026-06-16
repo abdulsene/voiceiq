@@ -2,9 +2,11 @@
  * Lead-bridge initiation + status endpoints. Customer + admin parity.
  *
  *   POST /api/business/leads/:id/call
+ *   POST /api/business/leads/:id/schedule-call                    (Phase 1.7)
  *   GET  /api/business/leads/:id/calls/:callSid/status
  *
  *   POST /api/admin/business/:businessId/leads/:id/call           (Stage 6)
+ *   POST /api/admin/business/:businessId/leads/:id/schedule-call  (Phase 1.7)
  *   GET  /api/admin/business/:businessId/leads/:id/calls/:callSid/status
  *
  * Recording-status + voice TwiML + call-status webhooks live in
@@ -270,6 +272,191 @@ async function handleInitiateCall(opts: {
   });
 }
 
+// ── handleScheduleCall (Phase 1.7) ────────────────────────────────────
+//
+// Shared handler for /api/business/leads/:id/schedule-call (dashboard)
+// and the admin parallel. Delegates to placeCall with scheduledFor set
+// — placeCall's step-7 defer-branch handles the pre-insert with
+// status='scheduled'. The cron worker (Phase 1.5b) picks it up at fire
+// time and re-invokes placeCall via existingLeadCallId mode.
+//
+// Reusing placeCall here means the route inherits placeCall's
+// cross-tenant guard, compliance check (evaluated against fire-time
+// window), and idempotency check on (lead_id, call_objective,
+// scheduled_for) — no duplication of those concerns.
+//
+// Notes from the staff user (optional) are surfaced as an inline
+// metadata field on a separate lead_activities INSERT after placeCall
+// returns. placeCall doesn't natively carry per-call notes; a follow-up
+// activity row is the natural extension point.
+
+const KNOWN_CALL_OBJECTIVES = new Set([
+  "appointment_reminder",
+  "lead_reactivation",
+  "no_answer_followup",
+]);
+
+// Exported for the 028 smoke — bypasses auth/middleware and exercises
+// the handler logic directly with a mock req/res + FakeSupabaseClient.
+export async function handleScheduleCall(opts: {
+  req: Request;
+  res: Response;
+  supabase: SupabaseClient;
+  businessId: string;
+  leadId: string;
+  staffUserId: string;
+  isAdmin: boolean;
+}): Promise<void> {
+  const { req, res, supabase, businessId, leadId, staffUserId, isAdmin } = opts;
+  const body = (req.body || {}) as Record<string, unknown>;
+
+  // (1) Validate scheduled_for — must parse and must be in the future.
+  // Past scheduled_for would let placeCall fall through to immediate
+  // dispatch (isScheduled = false), which is NOT what the dashboard
+  // intends.
+  const scheduledForRaw = typeof body.scheduled_for === "string" ? body.scheduled_for : null;
+  if (!scheduledForRaw) {
+    res.status(400).json({ error: "scheduled_for required (ISO 8601 timestamp)" });
+    return;
+  }
+  const scheduledForDate = new Date(scheduledForRaw);
+  if (isNaN(scheduledForDate.getTime())) {
+    res.status(400).json({ error: "scheduled_for must be a valid ISO 8601 timestamp" });
+    return;
+  }
+  if (scheduledForDate.getTime() <= Date.now()) {
+    res.status(400).json({ error: "scheduled_for must be in the future" });
+    return;
+  }
+
+  // (2) Validate call_objective — must be in the known set. The DB has
+  // no CHECK on this column (Phase 0 design intentionally keeps it
+  // open for campaign vocabulary growth), but the dashboard only ever
+  // sends one of three known values.
+  const callObjective = typeof body.call_objective === "string" ? body.call_objective : null;
+  if (!callObjective || !KNOWN_CALL_OBJECTIVES.has(callObjective)) {
+    res.status(400).json({
+      error: "call_objective required (appointment_reminder | lead_reactivation | no_answer_followup)",
+    });
+    return;
+  }
+
+  // (3) Optional staff notes — trimmed, stored on lead_activities.
+  const notes =
+    typeof body.notes === "string" && body.notes.trim().length > 0
+      ? body.notes.trim()
+      : null;
+
+  const meta = extractRequestMeta(req);
+  const result = await placeCall(supabase, {
+    businessId,
+    leadId,
+    direction: "outbound_automated",
+    callObjective,
+    scheduledFor: scheduledForDate,
+    requestMeta: {
+      ipAddress: meta.ipAddress ?? null,
+      userAgent: meta.userAgent ?? null,
+    },
+    isAdmin,
+  });
+
+  if (!result.ok) {
+    switch (result.reason) {
+      case "lead_not_found":
+        res.status(404).json({ error: "Lead not found" });
+        return;
+      case "lead_phone_invalid":
+        res.status(400).json({ error: "This lead has no usable customer phone on file" });
+        return;
+      case "business_not_found":
+        res.status(404).json({ error: "Business config missing" });
+        return;
+      case "tenant_outbound_disabled":
+        res.status(400).json({ error: "Outbound voice not enabled for this business" });
+        return;
+      case "non_nanp_number_no_tz_inference":
+        res.status(400).json({ error: "Phone number is not NANP — cannot infer recipient timezone for calling-hours check" });
+        return;
+      case "compliance_blocked":
+        res.status(409).json({
+          error: "compliance_blocked",
+          blocked_by: result.blocked_by,
+          checks: result.checks,
+        });
+        return;
+      case "db_error":
+        Sentry.captureMessage("schedule_call_db_error", {
+          level: "error",
+          extra: { businessId, leadId, step: result.step, error: result.error },
+        });
+        res.status(500).json({ error: "Database error", step: result.step });
+        return;
+      // Defensive — these should not happen at schedule time (no
+      // provider invocation, no bridge resolution).
+      case "provider_failed":
+      case "staff_ring_number_missing":
+      case "caller_id_unresolvable":
+        Sentry.captureMessage("schedule_call_unexpected_reason", {
+          level: "error",
+          extra: { reason: result.reason, businessId, leadId },
+        });
+        res.status(500).json({ error: "Unexpected schedule error" });
+        return;
+      default: {
+        const _exhaustive: never = result;
+        void _exhaustive;
+        res.status(500).json({ error: "Unknown schedule error" });
+        return;
+      }
+    }
+  }
+
+  // Success path. status must be 'scheduled' — we passed a future
+  // scheduledFor, so placeCall's step-7 defer-branch fired.
+  if (result.status !== "scheduled") {
+    Sentry.captureMessage("schedule_call_unexpected_status", {
+      level: "error",
+      extra: { status: result.status, businessId, leadId },
+    });
+    res.status(500).json({ error: "Unexpected schedule status" });
+    return;
+  }
+
+  // Best-effort lead_activities INSERT — gives staff a timeline marker.
+  // Skipped on idempotent re-submit (existing row already has its
+  // activity record from the first submit).
+  if (!result.idempotent) {
+    try {
+      const activityMetadata: Record<string, unknown> = {
+        lead_call_id: result.leadCallId,
+        scheduled_for: scheduledForDate.toISOString(),
+        call_objective: callObjective,
+        source: isAdmin ? "admin_raw" : "dashboard",
+      };
+      if (notes) activityMetadata.scheduling_notes = notes;
+      await supabase.from("lead_activities").insert({
+        lead_id: leadId,
+        actor_id: staffUserId,
+        actor_type: "staff",
+        action: "call_scheduled",
+        metadata: activityMetadata,
+      });
+    } catch (err: any) {
+      Sentry.captureException(err, {
+        extra: { route: "schedule-call.lead_activities_insert", leadId, leadCallId: result.leadCallId },
+      });
+    }
+  }
+
+  res.json({
+    success: true,
+    lead_call_id: result.leadCallId,
+    scheduled_for: scheduledForDate.toISOString(),
+    ...(result.idempotent ? { idempotent: true } : {}),
+  });
+}
+
 // ── GET / PUT /api/business/me/callback-preference ────────────────────
 //
 // Per-(user, business) ring number preference. Stored on user_businesses.
@@ -392,6 +579,39 @@ router.post(
   },
 );
 
+// ── POST /api/business/leads/:id/schedule-call (Phase 1.7) ────────────
+
+router.post(
+  "/business/leads/:id/schedule-call",
+  requireAuth,
+  // 'calls:write' parity with /call — same RBAC as initiating a call
+  // because scheduling a future call is logically the same action.
+  requirePermission("calls", "write"),
+  async (req: Request, res: Response) => {
+    const supabase = getSupabase();
+    if (!supabase) {
+      res.status(500).json({ error: "Database not configured" });
+      return;
+    }
+    const businessId = req.businessId;
+    if (!businessId) {
+      res.status(400).json({ error: "No active business" });
+      return;
+    }
+    const userId = req.userId;
+    if (!userId) {
+      res.status(401).json({ error: "Authentication required" });
+      return;
+    }
+    const leadId = String(req.params.id);
+    await handleScheduleCall({
+      req, res, supabase, businessId, leadId,
+      staffUserId: userId,
+      isAdmin: false,
+    });
+  },
+);
+
 // ── GET /api/business/leads/:id/calls/:callSid/status ─────────────────
 
 router.get(
@@ -462,6 +682,33 @@ router.post(
       req, res, supabase, businessId, leadId,
       staffUserId: userId,
       ringNumberOverride: ringOverride,
+      isAdmin: true,
+    });
+  },
+);
+
+// ── POST /api/admin/business/:businessId/leads/:id/schedule-call ──────
+
+router.post(
+  "/admin/business/:businessId/leads/:id/schedule-call",
+  requireAuth,
+  requireStaffPermission("leads", "write"),
+  async (req: Request, res: Response) => {
+    const supabase = getSupabase();
+    if (!supabase) {
+      res.status(500).json({ error: "Database not configured" });
+      return;
+    }
+    const businessId = String(req.params.businessId);
+    const userId = req.userId;
+    if (!userId) {
+      res.status(401).json({ error: "Authentication required" });
+      return;
+    }
+    const leadId = String(req.params.id);
+    await handleScheduleCall({
+      req, res, supabase, businessId, leadId,
+      staffUserId: userId,
       isAdmin: true,
     });
   },

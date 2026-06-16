@@ -5393,6 +5393,32 @@ router.get("/sms/templates", requireAuth, async (req: Request, res: Response) =>
   res.json({ success: true, templates: data || [] });
 });
 
+/**
+ * Phase 1.7 — apply the 10 outbound_* fields from a configure request
+ * body to the `configData` UPDATE payload. Exported for the 028b
+ * smoke. Mirrors the inline conditional shape used for the other
+ * settings fields above.
+ *
+ * Order matches the migration 025 + 026 column ordering. The schema's
+ * CHECK constraint on `outbound_provider` (twilio | elevenlabs_hosted)
+ * is the authoritative validator — we pass values through.
+ */
+export function applyOutboundConfigFields(
+  body: Record<string, unknown>,
+  configData: Record<string, unknown>,
+): void {
+  if (body.outbound_voice_enabled !== undefined) configData.outbound_voice_enabled = body.outbound_voice_enabled;
+  if (body.outbound_provider !== undefined) configData.outbound_provider = body.outbound_provider;
+  if (body.outbound_calling_hours_start !== undefined) configData.outbound_calling_hours_start = body.outbound_calling_hours_start;
+  if (body.outbound_calling_hours_end !== undefined) configData.outbound_calling_hours_end = body.outbound_calling_hours_end;
+  if (body.outbound_calling_hours_days !== undefined) configData.outbound_calling_hours_days = body.outbound_calling_hours_days;
+  if (body.max_outbound_calls_per_day !== undefined) configData.max_outbound_calls_per_day = body.max_outbound_calls_per_day;
+  if (body.record_outbound_calls !== undefined) configData.record_outbound_calls = body.record_outbound_calls;
+  if (body.voice_consent_default !== undefined) configData.voice_consent_default = body.voice_consent_default;
+  if (body.outbound_voicemail_text !== undefined) configData.outbound_voicemail_text = body.outbound_voicemail_text;
+  if (body.elevenlabs_phone_number_id !== undefined) configData.elevenlabs_phone_number_id = body.elevenlabs_phone_number_id;
+}
+
 router.post("/business/configure", requireAuth, async (req: Request, res: Response) => {
   const body = req.body as any;
   const {
@@ -5460,6 +5486,13 @@ router.post("/business/configure", requireAuth, async (req: Request, res: Respon
       if (body.coaching_config !== undefined) {
         configData.coaching_config = JSON.stringify(body.coaching_config);
       }
+
+      // Phase 1.7 — outbound voice configuration. Extracted helper
+      // so the 028b smoke can unit-test the conditional field
+      // application without spinning up the full Express + auth
+      // middleware stack. The schema's CHECK on outbound_provider
+      // catches bad enum values at the DB layer.
+      applyOutboundConfigFields(body, configData);
 
       const { error: updErr, data: updatedRows } = await supabase
         .from("business_configs")
