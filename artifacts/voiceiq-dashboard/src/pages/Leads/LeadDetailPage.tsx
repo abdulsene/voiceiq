@@ -30,6 +30,7 @@ import {
   AlertTriangle,
   ArrowLeft,
   Bot,
+  Calendar,
   Check,
   Clock,
   CornerDownRight,
@@ -404,6 +405,147 @@ function CallCustomerModal({
             className="px-4 py-2 text-sm font-semibold bg-[#2E75B6] text-white rounded-lg hover:bg-[#2563a0] disabled:opacity-50"
           >
             {saving ? t("leads.call.modal.connecting") : t("leads.call.modal.callNow")}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Phase 1.7b — Schedule reminder modal. Submits to
+// POST /api/business/leads/:id/schedule-call which delegates to placeCall
+// with scheduledFor → pre-inserts a lead_calls row with status='scheduled'.
+// The cron worker (Phase 1.5b) picks it up at fire time and re-runs
+// compliance via placeCall existingLeadCallId mode.
+//
+// Date+time defaults to NOW + 24h per R1.
+// Idempotent re-submit surfaces a different toast per R2.
+function ScheduleReminderModal({
+  customerName,
+  saving,
+  serverError,
+  defaultDate,
+  defaultTime,
+  onCancel,
+  onConfirm,
+}: {
+  customerName: string;
+  saving: boolean;
+  serverError: string | null;
+  defaultDate: string;
+  defaultTime: string;
+  onCancel: () => void;
+  onConfirm: (opts: { scheduledFor: string; callObjective: string; notes: string }) => void;
+}) {
+  const { t } = useTranslation();
+  const [date, setDate] = useState(defaultDate);
+  const [time, setTime] = useState(defaultTime);
+  const [objective, setObjective] = useState<"appointment_reminder" | "lead_reactivation" | "no_answer_followup">(
+    "appointment_reminder",
+  );
+  const [notes, setNotes] = useState("");
+
+  const todayIso = new Date().toISOString().slice(0, 10);
+
+  function submit() {
+    // Compose ISO 8601 from local date + time. Server runs timezone
+    // resolution against the recipient's phone (NANP area-code → IANA);
+    // we send a wall-clock-local timestamp interpreted as the browser's
+    // current zone, which is the most predictable behavior for staff.
+    const combined = new Date(`${date}T${time}:00`);
+    onConfirm({
+      scheduledFor: combined.toISOString(),
+      callObjective: objective,
+      notes: notes.trim(),
+    });
+  }
+
+  return (
+    <div
+      role="dialog"
+      aria-modal="true"
+      className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-4"
+      onClick={onCancel}
+    >
+      <div
+        className="bg-white rounded-2xl shadow-xl max-w-md w-full p-6 space-y-4"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-center gap-3">
+          <div className="h-10 w-10 rounded-full bg-[#2E75B6]/10 flex items-center justify-center">
+            <Calendar className="h-5 w-5 text-[#2E75B6]" />
+          </div>
+          <h2 className="text-lg font-semibold text-gray-900">{t("leads.schedule.modal.title")}</h2>
+        </div>
+        <p className="text-sm text-gray-600 leading-relaxed">
+          {t("leads.schedule.modal.description", { customerName })}
+        </p>
+        <div className="grid grid-cols-2 gap-3">
+          <div>
+            <label className="block text-xs font-medium text-gray-700 mb-1">{t("leads.schedule.modal.date")}</label>
+            <input
+              type="date"
+              value={date}
+              min={todayIso}
+              onChange={(e) => setDate(e.target.value)}
+              className="w-full px-3 py-2 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-[#2E75B6]/30"
+            />
+          </div>
+          <div>
+            <label className="block text-xs font-medium text-gray-700 mb-1">{t("leads.schedule.modal.time")}</label>
+            <input
+              type="time"
+              value={time}
+              onChange={(e) => setTime(e.target.value)}
+              className="w-full px-3 py-2 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-[#2E75B6]/30"
+            />
+          </div>
+        </div>
+        <div>
+          <label className="block text-xs font-medium text-gray-700 mb-1">{t("leads.schedule.modal.objective.label")}</label>
+          <select
+            value={objective}
+            onChange={(e) => setObjective(e.target.value as typeof objective)}
+            className="w-full px-3 py-2 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-[#2E75B6]/30"
+          >
+            <option value="appointment_reminder">{t("leads.schedule.modal.objective.appointmentReminder")}</option>
+            <option value="lead_reactivation">{t("leads.schedule.modal.objective.leadReactivation")}</option>
+            <option value="no_answer_followup">{t("leads.schedule.modal.objective.noAnswerFollowup")}</option>
+          </select>
+        </div>
+        <div>
+          <label className="block text-xs font-medium text-gray-700 mb-1">{t("leads.schedule.modal.notes")}</label>
+          <textarea
+            rows={2}
+            value={notes}
+            onChange={(e) => setNotes(e.target.value)}
+            maxLength={1000}
+            placeholder={t("leads.schedule.modal.notesPlaceholder")}
+            className="w-full px-3 py-2 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-[#2E75B6]/30 resize-none"
+          />
+        </div>
+        {serverError && (
+          <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 flex items-start gap-2 text-xs text-red-700">
+            <AlertCircle className="h-3.5 w-3.5 shrink-0 mt-0.5" />
+            <span>{serverError}</span>
+          </div>
+        )}
+        <div className="flex items-center justify-end gap-2 pt-2">
+          <button
+            type="button"
+            onClick={onCancel}
+            disabled={saving}
+            className="px-3 py-2 text-sm text-gray-700 rounded-lg hover:bg-gray-100 disabled:opacity-50"
+          >
+            {t("leads.schedule.modal.cancel")}
+          </button>
+          <button
+            type="button"
+            onClick={submit}
+            disabled={saving}
+            className="px-4 py-2 text-sm font-semibold bg-[#2E75B6] text-white rounded-lg hover:bg-[#2563a0] disabled:opacity-50"
+          >
+            {saving ? t("leads.schedule.modal.submitting") : t("leads.schedule.modal.submit")}
           </button>
         </div>
       </div>
@@ -1010,6 +1152,13 @@ export default function LeadDetailPage() {
   const [callServerError, setCallServerError] = useState<string | null>(null);
   const [activeCallSid, setActiveCallSid] = useState<string | null>(null);
 
+  // Phase 1.7b — outbound voice gate fetch + schedule modal state.
+  const [outboundEnabled, setOutboundEnabled] = useState<boolean | null>(null);
+  const [scheduleModalOpen, setScheduleModalOpen] = useState(false);
+  const [scheduleSaving, setScheduleSaving] = useState(false);
+  const [scheduleServerError, setScheduleServerError] = useState<string | null>(null);
+  const [scheduleToast, setScheduleToast] = useState<{ kind: "ok" | "info" | "err"; message: string } | null>(null);
+
   // Reloads the detail data; called after a call enters a terminal state
   // so the new call_completed activity row appears.
   async function refreshDetail() {
@@ -1055,6 +1204,22 @@ export default function LeadDetailPage() {
         // Treat as unset on error; the banner will surface it.
       } finally {
         if (!cancelled) setRingPrefLoaded(true);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  // Phase 1.7b — load business_configs.outbound_voice_enabled to gate
+  // the Schedule Reminder button. Single fetch on mount, cached in
+  // useState. Failure to fetch → treat as disabled (defensive default).
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const r = (await fetchApi(`/business/configure`)) as { config?: { outbound_voice_enabled?: boolean } };
+        if (!cancelled) setOutboundEnabled(r?.config?.outbound_voice_enabled === true);
+      } catch {
+        if (!cancelled) setOutboundEnabled(false);
       }
     })();
     return () => { cancelled = true; };
@@ -1152,6 +1317,79 @@ export default function LeadDetailPage() {
       return;
     }
     setModalOpen(true);
+  }
+
+  // Phase 1.7b — submit handler for the schedule modal. POSTs to the
+  // 1.7a endpoint which delegates to placeCall with scheduledFor.
+  // Differentiates idempotent vs fresh schedule per R2 (separate toast).
+  async function handleConfirmSchedule(opts: { scheduledFor: string; callObjective: string; notes: string }) {
+    if (!data) return;
+    setScheduleSaving(true);
+    setScheduleServerError(null);
+    try {
+      const r = await fetch(`/api/${apiBase}/leads/${leadId}/schedule-call`, {
+        method: "POST",
+        headers: { ...getAuthHeaders(), "Content-Type": "application/json" },
+        body: JSON.stringify({
+          scheduled_for: opts.scheduledFor,
+          call_objective: opts.callObjective,
+          notes: opts.notes || undefined,
+        }),
+      });
+      const body = (await r.json().catch(() => ({}))) as {
+        success?: boolean;
+        lead_call_id?: string;
+        scheduled_for?: string;
+        idempotent?: boolean;
+        error?: string;
+        blocked_by?: "dnc" | "consent" | "calling_hours";
+      };
+      if (r.status === 409 && body.error === "compliance_blocked") {
+        const reasonKey = body.blocked_by || "dnc";
+        const reasonText = t(`leads.schedule.complianceReason.${reasonKey}`, { defaultValue: reasonKey });
+        setScheduleServerError(t("leads.schedule.toast.complianceBlocked", { reason: reasonText }));
+        return;
+      }
+      if (!r.ok) {
+        setScheduleServerError(body.error || t("leads.schedule.toast.error"));
+        return;
+      }
+      const whenStr = body.scheduled_for ? formatTimestamp(body.scheduled_for) : t("leads.schedule.modal.time");
+      setScheduleToast({
+        kind: body.idempotent ? "info" : "ok",
+        message: t(
+          body.idempotent ? "leads.schedule.toast.alreadyScheduled" : "leads.schedule.toast.scheduled",
+          { when: whenStr },
+        ),
+      });
+      setScheduleModalOpen(false);
+      // Auto-dismiss the toast after 5s.
+      setTimeout(() => setScheduleToast(null), 5000);
+      // Refetch detail so the new call_scheduled activity row appears
+      // in the timeline. Skipped on idempotent — no new row was inserted.
+      if (!body.idempotent) {
+        await refreshDetail();
+      }
+    } catch (e: any) {
+      setScheduleServerError(e?.message || t("leads.schedule.toast.error"));
+    } finally {
+      setScheduleSaving(false);
+    }
+  }
+
+  function handleClickSchedule() {
+    setScheduleServerError(null);
+    if (outboundEnabled !== true) return;
+    if (activeCallSid) return;
+    if (!data?.lead.contact_phone) return;
+    setScheduleModalOpen(true);
+  }
+
+  function scheduleButtonDisabledReason(): string | null {
+    if (outboundEnabled !== true) return t("leads.schedule.button.disabled.outboundNotEnabled");
+    if (activeCallSid) return t("leads.schedule.button.disabled.activeCall");
+    if (!data?.lead.contact_phone) return t("leads.schedule.button.disabled.noPhone");
+    return null;
   }
 
   if (loading) {
@@ -1254,18 +1492,36 @@ export default function LeadDetailPage() {
           </div>
         </div>
 
-        {/* Call customer action */}
+        {/* Call customer action + Phase 1.7b schedule reminder sibling. */}
         {canCall && (
           <div className="mt-5 pt-5 border-t border-gray-100">
-            <button
-              type="button"
-              onClick={handleClickCall}
-              disabled={!ringPreference || !!activeCallSid}
-              className="inline-flex items-center gap-2 px-4 py-2.5 bg-[#2E75B6] text-white text-sm font-semibold rounded-lg hover:bg-[#2563a0] disabled:opacity-50 disabled:cursor-not-allowed"
-            >
-              <PhoneCall className="h-4 w-4" />
-              {t("leads.call.button.callCustomer")}
-            </button>
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                onClick={handleClickCall}
+                disabled={!ringPreference || !!activeCallSid}
+                className="inline-flex items-center gap-2 px-4 py-2.5 bg-[#2E75B6] text-white text-sm font-semibold rounded-lg hover:bg-[#2563a0] disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                <PhoneCall className="h-4 w-4" />
+                {t("leads.call.button.callCustomer")}
+              </button>
+              {/* Schedule button — disabled tooltip carries the reason via title attr (R3 lean: no tooltip lib). */}
+              {(() => {
+                const disabledReason = scheduleButtonDisabledReason();
+                return (
+                  <button
+                    type="button"
+                    onClick={handleClickSchedule}
+                    disabled={disabledReason !== null}
+                    title={disabledReason ?? undefined}
+                    className="inline-flex items-center gap-2 px-4 py-2.5 bg-white text-[#2E75B6] border border-[#2E75B6] text-sm font-semibold rounded-lg hover:bg-[#2E75B6]/5 disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    <Calendar className="h-4 w-4" />
+                    {t("leads.schedule.button.scheduleReminder")}
+                  </button>
+                );
+              })()}
+            </div>
             {ringPreference && (
               <p className="mt-2 text-xs text-gray-500">
                 {t("leads.call.button.willRing", { number: formatPhoneForDisplay(ringPreference) || ringPreference })}
@@ -1453,6 +1709,55 @@ export default function LeadDetailPage() {
           onCancel={() => setModalOpen(false)}
           onConfirm={() => { void handleConfirmCall(); }}
         />
+      )}
+
+      {scheduleModalOpen && data && (() => {
+        // Default date+time = NOW + 24h per R1.
+        const tomorrow = new Date(Date.now() + 24 * 60 * 60 * 1000);
+        const defaultDate = tomorrow.toISOString().slice(0, 10);
+        const defaultTime = tomorrow.toTimeString().slice(0, 5);
+        return (
+          <ScheduleReminderModal
+            customerName={data.lead.contact_name || t("leads.unknownCaller")}
+            saving={scheduleSaving}
+            serverError={scheduleServerError}
+            defaultDate={defaultDate}
+            defaultTime={defaultTime}
+            onCancel={() => { setScheduleModalOpen(false); setScheduleServerError(null); }}
+            onConfirm={(opts) => { void handleConfirmSchedule(opts); }}
+          />
+        );
+      })()}
+
+      {scheduleToast && (
+        <div
+          role="status"
+          aria-live="polite"
+          className={`fixed bottom-6 right-6 z-50 max-w-sm rounded-lg shadow-lg px-4 py-3 text-sm flex items-start gap-2 ${
+            scheduleToast.kind === "ok"
+              ? "bg-emerald-50 border border-emerald-200 text-emerald-900"
+              : scheduleToast.kind === "info"
+                ? "bg-blue-50 border border-blue-200 text-blue-900"
+                : "bg-red-50 border border-red-200 text-red-900"
+          }`}
+        >
+          {scheduleToast.kind === "ok" ? (
+            <Check className="h-4 w-4 shrink-0 mt-0.5" />
+          ) : scheduleToast.kind === "info" ? (
+            <Calendar className="h-4 w-4 shrink-0 mt-0.5" />
+          ) : (
+            <AlertCircle className="h-4 w-4 shrink-0 mt-0.5" />
+          )}
+          <span className="flex-1">{scheduleToast.message}</span>
+          <button
+            type="button"
+            onClick={() => setScheduleToast(null)}
+            className="shrink-0 text-current opacity-60 hover:opacity-100"
+            aria-label="Dismiss"
+          >
+            <X className="h-3.5 w-3.5" />
+          </button>
+        </div>
       )}
     </div>
   );

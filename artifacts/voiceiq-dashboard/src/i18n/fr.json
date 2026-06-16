@@ -268,6 +268,44 @@
         "empty": "Aucune transcription capturée."
       }
     },
+    "schedule": {
+      "button": {
+        "scheduleReminder": "Planifier un rappel",
+        "disabled": {
+          "outboundNotEnabled": "Voix sortante non activée — activez-la dans Paramètres → Voix sortante",
+          "activeCall": "Appel en cours",
+          "noPhone": "Aucun téléphone enregistré"
+        }
+      },
+      "modal": {
+        "title": "Planifier un appel de rappel",
+        "description": "Planifier un appel sortant automatisé vers {{customerName}}. L'appel sera effectué à l'heure sélectionnée et les vérifications de conformité seront exécutées à nouveau au moment de l'appel.",
+        "date": "Date",
+        "time": "Heure",
+        "objective": {
+          "label": "Motif",
+          "appointmentReminder": "Rappel de rendez-vous",
+          "leadReactivation": "Réactivation du prospect",
+          "noAnswerFollowup": "Suivi après non-réponse"
+        },
+        "notes": "Notes (facultatif)",
+        "notesPlaceholder": "Tout ce que l'agent IA devrait savoir avant d'appeler.",
+        "cancel": "Annuler",
+        "submit": "Planifier",
+        "submitting": "Planification…"
+      },
+      "toast": {
+        "scheduled": "Rappel planifié pour {{when}}",
+        "alreadyScheduled": "Un rappel est déjà planifié pour {{when}}",
+        "complianceBlocked": "Impossible de planifier — {{reason}}",
+        "error": "Impossible de planifier le rappel"
+      },
+      "complianceReason": {
+        "dnc": "ce numéro est sur la liste « ne pas appeler »",
+        "consent": "aucun consentement vocal enregistré pour ce numéro",
+        "calling_hours": "en dehors de la plage horaire d'appels configurée"
+      }
+    },
     "outcome": {
       "cardTitle": "Que s'est-il passé ?",
       "save": "Enregistrer le résultat",

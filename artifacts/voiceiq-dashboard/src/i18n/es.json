@@ -268,6 +268,44 @@
         "empty": "No se capturó transcripción."
       }
     },
+    "schedule": {
+      "button": {
+        "scheduleReminder": "Programar recordatorio",
+        "disabled": {
+          "outboundNotEnabled": "Voz saliente no habilitada — actívala en Ajustes → Voz Saliente",
+          "activeCall": "Llamada en curso",
+          "noPhone": "No hay teléfono registrado"
+        }
+      },
+      "modal": {
+        "title": "Programar llamada de recordatorio",
+        "description": "Programar una llamada automática saliente a {{customerName}}. La llamada se realizará a la hora seleccionada y se ejecutarán verificaciones de cumplimiento nuevamente al momento de la llamada.",
+        "date": "Fecha",
+        "time": "Hora",
+        "objective": {
+          "label": "Motivo",
+          "appointmentReminder": "Recordatorio de cita",
+          "leadReactivation": "Reactivación del prospecto",
+          "noAnswerFollowup": "Seguimiento tras no contestar"
+        },
+        "notes": "Notas (opcional)",
+        "notesPlaceholder": "Cualquier cosa que el agente de IA deba saber antes de llamar.",
+        "cancel": "Cancelar",
+        "submit": "Programar",
+        "submitting": "Programando…"
+      },
+      "toast": {
+        "scheduled": "Recordatorio programado para {{when}}",
+        "alreadyScheduled": "Ya hay un recordatorio programado para {{when}}",
+        "complianceBlocked": "No se puede programar — {{reason}}",
+        "error": "No se pudo programar el recordatorio"
+      },
+      "complianceReason": {
+        "dnc": "este número está en la lista de no llamar",
+        "consent": "no hay consentimiento de voz registrado para este número",
+        "calling_hours": "fuera del horario de llamadas configurado"
+      }
+    },
     "outcome": {
       "cardTitle": "¿Qué pasó?",
       "save": "Guardar resultado",

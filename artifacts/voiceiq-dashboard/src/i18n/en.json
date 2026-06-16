@@ -268,6 +268,44 @@
         "empty": "No transcript captured."
       }
     },
+    "schedule": {
+      "button": {
+        "scheduleReminder": "Schedule reminder",
+        "disabled": {
+          "outboundNotEnabled": "Outbound voice not enabled — enable in Settings → Outbound Voice",
+          "activeCall": "Call in progress",
+          "noPhone": "No phone on file"
+        }
+      },
+      "modal": {
+        "title": "Schedule reminder call",
+        "description": "Schedule an automated outbound call to {{customerName}}. The call fires at the time you select and runs compliance checks again at fire time.",
+        "date": "Date",
+        "time": "Time",
+        "objective": {
+          "label": "Reason",
+          "appointmentReminder": "Appointment reminder",
+          "leadReactivation": "Lead re-engagement",
+          "noAnswerFollowup": "Follow-up after no answer"
+        },
+        "notes": "Notes (optional)",
+        "notesPlaceholder": "Anything the AI agent should know going in.",
+        "cancel": "Cancel",
+        "submit": "Schedule",
+        "submitting": "Scheduling…"
+      },
+      "toast": {
+        "scheduled": "Reminder scheduled for {{when}}",
+        "alreadyScheduled": "Reminder already scheduled for {{when}}",
+        "complianceBlocked": "Cannot schedule — {{reason}}",
+        "error": "Could not schedule reminder"
+      },
+      "complianceReason": {
+        "dnc": "this number is on the do-not-call list",
+        "consent": "no voice consent on record for this number",
+        "calling_hours": "outside the configured calling-hours window"
+      }
+    },
     "outcome": {
       "cardTitle": "What happened?",
       "save": "Save outcome",

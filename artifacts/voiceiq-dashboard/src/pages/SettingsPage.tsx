@@ -7,7 +7,7 @@ import {
   EyeOff, ExternalLink, Copy, PhoneCall, ChevronRight, Zap, Plug,
   RefreshCw, Send, Check, MapPin, Plus, Trash2, Edit3, PhoneForwarded,
   Clock, Users, ArrowRightLeft, Brain, X, ToggleLeft, ToggleRight,
-  Swords, Headphones, MessageSquare, Code2, Sparkles,
+  Swords, Headphones, MessageSquare, Code2, Sparkles, PhoneOutgoing,
 } from "lucide-react";
 import SalesDemosTab from "../components/SalesDemosTab";
 
@@ -2285,6 +2285,11 @@ export default function SettingsPage() {
     { id: "callback", label: t("nav.callbackNumber"), icon: PhoneCall },
     { id: "website", label: "Website", icon: Globe },
     { id: "phone", label: "Phone Setup", icon: Phone },
+    // Phase 1.7: outbound voice configuration. Lives next to Phone Setup
+    // because both are dial-out adjacent — the discoverability heuristic
+    // most users will land on. Master enable toggle, calling-hours window,
+    // provider radio, voicemail text, ElevenLabs phone-number id.
+    { id: "outbound", label: "Outbound Voice", icon: PhoneOutgoing },
     { id: "locations", label: "Locations", icon: MapPin },
     { id: "integrations", label: "Integrations", icon: Plug },
     { id: "team", label: "Team", icon: Users },
@@ -2854,6 +2859,8 @@ export default function SettingsPage() {
         )}
 
         {tab === "phone" && <PhoneSetupTab neverrPhone={neverrPhone} />}
+
+        {tab === "outbound" && <OutboundSettingsTab />}
 
         {tab === "locations" && <LocationsTab plan={currentPlan} />}
 
@@ -3774,6 +3781,392 @@ function SmsOptInTab({ businessId }: { businessId: string }) {
         {savedAt && !saving && (
           <span className="text-xs text-emerald-700">Saved.</span>
         )}
+      </div>
+    </div>
+  );
+}
+
+// ── Phase 1.7 — Outbound Voice Settings tab ────────────────────────────
+//
+// Surfaces the 10 outbound_* columns on business_configs (migrations 025
+// + 026) — master enable, provider, calling-hours window, daily cap,
+// recording toggle, consent default, voicemail text, ElevenLabs phone
+// number id. Plain English labels everywhere to match this file's
+// convention; the one stray t() call ("nav.callbackNumber") is the
+// exception that proves the rule.
+//
+// Load: GET /api/business/configure → response.config carries the full
+// business_configs row; we read the 10 outbound_* fields from it.
+// Save: POST /api/business/configure with ONLY the 10 outbound_* keys
+// — the route's applyOutboundConfigFields helper (Phase 1.7a) applies
+// them conditionally so existing settings stay untouched.
+
+const DAYS_OF_WEEK = [
+  { iso: 1, label: "Mon" },
+  { iso: 2, label: "Tue" },
+  { iso: 3, label: "Wed" },
+  { iso: 4, label: "Thu" },
+  { iso: 5, label: "Fri" },
+  { iso: 6, label: "Sat" },
+  { iso: 7, label: "Sun" },
+];
+
+const VOICEMAIL_MAX_CHARS = 800;
+
+function OutboundSettingsTab() {
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [saveStatus, setSaveStatus] = useState<{ kind: "ok" | "err"; message: string } | null>(null);
+
+  // Form state — one piece per outbound_* column.
+  const [enabled, setEnabled] = useState(false);
+  const [provider, setProvider] = useState<"twilio" | "elevenlabs_hosted">("elevenlabs_hosted");
+  const [hoursStart, setHoursStart] = useState("08:00");
+  const [hoursEnd, setHoursEnd] = useState("21:00");
+  const [hoursDays, setHoursDays] = useState<number[]>([1, 2, 3, 4, 5, 6, 7]);
+  const [maxPerDay, setMaxPerDay] = useState(100);
+  const [recordCalls, setRecordCalls] = useState(true);
+  const [consentDefault, setConsentDefault] = useState(false);
+  const [voicemailText, setVoicemailText] = useState("");
+  const [elevenlabsPhoneNumberId, setElevenlabsPhoneNumberId] = useState("");
+
+  const token = typeof window !== "undefined" ? localStorage.getItem("neverr_token") : null;
+  const activeBusinessId = typeof window !== "undefined" ? localStorage.getItem("neverr_active_business_id") : null;
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+  };
+  if (token) headers.Authorization = `Bearer ${token}`;
+  if (activeBusinessId) headers["X-Active-Business"] = activeBusinessId;
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const r = await fetch(`${API}/business/configure`, { headers });
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        const d = await r.json();
+        if (cancelled) return;
+        const c = (d?.config || {}) as Record<string, unknown>;
+        if (typeof c.outbound_voice_enabled === "boolean") setEnabled(c.outbound_voice_enabled);
+        if (c.outbound_provider === "twilio" || c.outbound_provider === "elevenlabs_hosted") {
+          setProvider(c.outbound_provider);
+        }
+        // DB stores TIME as 'HH:MM:SS'; the <input type="time"> wants 'HH:MM'.
+        if (typeof c.outbound_calling_hours_start === "string") setHoursStart(c.outbound_calling_hours_start.slice(0, 5));
+        if (typeof c.outbound_calling_hours_end === "string") setHoursEnd(c.outbound_calling_hours_end.slice(0, 5));
+        if (Array.isArray(c.outbound_calling_hours_days)) {
+          setHoursDays((c.outbound_calling_hours_days as number[]).filter((n) => n >= 1 && n <= 7));
+        }
+        if (typeof c.max_outbound_calls_per_day === "number") setMaxPerDay(c.max_outbound_calls_per_day);
+        if (typeof c.record_outbound_calls === "boolean") setRecordCalls(c.record_outbound_calls);
+        if (typeof c.voice_consent_default === "boolean") setConsentDefault(c.voice_consent_default);
+        if (typeof c.outbound_voicemail_text === "string") setVoicemailText(c.outbound_voicemail_text);
+        if (typeof c.elevenlabs_phone_number_id === "string") setElevenlabsPhoneNumberId(c.elevenlabs_phone_number_id);
+      } catch (e: any) {
+        if (!cancelled) setLoadError(e?.message || "Failed to load outbound settings");
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  function toggleDay(iso: number) {
+    setHoursDays((prev) =>
+      prev.includes(iso) ? prev.filter((d) => d !== iso) : [...prev, iso].sort((a, b) => a - b),
+    );
+  }
+
+  async function handleSave() {
+    setSaving(true);
+    setSaveStatus(null);
+    try {
+      // Send the TIME fields back with the ":00" seconds suffix the DB
+      // column expects. Days array goes verbatim.
+      const payload: Record<string, unknown> = {
+        outbound_voice_enabled: enabled,
+        outbound_provider: provider,
+        outbound_calling_hours_start: `${hoursStart}:00`,
+        outbound_calling_hours_end: `${hoursEnd}:00`,
+        outbound_calling_hours_days: hoursDays,
+        max_outbound_calls_per_day: maxPerDay,
+        record_outbound_calls: recordCalls,
+        voice_consent_default: consentDefault,
+        outbound_voicemail_text: voicemailText,
+        elevenlabs_phone_number_id: elevenlabsPhoneNumberId,
+      };
+      const r = await fetch(`${API}/business/configure`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(payload),
+      });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) {
+        setSaveStatus({ kind: "err", message: d?.error || `Save failed (HTTP ${r.status})` });
+      } else {
+        setSaveStatus({ kind: "ok", message: "Saved." });
+        setTimeout(() => setSaveStatus(null), 3000);
+      }
+    } catch (e: any) {
+      setSaveStatus({ kind: "err", message: e?.message || "Network error" });
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center h-32">
+        <Loader2 className="w-6 h-6 animate-spin text-gray-400" />
+      </div>
+    );
+  }
+  if (loadError) {
+    return (
+      <div className="rounded-lg border border-red-200 bg-red-50 p-4 text-sm text-red-700">
+        {loadError}
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-6">
+      {/* Master enable card with TCPA callout */}
+      <div className="rounded-xl border border-gray-200 bg-white p-5 space-y-4">
+        <div className="flex items-start justify-between gap-4">
+          <div className="flex-1">
+            <h3 className="text-base font-semibold text-gray-900">Outbound automated calling</h3>
+            <p className="mt-1 text-sm text-gray-600">
+              Master switch for outbound voice campaigns and scheduled reminder calls.
+            </p>
+          </div>
+          <label className="inline-flex items-center cursor-pointer shrink-0">
+            <input
+              type="checkbox"
+              checked={enabled}
+              onChange={(e) => setEnabled(e.target.checked)}
+              className="sr-only peer"
+            />
+            <div className="relative w-12 h-7 bg-gray-200 peer-checked:bg-[#2E75B6] rounded-full transition-colors after:content-[''] after:absolute after:top-0.5 after:left-0.5 after:bg-white after:h-6 after:w-6 after:rounded-full after:transition-transform peer-checked:after:translate-x-5" />
+          </label>
+        </div>
+        <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2.5 flex items-start gap-2 text-xs text-amber-900">
+          <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
+          <span>
+            Outbound automated calling must comply with TCPA. Confirm consent records, calling hours,
+            and DNC list are configured before enabling. Violations carry per-call statutory penalties.
+          </span>
+        </div>
+      </div>
+
+      {/* Provider radio */}
+      <div className="rounded-xl border border-gray-200 bg-white p-5 space-y-3">
+        <div>
+          <h3 className="text-base font-semibold text-gray-900">Provider for outbound automated calls</h3>
+          <p className="mt-1 text-sm text-gray-600">
+            Direct via Twilio gives full control over AMD and voicemail behavior. ElevenLabs hosted is
+            simpler but defers AMD and voicemail to ElevenLabs's configuration.
+          </p>
+        </div>
+        <div className="space-y-2">
+          <label className="flex items-start gap-2 p-3 border border-gray-200 rounded-lg cursor-pointer hover:bg-gray-50">
+            <input
+              type="radio"
+              name="outbound_provider"
+              value="twilio"
+              checked={provider === "twilio"}
+              onChange={() => setProvider("twilio")}
+              className="mt-0.5"
+            />
+            <div className="text-sm">
+              <div className="font-medium text-gray-900">Direct via Twilio</div>
+              <div className="text-xs text-gray-500 mt-0.5">Our AMD redirect + voicemail TwiML fires for machine-detected calls.</div>
+            </div>
+          </label>
+          <label className="flex items-start gap-2 p-3 border border-gray-200 rounded-lg cursor-pointer hover:bg-gray-50">
+            <input
+              type="radio"
+              name="outbound_provider"
+              value="elevenlabs_hosted"
+              checked={provider === "elevenlabs_hosted"}
+              onChange={() => setProvider("elevenlabs_hosted")}
+              className="mt-0.5"
+            />
+            <div className="text-sm">
+              <div className="font-medium text-gray-900">ElevenLabs hosted</div>
+              <div className="text-xs text-gray-500 mt-0.5">ElevenLabs hosts the call media. AMD and voicemail are configured on their side.</div>
+            </div>
+          </label>
+        </div>
+      </div>
+
+      {/* Calling hours card */}
+      <div className="rounded-xl border border-gray-200 bg-white p-5 space-y-4">
+        <div>
+          <h3 className="text-base font-semibold text-gray-900">Calling hours</h3>
+          <p className="mt-1 text-sm text-gray-600">
+            Federal floor is 8am–9pm recipient-local. Tenants can narrow but should not widen.
+          </p>
+        </div>
+        <div className="grid grid-cols-2 gap-3">
+          <div>
+            <label className="block text-xs font-medium text-gray-700 mb-1">Start</label>
+            <input
+              type="time"
+              value={hoursStart}
+              onChange={(e) => setHoursStart(e.target.value)}
+              className="w-full px-3 py-2 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-[#2E75B6]/30"
+            />
+          </div>
+          <div>
+            <label className="block text-xs font-medium text-gray-700 mb-1">End</label>
+            <input
+              type="time"
+              value={hoursEnd}
+              onChange={(e) => setHoursEnd(e.target.value)}
+              className="w-full px-3 py-2 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-[#2E75B6]/30"
+            />
+          </div>
+        </div>
+        <div>
+          <label className="block text-xs font-medium text-gray-700 mb-2">Days of the week</label>
+          <div className="flex flex-wrap gap-2">
+            {DAYS_OF_WEEK.map((d) => {
+              const active = hoursDays.includes(d.iso);
+              return (
+                <button
+                  key={d.iso}
+                  type="button"
+                  onClick={() => toggleDay(d.iso)}
+                  className={`px-3 py-1.5 text-xs font-medium rounded-md border transition-colors ${
+                    active
+                      ? "bg-[#2E75B6] text-white border-[#2E75B6]"
+                      : "bg-white text-gray-700 border-gray-200 hover:bg-gray-50"
+                  }`}
+                >
+                  {d.label}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      </div>
+
+      {/* Daily cap */}
+      <div className="rounded-xl border border-gray-200 bg-white p-5 space-y-2">
+        <h3 className="text-base font-semibold text-gray-900">Daily cap</h3>
+        <p className="text-sm text-gray-600">Maximum outbound automated calls per day for this business.</p>
+        <input
+          type="number"
+          min={1}
+          value={maxPerDay}
+          onChange={(e) => setMaxPerDay(Math.max(1, parseInt(e.target.value || "1", 10) || 1))}
+          className="w-32 px-3 py-2 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-[#2E75B6]/30"
+        />
+      </div>
+
+      {/* Recording */}
+      <div className="rounded-xl border border-gray-200 bg-white p-5 flex items-start justify-between gap-4">
+        <div className="flex-1">
+          <h3 className="text-base font-semibold text-gray-900">Record outbound calls</h3>
+          <p className="mt-1 text-sm text-gray-600">
+            Recordings include the customer disclosure. Two-party-consent states require recording regardless of tenant preference.
+          </p>
+        </div>
+        <label className="inline-flex items-center cursor-pointer shrink-0">
+          <input
+            type="checkbox"
+            checked={recordCalls}
+            onChange={(e) => setRecordCalls(e.target.checked)}
+            className="sr-only peer"
+          />
+          <div className="relative w-12 h-7 bg-gray-200 peer-checked:bg-[#2E75B6] rounded-full transition-colors after:content-[''] after:absolute after:top-0.5 after:left-0.5 after:bg-white after:h-6 after:w-6 after:rounded-full after:transition-transform peer-checked:after:translate-x-5" />
+        </label>
+      </div>
+
+      {/* Consent default */}
+      <div className="rounded-xl border border-gray-200 bg-white p-5 flex items-start justify-between gap-4">
+        <div className="flex-1">
+          <h3 className="text-base font-semibold text-gray-900">Presume voice consent</h3>
+          <p className="mt-1 text-sm text-gray-600">
+            Only enable for industries where every lead provides express inbound consent. TCPA exposure if mis-set.
+          </p>
+        </div>
+        <label className="inline-flex items-center cursor-pointer shrink-0">
+          <input
+            type="checkbox"
+            checked={consentDefault}
+            onChange={(e) => setConsentDefault(e.target.checked)}
+            className="sr-only peer"
+          />
+          <div className="relative w-12 h-7 bg-gray-200 peer-checked:bg-[#2E75B6] rounded-full transition-colors after:content-[''] after:absolute after:top-0.5 after:left-0.5 after:bg-white after:h-6 after:w-6 after:rounded-full after:transition-transform peer-checked:after:translate-x-5" />
+        </label>
+      </div>
+
+      {/* Voicemail text */}
+      <div className="rounded-xl border border-gray-200 bg-white p-5 space-y-2">
+        <h3 className="text-base font-semibold text-gray-900">Voicemail message</h3>
+        <p className="text-sm text-gray-600">
+          When AMD detects a machine, Twilio's TTS will read this text then hang up. Leave blank to disconnect without a message.
+        </p>
+        <textarea
+          rows={3}
+          value={voicemailText}
+          onChange={(e) => setVoicemailText(e.target.value.slice(0, VOICEMAIL_MAX_CHARS))}
+          placeholder="Hi, this is a reminder from your business. Please call us back at your convenience."
+          className="w-full px-3 py-2 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-[#2E75B6]/30 resize-none"
+        />
+        <div className="flex items-center justify-between text-xs">
+          <span className="text-gray-500">{voicemailText.length} / {VOICEMAIL_MAX_CHARS} chars</span>
+          {provider === "elevenlabs_hosted" && (
+            <span className="text-amber-700">
+              Voicemail behavior on the ElevenLabs hosted provider is configured in ElevenLabs's dashboard. This field is ignored.
+            </span>
+          )}
+        </div>
+      </div>
+
+      {/* ElevenLabs phone number id (provider-conditional) */}
+      {provider === "elevenlabs_hosted" && (
+        <div className="rounded-xl border border-gray-200 bg-white p-5 space-y-2">
+          <h3 className="text-base font-semibold text-gray-900">ElevenLabs phone number id</h3>
+          <p className="text-sm text-gray-600">
+            ElevenLabs's agent_phone_number_id. Set during pilot onboarding by ops.
+          </p>
+          <input
+            type="text"
+            value={elevenlabsPhoneNumberId}
+            onChange={(e) => setElevenlabsPhoneNumberId(e.target.value)}
+            placeholder="phnum_..."
+            className="w-full px-3 py-2 border border-gray-200 rounded-lg text-sm font-mono focus:outline-none focus:ring-2 focus:ring-[#2E75B6]/30"
+          />
+        </div>
+      )}
+
+      {/* Save */}
+      <div className="flex items-center justify-end gap-3 pt-2">
+        {saveStatus && (
+          <span
+            className={`text-xs ${
+              saveStatus.kind === "ok" ? "text-emerald-700" : "text-red-700"
+            }`}
+          >
+            {saveStatus.message}
+          </span>
+        )}
+        <button
+          type="button"
+          onClick={handleSave}
+          disabled={saving}
+          className="inline-flex items-center gap-2 px-4 py-2 bg-[#2E75B6] text-white text-sm font-semibold rounded-lg hover:bg-[#2563a0] disabled:opacity-50 disabled:cursor-not-allowed"
+        >
+          {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
+          {saving ? "Saving…" : "Save settings"}
+        </button>
       </div>
     </div>
   );
