@@ -562,6 +562,15 @@ export async function handleGetCampaignLeads(
 // rather than getting papered over. (Phase 2.7 intentionally does NOT
 // auto-reconcile — it surfaces. Auto-reconciliation can land later if
 // the drift turns out to be a real ops pattern.)
+//
+// Phase 2.7a-fix: succeeded/failed/voicemail are NOT junction states
+// (the junction CHECK constraint allows only pending/scheduled/
+// completed/skipped/opted_out — see migration 032). Those outcomes
+// live on the lead_calls row that the junction points at via
+// scheduled_call_id, written by the twilio-outbound-voice status +
+// AMD webhooks. We JOIN to lead_calls for state='completed' junction
+// rows and derive the outcome in Node using the canonical mapping
+// from src/routes/twilio-outbound-voice.ts.
 
 export interface CampaignMetricsCounters {
   target: number;
@@ -623,6 +632,45 @@ function safeRate(numerator: number, denominator: number): number {
   return r;
 }
 
+// Canonical outcome mapping — kept in lockstep with
+// src/routes/twilio-outbound-voice.ts:
+//   - status handler sets status='completed' on CallStatus=completed,
+//     and status='failed' (end_reason ∈ {no-answer, busy, failed,
+//     canceled}) on the terminal-failure callbacks.
+//   - AMD handler sets voicemail_left=false on first AnsweredBy, then
+//     tryRedirectToVoicemail flips voicemail_left=true ONLY on a
+//     successful redirect to the /voicemail TwiML route.
+// Priority matters: voicemail_left wins over status='completed' because
+// a voicemail call also ends in status='completed' (the redirect happens
+// mid-call, then the call still terminates normally). Returns null for
+// pre-terminal rows so the caller can detect drift between the junction
+// state and the lead_calls reality.
+type LeadCallFields = {
+  status: string | null;
+  voicemail_left: boolean | null;
+  end_reason: string | null;
+};
+type DerivedOutcome = "succeeded" | "failed" | "voicemail" | null;
+function deriveOutcome(call: LeadCallFields | null): DerivedOutcome {
+  if (!call) return null;
+  if (call.voicemail_left === true) return "voicemail";
+  if (call.status === "failed") return "failed";
+  if (call.status === "completed") return "succeeded";
+  return null;
+}
+
+// PostgREST embedded select returns the joined row either as a single
+// object or a one-element array depending on the relationship cardinality
+// it infers. scheduled_call_id is a many-to-one FK (each junction row
+// points at one lead_call) so a single object is the expected shape, but
+// supabase-js typings have historically waffled on this — handle both.
+function extractEmbeddedLeadCall(row: any): LeadCallFields | null {
+  const lc = row?.lead_calls;
+  if (!lc) return null;
+  if (Array.isArray(lc)) return (lc[0] as LeadCallFields) ?? null;
+  return lc as LeadCallFields;
+}
+
 export async function handleGetCampaignMetrics(
   supabase: SupabaseClient,
   businessId: string,
@@ -645,22 +693,32 @@ export async function handleGetCampaignMetrics(
     return { ok: false, status: 500, error: err?.message || "Database error" };
   }
 
-  // (2) Parallel data fetch: 2 supabase-js queries + 1 RPC.
+  // (2) Parallel data fetch: 3 supabase-js queries + 1 RPC.
   //     - states: every junction row's `state` for the campaign. Used
-  //       to derive counters + state_distribution in Node (no separate
-  //       round-trip needed).
+  //       to derive lifecycle counters + state_distribution in Node.
   //     - skipReasons: only state='skipped' rows; group + top-10 in
   //       Node after fetch.
+  //     - completedOutcomes: junction state='completed' rows JOIN'd to
+  //       lead_calls via scheduled_call_id (PostgREST embedded select).
+  //       succeeded/failed/voicemail derive from lead_calls fields per
+  //       the canonical mapping in twilio-outbound-voice.ts — see
+  //       deriveOutcome() above. The junction's `state` column tops
+  //       out at 'completed'; the per-outcome split lives on lead_calls.
   //     - rpcTimeSeries: campaign_metrics_time_series RPC (migration
   //       034) — returns (day, state, count) for the last 30 days.
   try {
-    const [statesResp, skipReasonsResp, rpcResp] = await Promise.all([
+    const [statesResp, skipReasonsResp, completedOutcomesResp, rpcResp] = await Promise.all([
       supabase.from("outbound_campaign_leads").select("state").eq("campaign_id", campaignId),
       supabase
         .from("outbound_campaign_leads")
         .select("skip_reason")
         .eq("campaign_id", campaignId)
         .eq("state", "skipped"),
+      supabase
+        .from("outbound_campaign_leads")
+        .select("id, state, lead_calls!scheduled_call_id(status, voicemail_left, end_reason)")
+        .eq("campaign_id", campaignId)
+        .eq("state", "completed"),
       supabase.rpc("campaign_metrics_time_series", { p_campaign_id: campaignId }),
     ]);
 
@@ -678,6 +736,13 @@ export async function handleGetCampaignMetrics(
       });
       return { ok: false, status: 500, error: "Database error" };
     }
+    if (completedOutcomesResp.error) {
+      Sentry.captureMessage("campaign_metrics_completed_outcomes_failed", {
+        level: "error",
+        extra: { campaignId, error: completedOutcomesResp.error.message },
+      });
+      return { ok: false, status: 500, error: "Database error" };
+    }
     if (rpcResp.error) {
       Sentry.captureMessage("campaign_metrics_time_series_failed", {
         level: "error",
@@ -686,21 +751,48 @@ export async function handleGetCampaignMetrics(
       return { ok: false, status: 500, error: "Database error" };
     }
 
-    // (2a) Counters from the state column.
+    // (2a) Lifecycle counters from the junction state column. Note:
+    //      succeeded/failed/voicemail are NOT computed here — they
+    //      derive from lead_calls in (2a-bis). The junction CHECK
+    //      constraint (migration 032) limits state to pending/
+    //      scheduled/completed/skipped/opted_out, so reading those
+    //      three from stateCounts would always return 0 in production
+    //      (the original Phase 2.7a bug).
     const stateRows = (statesResp.data as Array<{ state: string | null }> | null) ?? [];
     const stateCounts: Record<string, number> = {};
     for (const r of stateRows) {
       const s = r.state ?? "unknown";
       stateCounts[s] = (stateCounts[s] ?? 0) + 1;
     }
+
+    // (2a-bis) succeeded/failed/voicemail derivation from lead_calls.
+    //          Iterate the completed junction rows, extract the
+    //          embedded lead_call payload, and bucket via the
+    //          canonical mapping helper. Rows where the FK is NULL
+    //          (e.g. retention pruned the lead_call) or the call hasn't
+    //          reached terminal status fall through to no-outcome —
+    //          they show up as drift (succeeded + failed + voicemail
+    //          < completed) which is the intentional Phase 2.7
+    //          surface-don't-paper-over posture.
+    const completedRows = (completedOutcomesResp.data as any[] | null) ?? [];
+    let succeededCount = 0;
+    let failedCount = 0;
+    let voicemailCount = 0;
+    for (const row of completedRows) {
+      const outcome = deriveOutcome(extractEmbeddedLeadCall(row));
+      if (outcome === "succeeded") succeededCount += 1;
+      else if (outcome === "failed") failedCount += 1;
+      else if (outcome === "voicemail") voicemailCount += 1;
+    }
+
     const counters: CampaignMetricsCounters = {
       target: stateRows.length,
       pending: stateCounts["pending"] ?? 0,
       scheduled: stateCounts["scheduled"] ?? 0,
       completed: stateCounts["completed"] ?? 0,
-      succeeded: stateCounts["succeeded"] ?? 0,
-      failed: stateCounts["failed"] ?? 0,
-      voicemail: stateCounts["voicemail"] ?? 0,
+      succeeded: succeededCount,
+      failed: failedCount,
+      voicemail: voicemailCount,
       skipped: stateCounts["skipped"] ?? 0,
     };
 

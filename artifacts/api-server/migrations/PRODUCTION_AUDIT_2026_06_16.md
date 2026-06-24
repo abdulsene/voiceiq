@@ -130,3 +130,53 @@ Next migration number: **035**.
 - The `20260422_industry_templates_phase_1_5.sql` migration (datestamp
   naming) is unrelated to the campaign engine and was not in scope
   for this audit.
+
+---
+
+## 2026-06-24 — Phase 2.7a-fix: metrics endpoint outcome derivation
+
+**Bug.** `handleGetCampaignMetrics` in `src/routes/campaigns.ts` was
+reading `succeeded`, `failed`, `voicemail` directly from
+`outbound_campaign_leads.state` — but the CHECK constraint at item (c)
+above caps `state` at `{pending, scheduled, completed, skipped,
+opted_out}`. Those three counters always returned 0 in production. The
+034 metrics smoke passed because `FakeSupabaseClient` doesn't enforce
+CHECK constraints, masking the bug.
+
+**Where outcomes actually live.** `lead_calls.status` (text,
+'completed' / 'failed'), `lead_calls.voicemail_left` (boolean), and
+`lead_calls.end_reason` (text) — set by the Twilio post-call status
+webhook and AMD voicemail-redirect path in
+`src/routes/twilio-outbound-voice.ts`.
+
+**Fix.** Added a 4th parallel query in `handleGetCampaignMetrics`
+that JOINs `outbound_campaign_leads → lead_calls` via
+`scheduled_call_id` (PostgREST embedded select) for junction rows
+with `state='completed'`, then derives succeeded / failed / voicemail
+in Node using the canonical mapping (`deriveOutcome`):
+
+  1. `voicemail_left === true` → **voicemail**
+  2. `status === 'failed'` → **failed**
+  3. `status === 'completed'` → **succeeded**
+
+Priority order matters — a successful voicemail leave also lands on
+`status='completed'`, so `voicemail_left` is checked first.
+
+**Test posture.** 034 metrics smoke's T1 fixture was restructured to
+stage only CHECK-valid junction states (10 scheduled + 8 completed +
+30 skipped + 2 pending = 50 rows) plus an embedded-JOIN response
+exercising each branch (6 succeeded + 1 failed + 1 voicemail lead_call
+payloads). T2 / T3 / T5 received empty stubs for the 4th query.
+
+**No DB drift.** This is a pure code-side fix — no migration, no schema
+change. Production state matches the in-repo migration sequence
+unchanged; the next migration number is still 035.
+
+**Aligned but-not-yet-fixed.** The `campaign_metrics_time_series` RPC
+(migration 034) is the second consumer of the same false assumption —
+it groups by junction `state` and so will never emit
+`succeeded`/`failed`/`voicemail` rows. The time_series chart silently
+shows 0 for those three series. Phase 2.7a-fix intentionally scopes to
+the counters; the RPC fix is a separate change because it requires
+either a JOIN to lead_calls inside SQL (per-day re-derivation) or a
+denormalized outcome column on the junction. Tracked for a follow-up.

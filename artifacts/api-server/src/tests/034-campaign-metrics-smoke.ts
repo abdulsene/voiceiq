@@ -104,27 +104,71 @@ const BIZ = "biz_test_034m";
 const OTHER_BIZ = "biz_other_034m";
 const CAMP = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
 
-// Stage 50 state rows: 10 scheduled, 8 completed (of which 6 succeeded,
-// 1 failed, 1 voicemail), 30 skipped, 2 pending. Per T1 spec.
+// Phase 2.7a-fix: T1 stages 50 junction rows using ONLY the states the
+// CHECK constraint allows (pending/scheduled/completed/skipped/opted_out
+// — see migration 032). succeeded/failed/voicemail are NOT junction
+// states; they live on lead_calls and are derived in the metrics handler
+// via the embedded JOIN. So T1 stages two responses now:
+//   1. The state column for 50 rows: 10 scheduled, 8 completed, 30
+//      skipped, 2 pending.
+//   2. The embedded JOIN response: 8 completed junction rows each with
+//      a lead_calls payload matching the canonical mapping —
+//      6 succeeded (status='completed', voicemail_left=false)
+//      1 failed (status='failed', end_reason='no-answer')
+//      1 voicemail (status='completed', voicemail_left=true)
 function stageT1States(fake: FakeSupabaseClient) {
   const rows: Array<{ state: string }> = [];
   for (let i = 0; i < 10; i++) rows.push({ state: "scheduled" });
-  for (let i = 0; i < 6; i++) rows.push({ state: "succeeded" });
-  rows.push({ state: "failed" });
-  rows.push({ state: "voicemail" });
-  // The 6+1+1 = 8 above are also the "completed" universe per the
-  // junction's state machine. Counter "completed" here means literally
-  // state='completed' rows; succeeded/failed/voicemail are distinct
-  // terminal states. Per T1 expected math, completed = 8 → the spec
-  // groups succeeded/failed/voicemail UNDER completed conceptually but
-  // counts them as distinct states. We model both: completed=8, and
-  // the 6+1+1 distinct terminals also each get counts of their own.
   for (let i = 0; i < 8; i++) rows.push({ state: "completed" });
   for (let i = 0; i < 30; i++) rows.push({ state: "skipped" });
   for (let i = 0; i < 2; i++) rows.push({ state: "pending" });
   fake.on(
     (c) => c.op === "select" && c.table === "outbound_campaign_leads" && c.selectColumns === "state",
     { data: rows },
+  );
+}
+
+// Stage the embedded-JOIN response for state='completed' junction rows.
+// The fake matches on selectColumns containing "lead_calls" (the
+// embedded-select clause); the 6+1+1 lead_call payloads exercise each
+// branch of deriveOutcome().
+function stageT1CompletedOutcomes(fake: FakeSupabaseClient) {
+  const rows: Array<{ id: string; state: string; lead_calls: any }> = [];
+  for (let i = 0; i < 6; i++) {
+    rows.push({
+      id: `lc-succ-${i}`,
+      state: "completed",
+      lead_calls: { status: "completed", voicemail_left: false, end_reason: "completed" },
+    });
+  }
+  rows.push({
+    id: "lc-fail-0",
+    state: "completed",
+    lead_calls: { status: "failed", voicemail_left: false, end_reason: "no-answer" },
+  });
+  rows.push({
+    id: "lc-vm-0",
+    state: "completed",
+    lead_calls: { status: "completed", voicemail_left: true, end_reason: "completed" },
+  });
+  fake.on(
+    (c) =>
+      c.op === "select" &&
+      c.table === "outbound_campaign_leads" &&
+      c.selectColumns.includes("lead_calls"),
+    { data: rows },
+  );
+}
+
+// Empty embedded-JOIN response — used by T2/T3/T5 where no completed
+// junction rows exist (so succeeded/failed/voicemail counters all 0).
+function stageEmptyCompletedOutcomes(fake: FakeSupabaseClient) {
+  fake.on(
+    (c) =>
+      c.op === "select" &&
+      c.table === "outbound_campaign_leads" &&
+      c.selectColumns.includes("lead_calls"),
+    { data: [] },
   );
 }
 
@@ -137,6 +181,7 @@ async function T1() {
     { data: { id: CAMP } },
   );
   stageT1States(fake);
+  stageT1CompletedOutcomes(fake);
   // Skip-reasons: stage 30 'do_not_call' rows (just one reason for T1
   // — the more interesting top-10 ordering is T3's job).
   fake.on(
@@ -154,13 +199,11 @@ async function T1() {
   if (!result.ok) failures.push(`not ok: ${(result as any).error}`);
   if (result.ok) {
     const c = result.metrics.counters;
-    if (c.target !== 50 + 6 + 1 + 1) failures.push(`target=${c.target} (expected 58 = 50 staged + the 6+1+1 succeeded/failed/voicemail)`);
-    // Actually let me recompute — stageT1States pushed:
-    //   10 scheduled + 6 succeeded + 1 failed + 1 voicemail + 8 completed
-    //   + 30 skipped + 2 pending = 58 rows total.
-    // So target = 58.
+    // 50 junction rows: 10 scheduled + 8 completed + 30 skipped + 2 pending.
+    if (c.target !== 50) failures.push(`target=${c.target} (expected 50)`);
     if (c.scheduled !== 10) failures.push(`scheduled=${c.scheduled}`);
     if (c.completed !== 8) failures.push(`completed=${c.completed}`);
+    // succeeded/failed/voicemail derived from lead_calls — 6/1/1 split.
     if (c.succeeded !== 6) failures.push(`succeeded=${c.succeeded}`);
     if (c.failed !== 1) failures.push(`failed=${c.failed}`);
     if (c.voicemail !== 1) failures.push(`voicemail=${c.voicemail}`);
@@ -172,17 +215,23 @@ async function T1() {
     if (Math.abs(r.connect_rate - 6 / 7) > 1e-9) failures.push(`connect_rate=${r.connect_rate} (expected ~0.857)`);
     // voicemail_rate = voicemail / completed = 1/8 = 0.125
     if (Math.abs(r.voicemail_rate - 0.125) > 1e-9) failures.push(`voicemail_rate=${r.voicemail_rate}`);
-    // skip_rate = skipped / target = 30/58
-    if (Math.abs(r.skip_rate - 30 / 58) > 1e-9) failures.push(`skip_rate=${r.skip_rate}`);
+    // skip_rate = skipped / target = 30/50 = 0.6
+    if (Math.abs(r.skip_rate - 0.6) > 1e-9) failures.push(`skip_rate=${r.skip_rate} (expected 0.6)`);
     // completion_rate = completed / scheduled = 8/10 = 0.8
     if (Math.abs(r.completion_rate - 0.8) > 1e-9) failures.push(`completion_rate=${r.completion_rate}`);
 
-    // state_distribution sorted desc by count
+    // state_distribution sorted desc by count — and must NOT include
+    // succeeded/failed/voicemail (those are sub-categories of completed,
+    // not separate junction states).
     const sd = result.metrics.state_distribution;
     if (sd.length === 0) failures.push("state_distribution empty");
     if (sd.length > 0 && sd[0].count < sd[sd.length - 1].count) failures.push("state_distribution not sorted desc");
+    const sdStates = new Set(sd.map((x) => x.state));
+    for (const leaked of ["succeeded", "failed", "voicemail"]) {
+      if (sdStates.has(leaked)) failures.push(`state_distribution leaked sub-state '${leaked}'`);
+    }
   }
-  record("T1 counters + rates", failures.length === 0, failures.join("; ") || "58 rows; 6/7≈0.857 connect, 0.125 vm, 0.8 completion");
+  record("T1 counters + rates", failures.length === 0, failures.join("; ") || "50 rows; 6/7≈0.857 connect, 0.125 vm, 0.6 skip, 0.8 completion");
 }
 
 async function T2() {
@@ -198,6 +247,8 @@ async function T2() {
     (c) => c.op === "select" && c.table === "outbound_campaign_leads" && c.selectColumns === "skip_reason",
     { data: [] },
   );
+  // No completed junction rows → empty embedded-JOIN response.
+  stageEmptyCompletedOutcomes(fake);
   // RPC returns 5 days × 3 distinct states.
   fake.on(
     (c) => c.op === "rpc" && c.table === "campaign_metrics_time_series",
@@ -286,6 +337,8 @@ async function T3() {
     (c) => c.op === "select" && c.table === "outbound_campaign_leads" && c.selectColumns === "skip_reason",
     { data: skipFixture },
   );
+  // T3 focuses on skip-reasons; no completed junction rows.
+  stageEmptyCompletedOutcomes(fake);
   fake.on((c) => c.op === "rpc" && c.table === "campaign_metrics_time_series", { data: [] });
 
   const result = await handleGetCampaignMetrics(asClient(fake), BIZ, CAMP);
@@ -363,6 +416,9 @@ async function T5() {
     (c) => c.op === "select" && c.table === "outbound_campaign_leads" && c.selectColumns === "skip_reason",
     { data: [] },
   );
+  // Zero-state: no completed junction rows → succeeded/failed/voicemail
+  // all stay 0 after derivation.
+  stageEmptyCompletedOutcomes(fake);
   fake.on((c) => c.op === "rpc" && c.table === "campaign_metrics_time_series", { data: [] });
 
   const result = await handleGetCampaignMetrics(asClient(fake), BIZ, CAMP);
