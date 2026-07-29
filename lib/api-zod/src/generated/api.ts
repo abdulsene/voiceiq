@@ -14,3 +14,384 @@ import * as zod from "zod";
 export const HealthCheckResponse = zod.object({
   status: zod.string(),
 });
+
+/**
+ * @summary List team members for the active business
+ */
+export const ListTeamResponse = zod.object({
+  members: zod.array(
+    zod.object({
+      user_id: zod.string().uuid(),
+      email: zod.string().email().nullish(),
+      full_name: zod.string().nullish(),
+      role: zod.enum([
+        "owner",
+        "admin",
+        "manager",
+        "team_lead",
+        "agent_manager",
+        "analyst",
+        "user",
+        "readonly",
+      ]),
+      is_on_duty: zod.boolean(),
+      on_duty_since: zod.date().nullish(),
+      callback_ring_number: zod
+        .string()
+        .nullish()
+        .describe("E.164 phone (e.g. +14155551234) or null."),
+      assigned_topics: zod
+        .array(zod.string())
+        .describe("Ordered list of topic_slug values this member handles."),
+      created_at: zod.date().nullish(),
+    }),
+  ),
+});
+
+/**
+ * @summary Invite a new team member by email
+ */
+export const InviteTeamMemberBody = zod.object({
+  email: zod.string().email(),
+  role: zod
+    .enum([
+      "admin",
+      "manager",
+      "team_lead",
+      "agent_manager",
+      "analyst",
+      "user",
+      "readonly",
+    ])
+    .describe(
+      "owner is not assignable via invite (established at signup only).",
+    ),
+  initial_topics: zod.array(zod.string()).optional(),
+  callback_ring_number: zod.string().nullish(),
+  full_name: zod.string().nullish(),
+});
+
+/**
+ * @summary Update a team member's role, callback number, or topic assignments
+ */
+export const PatchTeamMemberParams = zod.object({
+  userId: zod.coerce.string().uuid(),
+});
+
+export const PatchTeamMemberBody = zod.object({
+  role: zod
+    .enum([
+      "admin",
+      "manager",
+      "team_lead",
+      "agent_manager",
+      "analyst",
+      "user",
+      "readonly",
+    ])
+    .optional(),
+  callback_ring_number: zod.string().nullish(),
+  topics: zod.array(zod.string()).optional(),
+});
+
+export const PatchTeamMemberResponse = zod.object({
+  ok: zod.boolean().optional(),
+});
+
+/**
+ * @summary Remove a team member from the business
+ */
+export const RemoveTeamMemberParams = zod.object({
+  userId: zod.coerce.string().uuid(),
+});
+
+export const RemoveTeamMemberResponse = zod.object({
+  ok: zod.boolean().optional(),
+});
+
+/**
+ * @summary Clock in — set the caller's is_on_duty=true
+ */
+export const ClockInResponse = zod.object({
+  is_on_duty: zod.literal(true),
+  on_duty_since: zod.date(),
+});
+
+/**
+ * @summary Clock out — set the caller's is_on_duty=false
+ */
+export const ClockOutResponse = zod.object({
+  is_on_duty: zod.literal(false),
+});
+
+/**
+ * @summary Snapshot of currently-on-duty team members
+ */
+export const ListOnDutyResponse = zod.object({
+  members: zod.array(
+    zod.object({
+      user_id: zod.string().uuid(),
+      email: zod.string().email().nullish(),
+      full_name: zod.string().nullish(),
+      role: zod.enum([
+        "owner",
+        "admin",
+        "manager",
+        "team_lead",
+        "agent_manager",
+        "analyst",
+        "user",
+        "readonly",
+      ]),
+      is_on_duty: zod.boolean(),
+      on_duty_since: zod.date().nullish(),
+      callback_ring_number: zod
+        .string()
+        .nullish()
+        .describe("E.164 phone (e.g. +14155551234) or null."),
+      assigned_topics: zod
+        .array(zod.string())
+        .describe("Ordered list of topic_slug values this member handles."),
+      created_at: zod.date().nullish(),
+    }),
+  ),
+});
+
+/**
+ * @summary Current topics for the business + industry defaults
+ */
+export const getTopicsResponseTopicsItemSlugRegExp = new RegExp(
+  "^[a-z][a-z0-9_]\*$",
+);
+export const getTopicsResponseIndustryDefaultsItemSlugRegExp = new RegExp(
+  "^[a-z][a-z0-9_]\*$",
+);
+
+export const GetTopicsResponse = zod.object({
+  topics: zod.array(
+    zod.object({
+      slug: zod.string().regex(getTopicsResponseTopicsItemSlugRegExp),
+      name: zod.string(),
+      description: zod.string().optional(),
+      example_utterances: zod.array(zod.string()).optional(),
+    }),
+  ),
+  industry_defaults: zod.array(
+    zod.object({
+      slug: zod.string().regex(getTopicsResponseIndustryDefaultsItemSlugRegExp),
+      name: zod.string(),
+      description: zod.string().optional(),
+      example_utterances: zod.array(zod.string()).optional(),
+    }),
+  ),
+  industry_id: zod.string().nullish(),
+});
+
+/**
+ * @summary Bulk-replace the topic list for the business
+ */
+export const patchTopicsBodyTopicsItemSlugRegExp = new RegExp(
+  "^[a-z][a-z0-9_]\*$",
+);
+
+export const PatchTopicsBody = zod.object({
+  topics: zod.array(
+    zod.object({
+      slug: zod.string().regex(patchTopicsBodyTopicsItemSlugRegExp),
+      name: zod.string(),
+      description: zod.string().optional(),
+      example_utterances: zod.array(zod.string()).optional(),
+    }),
+  ),
+});
+
+export const patchTopicsResponseTopicsItemSlugRegExp = new RegExp(
+  "^[a-z][a-z0-9_]\*$",
+);
+
+export const PatchTopicsResponse = zod.object({
+  topics: zod.array(
+    zod.object({
+      slug: zod.string().regex(patchTopicsResponseTopicsItemSlugRegExp),
+      name: zod.string(),
+      description: zod.string().optional(),
+      example_utterances: zod.array(zod.string()).optional(),
+    }),
+  ),
+});
+
+/**
+ * @summary Reset the topic list to industry defaults
+ */
+export const resetTopicsResponseTopicsItemSlugRegExp = new RegExp(
+  "^[a-z][a-z0-9_]\*$",
+);
+
+export const ResetTopicsResponse = zod.object({
+  topics: zod.array(
+    zod.object({
+      slug: zod.string().regex(resetTopicsResponseTopicsItemSlugRegExp),
+      name: zod.string(),
+      description: zod.string().optional(),
+      example_utterances: zod.array(zod.string()).optional(),
+    }),
+  ),
+  source: zod.enum(["industry_defaults", "empty"]),
+});
+
+/**
+ * @summary Structured business hours for the active business
+ */
+export const getHoursResponseHoursItemDayOfWeekMin = 0;
+export const getHoursResponseHoursItemDayOfWeekMax = 6;
+
+export const getHoursResponseHoursItemOpensAtRegExp = new RegExp(
+  "^([01]\\d|2[0-3]):[0-5]\\d$",
+);
+export const getHoursResponseHoursItemClosesAtRegExp = new RegExp(
+  "^([01]\\d|2[0-3]):[0-5]\\d$",
+);
+
+export const GetHoursResponse = zod.object({
+  hours: zod.array(
+    zod.object({
+      day_of_week: zod
+        .number()
+        .min(getHoursResponseHoursItemDayOfWeekMin)
+        .max(getHoursResponseHoursItemDayOfWeekMax)
+        .describe("0=Sunday, 1=Monday, ..., 6=Saturday"),
+      opens_at: zod
+        .string()
+        .regex(getHoursResponseHoursItemOpensAtRegExp)
+        .nullish()
+        .describe("HH:MM 24-hour local time. Null when is_closed=true."),
+      closes_at: zod
+        .string()
+        .regex(getHoursResponseHoursItemClosesAtRegExp)
+        .nullish(),
+      timezone: zod
+        .string()
+        .describe("IANA timezone name, e.g. America\/New_York."),
+      is_closed: zod.boolean(),
+    }),
+  ),
+});
+
+/**
+ * @summary Bulk-replace the weekly schedule
+ */
+export const patchHoursBodyHoursItemDayOfWeekMin = 0;
+export const patchHoursBodyHoursItemDayOfWeekMax = 6;
+
+export const patchHoursBodyHoursItemOpensAtRegExp = new RegExp(
+  "^([01]\\d|2[0-3]):[0-5]\\d$",
+);
+export const patchHoursBodyHoursItemClosesAtRegExp = new RegExp(
+  "^([01]\\d|2[0-3]):[0-5]\\d$",
+);
+
+export const PatchHoursBody = zod.object({
+  hours: zod.array(
+    zod.object({
+      day_of_week: zod
+        .number()
+        .min(patchHoursBodyHoursItemDayOfWeekMin)
+        .max(patchHoursBodyHoursItemDayOfWeekMax)
+        .describe("0=Sunday, 1=Monday, ..., 6=Saturday"),
+      opens_at: zod
+        .string()
+        .regex(patchHoursBodyHoursItemOpensAtRegExp)
+        .nullish()
+        .describe("HH:MM 24-hour local time. Null when is_closed=true."),
+      closes_at: zod
+        .string()
+        .regex(patchHoursBodyHoursItemClosesAtRegExp)
+        .nullish(),
+      timezone: zod
+        .string()
+        .describe("IANA timezone name, e.g. America\/New_York."),
+      is_closed: zod.boolean(),
+    }),
+  ),
+});
+
+export const patchHoursResponseHoursItemDayOfWeekMin = 0;
+export const patchHoursResponseHoursItemDayOfWeekMax = 6;
+
+export const patchHoursResponseHoursItemOpensAtRegExp = new RegExp(
+  "^([01]\\d|2[0-3]):[0-5]\\d$",
+);
+export const patchHoursResponseHoursItemClosesAtRegExp = new RegExp(
+  "^([01]\\d|2[0-3]):[0-5]\\d$",
+);
+
+export const PatchHoursResponse = zod.object({
+  hours: zod.array(
+    zod.object({
+      day_of_week: zod
+        .number()
+        .min(patchHoursResponseHoursItemDayOfWeekMin)
+        .max(patchHoursResponseHoursItemDayOfWeekMax)
+        .describe("0=Sunday, 1=Monday, ..., 6=Saturday"),
+      opens_at: zod
+        .string()
+        .regex(patchHoursResponseHoursItemOpensAtRegExp)
+        .nullish()
+        .describe("HH:MM 24-hour local time. Null when is_closed=true."),
+      closes_at: zod
+        .string()
+        .regex(patchHoursResponseHoursItemClosesAtRegExp)
+        .nullish(),
+      timezone: zod
+        .string()
+        .describe("IANA timezone name, e.g. America\/New_York."),
+      is_closed: zod.boolean(),
+    }),
+  ),
+});
+
+/**
+ * @summary Is the business open right now? (Phase 3.5 after-hours integration point)
+ */
+export const getHoursNowResponseCurrentDayRowOneDayOfWeekMin = 0;
+export const getHoursNowResponseCurrentDayRowOneDayOfWeekMax = 6;
+
+export const getHoursNowResponseCurrentDayRowOneOpensAtRegExp = new RegExp(
+  "^([01]\\d|2[0-3]):[0-5]\\d$",
+);
+export const getHoursNowResponseCurrentDayRowOneClosesAtRegExp = new RegExp(
+  "^([01]\\d|2[0-3]):[0-5]\\d$",
+);
+
+export const GetHoursNowResponse = zod.object({
+  is_open: zod.boolean(),
+  source: zod
+    .enum(["structured", "parsed_fallback", "default_fallback"])
+    .describe(
+      "structured = read from the business_hours table; parsed_fallback = derived from business_configs.business_hours text; default_fallback = the parser could not read the text, Mon-Fri 9-5 assumed.",
+    ),
+  current_day_row: zod
+    .object({
+      day_of_week: zod
+        .number()
+        .min(getHoursNowResponseCurrentDayRowOneDayOfWeekMin)
+        .max(getHoursNowResponseCurrentDayRowOneDayOfWeekMax)
+        .describe("0=Sunday, 1=Monday, ..., 6=Saturday"),
+      opens_at: zod
+        .string()
+        .regex(getHoursNowResponseCurrentDayRowOneOpensAtRegExp)
+        .nullish()
+        .describe("HH:MM 24-hour local time. Null when is_closed=true."),
+      closes_at: zod
+        .string()
+        .regex(getHoursNowResponseCurrentDayRowOneClosesAtRegExp)
+        .nullish(),
+      timezone: zod
+        .string()
+        .describe("IANA timezone name, e.g. America\/New_York."),
+      is_closed: zod.boolean(),
+    })
+    .nullish(),
+  next_opens_at: zod.date().nullish(),
+  timezone: zod.string(),
+});

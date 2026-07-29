@@ -8,3 +8,194 @@
 export interface HealthStatus {
   status: string;
 }
+
+export type TeamMemberRole =
+  (typeof TeamMemberRole)[keyof typeof TeamMemberRole];
+
+export const TeamMemberRole = {
+  owner: "owner",
+  admin: "admin",
+  manager: "manager",
+  team_lead: "team_lead",
+  agent_manager: "agent_manager",
+  analyst: "analyst",
+  user: "user",
+  readonly: "readonly",
+} as const;
+
+export interface TeamMember {
+  user_id: string;
+  email?: string | null;
+  full_name?: string | null;
+  role: TeamMemberRole;
+  is_on_duty: boolean;
+  on_duty_since?: string | null;
+  /** E.164 phone (e.g. +14155551234) or null. */
+  callback_ring_number?: string | null;
+  /** Ordered list of topic_slug values this member handles. */
+  assigned_topics: string[];
+  created_at?: string | null;
+}
+
+/**
+ * owner is not assignable via invite (established at signup only).
+ */
+export type InviteRequestRole =
+  (typeof InviteRequestRole)[keyof typeof InviteRequestRole];
+
+export const InviteRequestRole = {
+  admin: "admin",
+  manager: "manager",
+  team_lead: "team_lead",
+  agent_manager: "agent_manager",
+  analyst: "analyst",
+  user: "user",
+  readonly: "readonly",
+} as const;
+
+export interface InviteRequest {
+  email: string;
+  /** owner is not assignable via invite (established at signup only). */
+  role: InviteRequestRole;
+  initial_topics?: string[];
+  callback_ring_number?: string | null;
+  full_name?: string | null;
+}
+
+export type PatchMemberRequestRole =
+  (typeof PatchMemberRequestRole)[keyof typeof PatchMemberRequestRole];
+
+export const PatchMemberRequestRole = {
+  admin: "admin",
+  manager: "manager",
+  team_lead: "team_lead",
+  agent_manager: "agent_manager",
+  analyst: "analyst",
+  user: "user",
+  readonly: "readonly",
+} as const;
+
+export interface PatchMemberRequest {
+  role?: PatchMemberRequestRole;
+  callback_ring_number?: string | null;
+  topics?: string[];
+}
+
+export interface Topic {
+  /** @pattern ^[a-z][a-z0-9_]*$ */
+  slug: string;
+  name: string;
+  description?: string;
+  example_utterances?: string[];
+}
+
+export interface BusinessHoursRow {
+  /**
+   * 0=Sunday, 1=Monday, ..., 6=Saturday
+   * @minimum 0
+   * @maximum 6
+   */
+  day_of_week: number;
+  /**
+   * HH:MM 24-hour local time. Null when is_closed=true.
+   * @pattern ^([01]\d|2[0-3]):[0-5]\d$
+   */
+  opens_at?: string | null;
+  /** @pattern ^([01]\d|2[0-3]):[0-5]\d$ */
+  closes_at?: string | null;
+  /** IANA timezone name, e.g. America/New_York. */
+  timezone: string;
+  is_closed: boolean;
+}
+
+/**
+ * structured = read from the business_hours table; parsed_fallback = derived from business_configs.business_hours text; default_fallback = the parser could not read the text, Mon-Fri 9-5 assumed.
+ */
+export type HoursNowResponseSource =
+  (typeof HoursNowResponseSource)[keyof typeof HoursNowResponseSource];
+
+export const HoursNowResponseSource = {
+  structured: "structured",
+  parsed_fallback: "parsed_fallback",
+  default_fallback: "default_fallback",
+} as const;
+
+export interface HoursNowResponse {
+  is_open: boolean;
+  /** structured = read from the business_hours table; parsed_fallback = derived from business_configs.business_hours text; default_fallback = the parser could not read the text, Mon-Fri 9-5 assumed. */
+  source: HoursNowResponseSource;
+  current_day_row?: BusinessHoursRow | null;
+  next_opens_at?: string | null;
+  timezone: string;
+}
+
+export type ListTeam200 = {
+  members: TeamMember[];
+};
+
+export type InviteTeamMember201 = {
+  user_id: string;
+  email: string;
+  /** True if a new invite email was sent; false if the user already existed and was reused. */
+  invited: boolean;
+};
+
+export type PatchTeamMember200 = {
+  ok?: boolean;
+};
+
+export type RemoveTeamMember200 = {
+  ok?: boolean;
+};
+
+export type ClockIn200 = {
+  is_on_duty: boolean;
+  on_duty_since: string;
+};
+
+export type ClockOut200 = {
+  is_on_duty: boolean;
+};
+
+export type ListOnDuty200 = {
+  members: TeamMember[];
+};
+
+export type GetTopics200 = {
+  topics: Topic[];
+  industry_defaults: Topic[];
+  industry_id?: string | null;
+};
+
+export type PatchTopicsBody = {
+  topics: Topic[];
+};
+
+export type PatchTopics200 = {
+  topics: Topic[];
+};
+
+export type ResetTopics200Source =
+  (typeof ResetTopics200Source)[keyof typeof ResetTopics200Source];
+
+export const ResetTopics200Source = {
+  industry_defaults: "industry_defaults",
+  empty: "empty",
+} as const;
+
+export type ResetTopics200 = {
+  topics: Topic[];
+  source: ResetTopics200Source;
+};
+
+export type GetHours200 = {
+  hours: BusinessHoursRow[];
+};
+
+export type PatchHoursBody = {
+  hours: BusinessHoursRow[];
+};
+
+export type PatchHours200 = {
+  hours: BusinessHoursRow[];
+};

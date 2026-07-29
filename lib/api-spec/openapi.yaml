@@ -10,6 +10,12 @@ servers:
 tags:
   - name: health
     description: Health operations
+  - name: team
+    description: Team management (Phase 3.1a — employees, roles, on-duty state)
+  - name: topics
+    description: Customer service topics (Phase 3.1a — industry-defined intents)
+  - name: hours
+    description: Structured business hours (Phase 3.1a)
 paths:
   /healthz:
     get:
@@ -24,6 +30,278 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/HealthStatus"
+
+  /business/team:
+    get:
+      operationId: listTeam
+      tags: [team]
+      summary: List team members for the active business
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [members]
+                properties:
+                  members:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/TeamMember"
+
+  /business/team/invite:
+    post:
+      operationId: inviteTeamMember
+      tags: [team]
+      summary: Invite a new team member by email
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/InviteRequest"
+      responses:
+        "201":
+          description: Invite sent
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [user_id, email, invited]
+                properties:
+                  user_id: { type: string, format: uuid }
+                  email: { type: string, format: email }
+                  invited:
+                    type: boolean
+                    description: True if a new invite email was sent; false if the user already existed and was reused.
+
+  /business/team/{userId}:
+    patch:
+      operationId: patchTeamMember
+      tags: [team]
+      summary: Update a team member's role, callback number, or topic assignments
+      parameters:
+        - name: userId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PatchMemberRequest"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+    delete:
+      operationId: removeTeamMember
+      tags: [team]
+      summary: Remove a team member from the business
+      parameters:
+        - name: userId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        "200":
+          description: Removed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+
+  /business/team/me/on-duty:
+    post:
+      operationId: clockIn
+      tags: [team]
+      summary: Clock in — set the caller's is_on_duty=true
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [is_on_duty, on_duty_since]
+                properties:
+                  is_on_duty: { type: boolean, enum: [true] }
+                  on_duty_since: { type: string, format: date-time }
+
+  /business/team/me/off-duty:
+    post:
+      operationId: clockOut
+      tags: [team]
+      summary: Clock out — set the caller's is_on_duty=false
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [is_on_duty]
+                properties:
+                  is_on_duty: { type: boolean, enum: [false] }
+
+  /business/team/on-duty:
+    get:
+      operationId: listOnDuty
+      tags: [team]
+      summary: Snapshot of currently-on-duty team members
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [members]
+                properties:
+                  members:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/TeamMember"
+
+  /business/topics:
+    get:
+      operationId: getTopics
+      tags: [topics]
+      summary: Current topics for the business + industry defaults
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [topics, industry_defaults]
+                properties:
+                  topics:
+                    type: array
+                    items: { $ref: "#/components/schemas/Topic" }
+                  industry_defaults:
+                    type: array
+                    items: { $ref: "#/components/schemas/Topic" }
+                  industry_id:
+                    type: string
+                    nullable: true
+    patch:
+      operationId: patchTopics
+      tags: [topics]
+      summary: Bulk-replace the topic list for the business
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [topics]
+              properties:
+                topics:
+                  type: array
+                  items: { $ref: "#/components/schemas/Topic" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [topics]
+                properties:
+                  topics:
+                    type: array
+                    items: { $ref: "#/components/schemas/Topic" }
+
+  /business/topics/reset:
+    post:
+      operationId: resetTopics
+      tags: [topics]
+      summary: Reset the topic list to industry defaults
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [topics, source]
+                properties:
+                  topics:
+                    type: array
+                    items: { $ref: "#/components/schemas/Topic" }
+                  source:
+                    type: string
+                    enum: [industry_defaults, empty]
+
+  /business/hours:
+    get:
+      operationId: getHours
+      tags: [hours]
+      summary: Structured business hours for the active business
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [hours]
+                properties:
+                  hours:
+                    type: array
+                    items: { $ref: "#/components/schemas/BusinessHoursRow" }
+    patch:
+      operationId: patchHours
+      tags: [hours]
+      summary: Bulk-replace the weekly schedule
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [hours]
+              properties:
+                hours:
+                  type: array
+                  items: { $ref: "#/components/schemas/BusinessHoursRow" }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [hours]
+                properties:
+                  hours:
+                    type: array
+                    items: { $ref: "#/components/schemas/BusinessHoursRow" }
+
+  /business/hours/now:
+    get:
+      operationId: getHoursNow
+      tags: [hours]
+      summary: Is the business open right now? (Phase 3.5 after-hours integration point)
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HoursNowResponse"
+
 components:
   schemas:
     HealthStatus:
@@ -34,3 +312,126 @@ components:
       required:
         - status
 
+    TeamMember:
+      type: object
+      required:
+        - user_id
+        - role
+        - is_on_duty
+        - assigned_topics
+      properties:
+        user_id: { type: string, format: uuid }
+        email: { type: string, format: email, nullable: true }
+        full_name: { type: string, nullable: true }
+        role:
+          type: string
+          enum: [owner, admin, manager, team_lead, agent_manager, analyst, user, readonly]
+        is_on_duty: { type: boolean }
+        on_duty_since:
+          type: string
+          format: date-time
+          nullable: true
+        callback_ring_number:
+          type: string
+          nullable: true
+          description: E.164 phone (e.g. +14155551234) or null.
+        assigned_topics:
+          type: array
+          items: { type: string }
+          description: Ordered list of topic_slug values this member handles.
+        created_at:
+          type: string
+          format: date-time
+          nullable: true
+
+    InviteRequest:
+      type: object
+      required: [email, role]
+      properties:
+        email: { type: string, format: email }
+        role:
+          type: string
+          enum: [admin, manager, team_lead, agent_manager, analyst, user, readonly]
+          description: owner is not assignable via invite (established at signup only).
+        initial_topics:
+          type: array
+          items: { type: string }
+        callback_ring_number:
+          type: string
+          nullable: true
+        full_name:
+          type: string
+          nullable: true
+
+    PatchMemberRequest:
+      type: object
+      properties:
+        role:
+          type: string
+          enum: [admin, manager, team_lead, agent_manager, analyst, user, readonly]
+        callback_ring_number:
+          type: string
+          nullable: true
+        topics:
+          type: array
+          items: { type: string }
+
+    Topic:
+      type: object
+      required: [slug, name]
+      properties:
+        slug:
+          type: string
+          pattern: "^[a-z][a-z0-9_]*$"
+        name: { type: string }
+        description: { type: string }
+        example_utterances:
+          type: array
+          items: { type: string }
+
+    BusinessHoursRow:
+      type: object
+      required: [day_of_week, timezone, is_closed]
+      properties:
+        day_of_week:
+          type: integer
+          minimum: 0
+          maximum: 6
+          description: 0=Sunday, 1=Monday, ..., 6=Saturday
+        opens_at:
+          type: string
+          pattern: "^([01]\\d|2[0-3]):[0-5]\\d$"
+          nullable: true
+          description: HH:MM 24-hour local time. Null when is_closed=true.
+        closes_at:
+          type: string
+          pattern: "^([01]\\d|2[0-3]):[0-5]\\d$"
+          nullable: true
+        timezone:
+          type: string
+          description: IANA timezone name, e.g. America/New_York.
+        is_closed:
+          type: boolean
+
+    HoursNowResponse:
+      type: object
+      required: [is_open, timezone, source]
+      properties:
+        is_open: { type: boolean }
+        source:
+          type: string
+          enum: [structured, parsed_fallback, default_fallback]
+          description: >-
+            structured = read from the business_hours table;
+            parsed_fallback = derived from business_configs.business_hours text;
+            default_fallback = the parser could not read the text, Mon-Fri 9-5 assumed.
+        current_day_row:
+          nullable: true
+          allOf:
+            - $ref: "#/components/schemas/BusinessHoursRow"
+        next_opens_at:
+          type: string
+          format: date-time
+          nullable: true
+        timezone:
+          type: string

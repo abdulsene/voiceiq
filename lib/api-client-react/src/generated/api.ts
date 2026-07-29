@@ -5,18 +5,40 @@
  * API specification
  * OpenAPI spec version: 0.1.0
  */
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery } from "@tanstack/react-query";
 import type {
+  MutationFunction,
   QueryFunction,
   QueryKey,
+  UseMutationOptions,
+  UseMutationResult,
   UseQueryOptions,
   UseQueryResult,
 } from "@tanstack/react-query";
 
-import type { HealthStatus } from "./api.schemas";
+import type {
+  ClockIn200,
+  ClockOut200,
+  GetHours200,
+  GetTopics200,
+  HealthStatus,
+  HoursNowResponse,
+  InviteRequest,
+  InviteTeamMember201,
+  ListOnDuty200,
+  ListTeam200,
+  PatchHours200,
+  PatchHoursBody,
+  PatchMemberRequest,
+  PatchTeamMember200,
+  PatchTopics200,
+  PatchTopicsBody,
+  RemoveTeamMember200,
+  ResetTopics200,
+} from "./api.schemas";
 
 import { customFetch } from "../custom-fetch";
-import type { ErrorType } from "../custom-fetch";
+import type { ErrorType, BodyType } from "../custom-fetch";
 
 type AwaitedInput<T> = PromiseLike<T> | T;
 
@@ -92,6 +114,1021 @@ export function useHealthCheck<
   request?: SecondParameter<typeof customFetch>;
 }): UseQueryResult<TData, TError> & { queryKey: QueryKey } {
   const queryOptions = getHealthCheckQueryOptions(options);
+
+  const query = useQuery(queryOptions) as UseQueryResult<TData, TError> & {
+    queryKey: QueryKey;
+  };
+
+  return { ...query, queryKey: queryOptions.queryKey };
+}
+
+/**
+ * @summary List team members for the active business
+ */
+export const getListTeamUrl = () => {
+  return `/api/business/team`;
+};
+
+export const listTeam = async (options?: RequestInit): Promise<ListTeam200> => {
+  return customFetch<ListTeam200>(getListTeamUrl(), {
+    ...options,
+    method: "GET",
+  });
+};
+
+export const getListTeamQueryKey = () => {
+  return [`/api/business/team`] as const;
+};
+
+export const getListTeamQueryOptions = <
+  TData = Awaited<ReturnType<typeof listTeam>>,
+  TError = ErrorType<unknown>,
+>(options?: {
+  query?: UseQueryOptions<Awaited<ReturnType<typeof listTeam>>, TError, TData>;
+  request?: SecondParameter<typeof customFetch>;
+}) => {
+  const { query: queryOptions, request: requestOptions } = options ?? {};
+
+  const queryKey = queryOptions?.queryKey ?? getListTeamQueryKey();
+
+  const queryFn: QueryFunction<Awaited<ReturnType<typeof listTeam>>> = ({
+    signal,
+  }) => listTeam({ signal, ...requestOptions });
+
+  return { queryKey, queryFn, ...queryOptions } as UseQueryOptions<
+    Awaited<ReturnType<typeof listTeam>>,
+    TError,
+    TData
+  > & { queryKey: QueryKey };
+};
+
+export type ListTeamQueryResult = NonNullable<
+  Awaited<ReturnType<typeof listTeam>>
+>;
+export type ListTeamQueryError = ErrorType<unknown>;
+
+/**
+ * @summary List team members for the active business
+ */
+
+export function useListTeam<
+  TData = Awaited<ReturnType<typeof listTeam>>,
+  TError = ErrorType<unknown>,
+>(options?: {
+  query?: UseQueryOptions<Awaited<ReturnType<typeof listTeam>>, TError, TData>;
+  request?: SecondParameter<typeof customFetch>;
+}): UseQueryResult<TData, TError> & { queryKey: QueryKey } {
+  const queryOptions = getListTeamQueryOptions(options);
+
+  const query = useQuery(queryOptions) as UseQueryResult<TData, TError> & {
+    queryKey: QueryKey;
+  };
+
+  return { ...query, queryKey: queryOptions.queryKey };
+}
+
+/**
+ * @summary Invite a new team member by email
+ */
+export const getInviteTeamMemberUrl = () => {
+  return `/api/business/team/invite`;
+};
+
+export const inviteTeamMember = async (
+  inviteRequest: InviteRequest,
+  options?: RequestInit,
+): Promise<InviteTeamMember201> => {
+  return customFetch<InviteTeamMember201>(getInviteTeamMemberUrl(), {
+    ...options,
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...options?.headers },
+    body: JSON.stringify(inviteRequest),
+  });
+};
+
+export const getInviteTeamMemberMutationOptions = <
+  TError = ErrorType<unknown>,
+  TContext = unknown,
+>(options?: {
+  mutation?: UseMutationOptions<
+    Awaited<ReturnType<typeof inviteTeamMember>>,
+    TError,
+    { data: BodyType<InviteRequest> },
+    TContext
+  >;
+  request?: SecondParameter<typeof customFetch>;
+}): UseMutationOptions<
+  Awaited<ReturnType<typeof inviteTeamMember>>,
+  TError,
+  { data: BodyType<InviteRequest> },
+  TContext
+> => {
+  const mutationKey = ["inviteTeamMember"];
+  const { mutation: mutationOptions, request: requestOptions } = options
+    ? options.mutation &&
+      "mutationKey" in options.mutation &&
+      options.mutation.mutationKey
+      ? options
+      : { ...options, mutation: { ...options.mutation, mutationKey } }
+    : { mutation: { mutationKey }, request: undefined };
+
+  const mutationFn: MutationFunction<
+    Awaited<ReturnType<typeof inviteTeamMember>>,
+    { data: BodyType<InviteRequest> }
+  > = (props) => {
+    const { data } = props ?? {};
+
+    return inviteTeamMember(data, requestOptions);
+  };
+
+  return { mutationFn, ...mutationOptions };
+};
+
+export type InviteTeamMemberMutationResult = NonNullable<
+  Awaited<ReturnType<typeof inviteTeamMember>>
+>;
+export type InviteTeamMemberMutationBody = BodyType<InviteRequest>;
+export type InviteTeamMemberMutationError = ErrorType<unknown>;
+
+/**
+ * @summary Invite a new team member by email
+ */
+export const useInviteTeamMember = <
+  TError = ErrorType<unknown>,
+  TContext = unknown,
+>(options?: {
+  mutation?: UseMutationOptions<
+    Awaited<ReturnType<typeof inviteTeamMember>>,
+    TError,
+    { data: BodyType<InviteRequest> },
+    TContext
+  >;
+  request?: SecondParameter<typeof customFetch>;
+}): UseMutationResult<
+  Awaited<ReturnType<typeof inviteTeamMember>>,
+  TError,
+  { data: BodyType<InviteRequest> },
+  TContext
+> => {
+  return useMutation(getInviteTeamMemberMutationOptions(options));
+};
+
+/**
+ * @summary Update a team member's role, callback number, or topic assignments
+ */
+export const getPatchTeamMemberUrl = (userId: string) => {
+  return `/api/business/team/${userId}`;
+};
+
+export const patchTeamMember = async (
+  userId: string,
+  patchMemberRequest: PatchMemberRequest,
+  options?: RequestInit,
+): Promise<PatchTeamMember200> => {
+  return customFetch<PatchTeamMember200>(getPatchTeamMemberUrl(userId), {
+    ...options,
+    method: "PATCH",
+    headers: { "Content-Type": "application/json", ...options?.headers },
+    body: JSON.stringify(patchMemberRequest),
+  });
+};
+
+export const getPatchTeamMemberMutationOptions = <
+  TError = ErrorType<unknown>,
+  TContext = unknown,
+>(options?: {
+  mutation?: UseMutationOptions<
+    Awaited<ReturnType<typeof patchTeamMember>>,
+    TError,
+    { userId: string; data: BodyType<PatchMemberRequest> },
+    TContext
+  >;
+  request?: SecondParameter<typeof customFetch>;
+}): UseMutationOptions<
+  Awaited<ReturnType<typeof patchTeamMember>>,
+  TError,
+  { userId: string; data: BodyType<PatchMemberRequest> },
+  TContext
+> => {
+  const mutationKey = ["patchTeamMember"];
+  const { mutation: mutationOptions, request: requestOptions } = options
+    ? options.mutation &&
+      "mutationKey" in options.mutation &&
+      options.mutation.mutationKey
+      ? options
+      : { ...options, mutation: { ...options.mutation, mutationKey } }
+    : { mutation: { mutationKey }, request: undefined };
+
+  const mutationFn: MutationFunction<
+    Awaited<ReturnType<typeof patchTeamMember>>,
+    { userId: string; data: BodyType<PatchMemberRequest> }
+  > = (props) => {
+    const { userId, data } = props ?? {};
+
+    return patchTeamMember(userId, data, requestOptions);
+  };
+
+  return { mutationFn, ...mutationOptions };
+};
+
+export type PatchTeamMemberMutationResult = NonNullable<
+  Awaited<ReturnType<typeof patchTeamMember>>
+>;
+export type PatchTeamMemberMutationBody = BodyType<PatchMemberRequest>;
+export type PatchTeamMemberMutationError = ErrorType<unknown>;
+
+/**
+ * @summary Update a team member's role, callback number, or topic assignments
+ */
+export const usePatchTeamMember = <
+  TError = ErrorType<unknown>,
+  TContext = unknown,
+>(options?: {
+  mutation?: UseMutationOptions<
+    Awaited<ReturnType<typeof patchTeamMember>>,
+    TError,
+    { userId: string; data: BodyType<PatchMemberRequest> },
+    TContext
+  >;
+  request?: SecondParameter<typeof customFetch>;
+}): UseMutationResult<
+  Awaited<ReturnType<typeof patchTeamMember>>,
+  TError,
+  { userId: string; data: BodyType<PatchMemberRequest> },
+  TContext
+> => {
+  return useMutation(getPatchTeamMemberMutationOptions(options));
+};
+
+/**
+ * @summary Remove a team member from the business
+ */
+export const getRemoveTeamMemberUrl = (userId: string) => {
+  return `/api/business/team/${userId}`;
+};
+
+export const removeTeamMember = async (
+  userId: string,
+  options?: RequestInit,
+): Promise<RemoveTeamMember200> => {
+  return customFetch<RemoveTeamMember200>(getRemoveTeamMemberUrl(userId), {
+    ...options,
+    method: "DELETE",
+  });
+};
+
+export const getRemoveTeamMemberMutationOptions = <
+  TError = ErrorType<unknown>,
+  TContext = unknown,
+>(options?: {
+  mutation?: UseMutationOptions<
+    Awaited<ReturnType<typeof removeTeamMember>>,
+    TError,
+    { userId: string },
+    TContext
+  >;
+  request?: SecondParameter<typeof customFetch>;
+}): UseMutationOptions<
+  Awaited<ReturnType<typeof removeTeamMember>>,
+  TError,
+  { userId: string },
+  TContext
+> => {
+  const mutationKey = ["removeTeamMember"];
+  const { mutation: mutationOptions, request: requestOptions } = options
+    ? options.mutation &&
+      "mutationKey" in options.mutation &&
+      options.mutation.mutationKey
+      ? options
+      : { ...options, mutation: { ...options.mutation, mutationKey } }
+    : { mutation: { mutationKey }, request: undefined };
+
+  const mutationFn: MutationFunction<
+    Awaited<ReturnType<typeof removeTeamMember>>,
+    { userId: string }
+  > = (props) => {
+    const { userId } = props ?? {};
+
+    return removeTeamMember(userId, requestOptions);
+  };
+
+  return { mutationFn, ...mutationOptions };
+};
+
+export type RemoveTeamMemberMutationResult = NonNullable<
+  Awaited<ReturnType<typeof removeTeamMember>>
+>;
+
+export type RemoveTeamMemberMutationError = ErrorType<unknown>;
+
+/**
+ * @summary Remove a team member from the business
+ */
+export const useRemoveTeamMember = <
+  TError = ErrorType<unknown>,
+  TContext = unknown,
+>(options?: {
+  mutation?: UseMutationOptions<
+    Awaited<ReturnType<typeof removeTeamMember>>,
+    TError,
+    { userId: string },
+    TContext
+  >;
+  request?: SecondParameter<typeof customFetch>;
+}): UseMutationResult<
+  Awaited<ReturnType<typeof removeTeamMember>>,
+  TError,
+  { userId: string },
+  TContext
+> => {
+  return useMutation(getRemoveTeamMemberMutationOptions(options));
+};
+
+/**
+ * @summary Clock in — set the caller's is_on_duty=true
+ */
+export const getClockInUrl = () => {
+  return `/api/business/team/me/on-duty`;
+};
+
+export const clockIn = async (options?: RequestInit): Promise<ClockIn200> => {
+  return customFetch<ClockIn200>(getClockInUrl(), {
+    ...options,
+    method: "POST",
+  });
+};
+
+export const getClockInMutationOptions = <
+  TError = ErrorType<unknown>,
+  TContext = unknown,
+>(options?: {
+  mutation?: UseMutationOptions<
+    Awaited<ReturnType<typeof clockIn>>,
+    TError,
+    void,
+    TContext
+  >;
+  request?: SecondParameter<typeof customFetch>;
+}): UseMutationOptions<
+  Awaited<ReturnType<typeof clockIn>>,
+  TError,
+  void,
+  TContext
+> => {
+  const mutationKey = ["clockIn"];
+  const { mutation: mutationOptions, request: requestOptions } = options
+    ? options.mutation &&
+      "mutationKey" in options.mutation &&
+      options.mutation.mutationKey
+      ? options
+      : { ...options, mutation: { ...options.mutation, mutationKey } }
+    : { mutation: { mutationKey }, request: undefined };
+
+  const mutationFn: MutationFunction<
+    Awaited<ReturnType<typeof clockIn>>,
+    void
+  > = () => {
+    return clockIn(requestOptions);
+  };
+
+  return { mutationFn, ...mutationOptions };
+};
+
+export type ClockInMutationResult = NonNullable<
+  Awaited<ReturnType<typeof clockIn>>
+>;
+
+export type ClockInMutationError = ErrorType<unknown>;
+
+/**
+ * @summary Clock in — set the caller's is_on_duty=true
+ */
+export const useClockIn = <
+  TError = ErrorType<unknown>,
+  TContext = unknown,
+>(options?: {
+  mutation?: UseMutationOptions<
+    Awaited<ReturnType<typeof clockIn>>,
+    TError,
+    void,
+    TContext
+  >;
+  request?: SecondParameter<typeof customFetch>;
+}): UseMutationResult<
+  Awaited<ReturnType<typeof clockIn>>,
+  TError,
+  void,
+  TContext
+> => {
+  return useMutation(getClockInMutationOptions(options));
+};
+
+/**
+ * @summary Clock out — set the caller's is_on_duty=false
+ */
+export const getClockOutUrl = () => {
+  return `/api/business/team/me/off-duty`;
+};
+
+export const clockOut = async (options?: RequestInit): Promise<ClockOut200> => {
+  return customFetch<ClockOut200>(getClockOutUrl(), {
+    ...options,
+    method: "POST",
+  });
+};
+
+export const getClockOutMutationOptions = <
+  TError = ErrorType<unknown>,
+  TContext = unknown,
+>(options?: {
+  mutation?: UseMutationOptions<
+    Awaited<ReturnType<typeof clockOut>>,
+    TError,
+    void,
+    TContext
+  >;
+  request?: SecondParameter<typeof customFetch>;
+}): UseMutationOptions<
+  Awaited<ReturnType<typeof clockOut>>,
+  TError,
+  void,
+  TContext
+> => {
+  const mutationKey = ["clockOut"];
+  const { mutation: mutationOptions, request: requestOptions } = options
+    ? options.mutation &&
+      "mutationKey" in options.mutation &&
+      options.mutation.mutationKey
+      ? options
+      : { ...options, mutation: { ...options.mutation, mutationKey } }
+    : { mutation: { mutationKey }, request: undefined };
+
+  const mutationFn: MutationFunction<
+    Awaited<ReturnType<typeof clockOut>>,
+    void
+  > = () => {
+    return clockOut(requestOptions);
+  };
+
+  return { mutationFn, ...mutationOptions };
+};
+
+export type ClockOutMutationResult = NonNullable<
+  Awaited<ReturnType<typeof clockOut>>
+>;
+
+export type ClockOutMutationError = ErrorType<unknown>;
+
+/**
+ * @summary Clock out — set the caller's is_on_duty=false
+ */
+export const useClockOut = <
+  TError = ErrorType<unknown>,
+  TContext = unknown,
+>(options?: {
+  mutation?: UseMutationOptions<
+    Awaited<ReturnType<typeof clockOut>>,
+    TError,
+    void,
+    TContext
+  >;
+  request?: SecondParameter<typeof customFetch>;
+}): UseMutationResult<
+  Awaited<ReturnType<typeof clockOut>>,
+  TError,
+  void,
+  TContext
+> => {
+  return useMutation(getClockOutMutationOptions(options));
+};
+
+/**
+ * @summary Snapshot of currently-on-duty team members
+ */
+export const getListOnDutyUrl = () => {
+  return `/api/business/team/on-duty`;
+};
+
+export const listOnDuty = async (
+  options?: RequestInit,
+): Promise<ListOnDuty200> => {
+  return customFetch<ListOnDuty200>(getListOnDutyUrl(), {
+    ...options,
+    method: "GET",
+  });
+};
+
+export const getListOnDutyQueryKey = () => {
+  return [`/api/business/team/on-duty`] as const;
+};
+
+export const getListOnDutyQueryOptions = <
+  TData = Awaited<ReturnType<typeof listOnDuty>>,
+  TError = ErrorType<unknown>,
+>(options?: {
+  query?: UseQueryOptions<
+    Awaited<ReturnType<typeof listOnDuty>>,
+    TError,
+    TData
+  >;
+  request?: SecondParameter<typeof customFetch>;
+}) => {
+  const { query: queryOptions, request: requestOptions } = options ?? {};
+
+  const queryKey = queryOptions?.queryKey ?? getListOnDutyQueryKey();
+
+  const queryFn: QueryFunction<Awaited<ReturnType<typeof listOnDuty>>> = ({
+    signal,
+  }) => listOnDuty({ signal, ...requestOptions });
+
+  return { queryKey, queryFn, ...queryOptions } as UseQueryOptions<
+    Awaited<ReturnType<typeof listOnDuty>>,
+    TError,
+    TData
+  > & { queryKey: QueryKey };
+};
+
+export type ListOnDutyQueryResult = NonNullable<
+  Awaited<ReturnType<typeof listOnDuty>>
+>;
+export type ListOnDutyQueryError = ErrorType<unknown>;
+
+/**
+ * @summary Snapshot of currently-on-duty team members
+ */
+
+export function useListOnDuty<
+  TData = Awaited<ReturnType<typeof listOnDuty>>,
+  TError = ErrorType<unknown>,
+>(options?: {
+  query?: UseQueryOptions<
+    Awaited<ReturnType<typeof listOnDuty>>,
+    TError,
+    TData
+  >;
+  request?: SecondParameter<typeof customFetch>;
+}): UseQueryResult<TData, TError> & { queryKey: QueryKey } {
+  const queryOptions = getListOnDutyQueryOptions(options);
+
+  const query = useQuery(queryOptions) as UseQueryResult<TData, TError> & {
+    queryKey: QueryKey;
+  };
+
+  return { ...query, queryKey: queryOptions.queryKey };
+}
+
+/**
+ * @summary Current topics for the business + industry defaults
+ */
+export const getGetTopicsUrl = () => {
+  return `/api/business/topics`;
+};
+
+export const getTopics = async (
+  options?: RequestInit,
+): Promise<GetTopics200> => {
+  return customFetch<GetTopics200>(getGetTopicsUrl(), {
+    ...options,
+    method: "GET",
+  });
+};
+
+export const getGetTopicsQueryKey = () => {
+  return [`/api/business/topics`] as const;
+};
+
+export const getGetTopicsQueryOptions = <
+  TData = Awaited<ReturnType<typeof getTopics>>,
+  TError = ErrorType<unknown>,
+>(options?: {
+  query?: UseQueryOptions<Awaited<ReturnType<typeof getTopics>>, TError, TData>;
+  request?: SecondParameter<typeof customFetch>;
+}) => {
+  const { query: queryOptions, request: requestOptions } = options ?? {};
+
+  const queryKey = queryOptions?.queryKey ?? getGetTopicsQueryKey();
+
+  const queryFn: QueryFunction<Awaited<ReturnType<typeof getTopics>>> = ({
+    signal,
+  }) => getTopics({ signal, ...requestOptions });
+
+  return { queryKey, queryFn, ...queryOptions } as UseQueryOptions<
+    Awaited<ReturnType<typeof getTopics>>,
+    TError,
+    TData
+  > & { queryKey: QueryKey };
+};
+
+export type GetTopicsQueryResult = NonNullable<
+  Awaited<ReturnType<typeof getTopics>>
+>;
+export type GetTopicsQueryError = ErrorType<unknown>;
+
+/**
+ * @summary Current topics for the business + industry defaults
+ */
+
+export function useGetTopics<
+  TData = Awaited<ReturnType<typeof getTopics>>,
+  TError = ErrorType<unknown>,
+>(options?: {
+  query?: UseQueryOptions<Awaited<ReturnType<typeof getTopics>>, TError, TData>;
+  request?: SecondParameter<typeof customFetch>;
+}): UseQueryResult<TData, TError> & { queryKey: QueryKey } {
+  const queryOptions = getGetTopicsQueryOptions(options);
+
+  const query = useQuery(queryOptions) as UseQueryResult<TData, TError> & {
+    queryKey: QueryKey;
+  };
+
+  return { ...query, queryKey: queryOptions.queryKey };
+}
+
+/**
+ * @summary Bulk-replace the topic list for the business
+ */
+export const getPatchTopicsUrl = () => {
+  return `/api/business/topics`;
+};
+
+export const patchTopics = async (
+  patchTopicsBody: PatchTopicsBody,
+  options?: RequestInit,
+): Promise<PatchTopics200> => {
+  return customFetch<PatchTopics200>(getPatchTopicsUrl(), {
+    ...options,
+    method: "PATCH",
+    headers: { "Content-Type": "application/json", ...options?.headers },
+    body: JSON.stringify(patchTopicsBody),
+  });
+};
+
+export const getPatchTopicsMutationOptions = <
+  TError = ErrorType<unknown>,
+  TContext = unknown,
+>(options?: {
+  mutation?: UseMutationOptions<
+    Awaited<ReturnType<typeof patchTopics>>,
+    TError,
+    { data: BodyType<PatchTopicsBody> },
+    TContext
+  >;
+  request?: SecondParameter<typeof customFetch>;
+}): UseMutationOptions<
+  Awaited<ReturnType<typeof patchTopics>>,
+  TError,
+  { data: BodyType<PatchTopicsBody> },
+  TContext
+> => {
+  const mutationKey = ["patchTopics"];
+  const { mutation: mutationOptions, request: requestOptions } = options
+    ? options.mutation &&
+      "mutationKey" in options.mutation &&
+      options.mutation.mutationKey
+      ? options
+      : { ...options, mutation: { ...options.mutation, mutationKey } }
+    : { mutation: { mutationKey }, request: undefined };
+
+  const mutationFn: MutationFunction<
+    Awaited<ReturnType<typeof patchTopics>>,
+    { data: BodyType<PatchTopicsBody> }
+  > = (props) => {
+    const { data } = props ?? {};
+
+    return patchTopics(data, requestOptions);
+  };
+
+  return { mutationFn, ...mutationOptions };
+};
+
+export type PatchTopicsMutationResult = NonNullable<
+  Awaited<ReturnType<typeof patchTopics>>
+>;
+export type PatchTopicsMutationBody = BodyType<PatchTopicsBody>;
+export type PatchTopicsMutationError = ErrorType<unknown>;
+
+/**
+ * @summary Bulk-replace the topic list for the business
+ */
+export const usePatchTopics = <
+  TError = ErrorType<unknown>,
+  TContext = unknown,
+>(options?: {
+  mutation?: UseMutationOptions<
+    Awaited<ReturnType<typeof patchTopics>>,
+    TError,
+    { data: BodyType<PatchTopicsBody> },
+    TContext
+  >;
+  request?: SecondParameter<typeof customFetch>;
+}): UseMutationResult<
+  Awaited<ReturnType<typeof patchTopics>>,
+  TError,
+  { data: BodyType<PatchTopicsBody> },
+  TContext
+> => {
+  return useMutation(getPatchTopicsMutationOptions(options));
+};
+
+/**
+ * @summary Reset the topic list to industry defaults
+ */
+export const getResetTopicsUrl = () => {
+  return `/api/business/topics/reset`;
+};
+
+export const resetTopics = async (
+  options?: RequestInit,
+): Promise<ResetTopics200> => {
+  return customFetch<ResetTopics200>(getResetTopicsUrl(), {
+    ...options,
+    method: "POST",
+  });
+};
+
+export const getResetTopicsMutationOptions = <
+  TError = ErrorType<unknown>,
+  TContext = unknown,
+>(options?: {
+  mutation?: UseMutationOptions<
+    Awaited<ReturnType<typeof resetTopics>>,
+    TError,
+    void,
+    TContext
+  >;
+  request?: SecondParameter<typeof customFetch>;
+}): UseMutationOptions<
+  Awaited<ReturnType<typeof resetTopics>>,
+  TError,
+  void,
+  TContext
+> => {
+  const mutationKey = ["resetTopics"];
+  const { mutation: mutationOptions, request: requestOptions } = options
+    ? options.mutation &&
+      "mutationKey" in options.mutation &&
+      options.mutation.mutationKey
+      ? options
+      : { ...options, mutation: { ...options.mutation, mutationKey } }
+    : { mutation: { mutationKey }, request: undefined };
+
+  const mutationFn: MutationFunction<
+    Awaited<ReturnType<typeof resetTopics>>,
+    void
+  > = () => {
+    return resetTopics(requestOptions);
+  };
+
+  return { mutationFn, ...mutationOptions };
+};
+
+export type ResetTopicsMutationResult = NonNullable<
+  Awaited<ReturnType<typeof resetTopics>>
+>;
+
+export type ResetTopicsMutationError = ErrorType<unknown>;
+
+/**
+ * @summary Reset the topic list to industry defaults
+ */
+export const useResetTopics = <
+  TError = ErrorType<unknown>,
+  TContext = unknown,
+>(options?: {
+  mutation?: UseMutationOptions<
+    Awaited<ReturnType<typeof resetTopics>>,
+    TError,
+    void,
+    TContext
+  >;
+  request?: SecondParameter<typeof customFetch>;
+}): UseMutationResult<
+  Awaited<ReturnType<typeof resetTopics>>,
+  TError,
+  void,
+  TContext
+> => {
+  return useMutation(getResetTopicsMutationOptions(options));
+};
+
+/**
+ * @summary Structured business hours for the active business
+ */
+export const getGetHoursUrl = () => {
+  return `/api/business/hours`;
+};
+
+export const getHours = async (options?: RequestInit): Promise<GetHours200> => {
+  return customFetch<GetHours200>(getGetHoursUrl(), {
+    ...options,
+    method: "GET",
+  });
+};
+
+export const getGetHoursQueryKey = () => {
+  return [`/api/business/hours`] as const;
+};
+
+export const getGetHoursQueryOptions = <
+  TData = Awaited<ReturnType<typeof getHours>>,
+  TError = ErrorType<unknown>,
+>(options?: {
+  query?: UseQueryOptions<Awaited<ReturnType<typeof getHours>>, TError, TData>;
+  request?: SecondParameter<typeof customFetch>;
+}) => {
+  const { query: queryOptions, request: requestOptions } = options ?? {};
+
+  const queryKey = queryOptions?.queryKey ?? getGetHoursQueryKey();
+
+  const queryFn: QueryFunction<Awaited<ReturnType<typeof getHours>>> = ({
+    signal,
+  }) => getHours({ signal, ...requestOptions });
+
+  return { queryKey, queryFn, ...queryOptions } as UseQueryOptions<
+    Awaited<ReturnType<typeof getHours>>,
+    TError,
+    TData
+  > & { queryKey: QueryKey };
+};
+
+export type GetHoursQueryResult = NonNullable<
+  Awaited<ReturnType<typeof getHours>>
+>;
+export type GetHoursQueryError = ErrorType<unknown>;
+
+/**
+ * @summary Structured business hours for the active business
+ */
+
+export function useGetHours<
+  TData = Awaited<ReturnType<typeof getHours>>,
+  TError = ErrorType<unknown>,
+>(options?: {
+  query?: UseQueryOptions<Awaited<ReturnType<typeof getHours>>, TError, TData>;
+  request?: SecondParameter<typeof customFetch>;
+}): UseQueryResult<TData, TError> & { queryKey: QueryKey } {
+  const queryOptions = getGetHoursQueryOptions(options);
+
+  const query = useQuery(queryOptions) as UseQueryResult<TData, TError> & {
+    queryKey: QueryKey;
+  };
+
+  return { ...query, queryKey: queryOptions.queryKey };
+}
+
+/**
+ * @summary Bulk-replace the weekly schedule
+ */
+export const getPatchHoursUrl = () => {
+  return `/api/business/hours`;
+};
+
+export const patchHours = async (
+  patchHoursBody: PatchHoursBody,
+  options?: RequestInit,
+): Promise<PatchHours200> => {
+  return customFetch<PatchHours200>(getPatchHoursUrl(), {
+    ...options,
+    method: "PATCH",
+    headers: { "Content-Type": "application/json", ...options?.headers },
+    body: JSON.stringify(patchHoursBody),
+  });
+};
+
+export const getPatchHoursMutationOptions = <
+  TError = ErrorType<unknown>,
+  TContext = unknown,
+>(options?: {
+  mutation?: UseMutationOptions<
+    Awaited<ReturnType<typeof patchHours>>,
+    TError,
+    { data: BodyType<PatchHoursBody> },
+    TContext
+  >;
+  request?: SecondParameter<typeof customFetch>;
+}): UseMutationOptions<
+  Awaited<ReturnType<typeof patchHours>>,
+  TError,
+  { data: BodyType<PatchHoursBody> },
+  TContext
+> => {
+  const mutationKey = ["patchHours"];
+  const { mutation: mutationOptions, request: requestOptions } = options
+    ? options.mutation &&
+      "mutationKey" in options.mutation &&
+      options.mutation.mutationKey
+      ? options
+      : { ...options, mutation: { ...options.mutation, mutationKey } }
+    : { mutation: { mutationKey }, request: undefined };
+
+  const mutationFn: MutationFunction<
+    Awaited<ReturnType<typeof patchHours>>,
+    { data: BodyType<PatchHoursBody> }
+  > = (props) => {
+    const { data } = props ?? {};
+
+    return patchHours(data, requestOptions);
+  };
+
+  return { mutationFn, ...mutationOptions };
+};
+
+export type PatchHoursMutationResult = NonNullable<
+  Awaited<ReturnType<typeof patchHours>>
+>;
+export type PatchHoursMutationBody = BodyType<PatchHoursBody>;
+export type PatchHoursMutationError = ErrorType<unknown>;
+
+/**
+ * @summary Bulk-replace the weekly schedule
+ */
+export const usePatchHours = <
+  TError = ErrorType<unknown>,
+  TContext = unknown,
+>(options?: {
+  mutation?: UseMutationOptions<
+    Awaited<ReturnType<typeof patchHours>>,
+    TError,
+    { data: BodyType<PatchHoursBody> },
+    TContext
+  >;
+  request?: SecondParameter<typeof customFetch>;
+}): UseMutationResult<
+  Awaited<ReturnType<typeof patchHours>>,
+  TError,
+  { data: BodyType<PatchHoursBody> },
+  TContext
+> => {
+  return useMutation(getPatchHoursMutationOptions(options));
+};
+
+/**
+ * @summary Is the business open right now? (Phase 3.5 after-hours integration point)
+ */
+export const getGetHoursNowUrl = () => {
+  return `/api/business/hours/now`;
+};
+
+export const getHoursNow = async (
+  options?: RequestInit,
+): Promise<HoursNowResponse> => {
+  return customFetch<HoursNowResponse>(getGetHoursNowUrl(), {
+    ...options,
+    method: "GET",
+  });
+};
+
+export const getGetHoursNowQueryKey = () => {
+  return [`/api/business/hours/now`] as const;
+};
+
+export const getGetHoursNowQueryOptions = <
+  TData = Awaited<ReturnType<typeof getHoursNow>>,
+  TError = ErrorType<unknown>,
+>(options?: {
+  query?: UseQueryOptions<
+    Awaited<ReturnType<typeof getHoursNow>>,
+    TError,
+    TData
+  >;
+  request?: SecondParameter<typeof customFetch>;
+}) => {
+  const { query: queryOptions, request: requestOptions } = options ?? {};
+
+  const queryKey = queryOptions?.queryKey ?? getGetHoursNowQueryKey();
+
+  const queryFn: QueryFunction<Awaited<ReturnType<typeof getHoursNow>>> = ({
+    signal,
+  }) => getHoursNow({ signal, ...requestOptions });
+
+  return { queryKey, queryFn, ...queryOptions } as UseQueryOptions<
+    Awaited<ReturnType<typeof getHoursNow>>,
+    TError,
+    TData
+  > & { queryKey: QueryKey };
+};
+
+export type GetHoursNowQueryResult = NonNullable<
+  Awaited<ReturnType<typeof getHoursNow>>
+>;
+export type GetHoursNowQueryError = ErrorType<unknown>;
+
+/**
+ * @summary Is the business open right now? (Phase 3.5 after-hours integration point)
+ */
+
+export function useGetHoursNow<
+  TData = Awaited<ReturnType<typeof getHoursNow>>,
+  TError = ErrorType<unknown>,
+>(options?: {
+  query?: UseQueryOptions<
+    Awaited<ReturnType<typeof getHoursNow>>,
+    TError,
+    TData
+  >;
+  request?: SecondParameter<typeof customFetch>;
+}): UseQueryResult<TData, TError> & { queryKey: QueryKey } {
+  const queryOptions = getGetHoursNowQueryOptions(options);
 
   const query = useQuery(queryOptions) as UseQueryResult<TData, TError> & {
     queryKey: QueryKey;

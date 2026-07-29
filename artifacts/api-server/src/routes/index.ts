@@ -21,6 +21,9 @@ import transferRouter from "./transfer";
 import leadsRouter from "./leads";
 import leadCallsRouter from "./lead-calls";
 import campaignsRouter from "./campaigns";
+import teamRouter from "./team";
+import topicsRouter from "./topics";
+import hoursRouter from "./hours";
 import leadOutcomesRouter from "./lead-outcomes";
 import publicLeadRouter from "./public-lead";
 import twilioCallbacksRouter from "./twilio-callbacks";
@@ -102,6 +105,14 @@ router.use(leadCallsRouter);
 // and same requireAuth + requirePermission gating. Before the catch-
 // all apiRouter so /api/business/campaigns is claimed here.
 router.use(campaignsRouter);
+// Phase 3.1a: team + topics + hours (/api/business/team*, /api/business/topics*,
+// /api/business/hours*). Mounted alongside campaignsRouter — same
+// /business/* resource tree and same requireAuth + requirePermission
+// gating. Before the catch-all apiRouter so /api/business/team is
+// claimed here.
+router.use(teamRouter);
+router.use(topicsRouter);
+router.use(hoursRouter);
 // Slice 3A pillar 1: outcome capture per lead-call.
 //   POST /api/business/leads/:id/calls/:callSid/outcome
 // Mounted alongside leadCallsRouter — both deal with the same
