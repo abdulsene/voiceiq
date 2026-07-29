@@ -39,15 +39,30 @@ export type RoutingPath =
  * Conventional values for calls.handoff_reason. Kept in sync with the
  * migration 040 header comment so ops can grep for reasons across DB
  * rows and code.
+ *
+ * Phase 3.2c lifecycle: routing-time reasons end in `_ringing`. The
+ * dial-status webhook (routes/routing.handleDialStatus) promotes the
+ * ringing suffix to `_answered` on DialCallStatus=completed, and
+ * escalates to `all_staff_no_answer` on DialCallStatus=no-answer.
+ * Terminal (no-dial) reasons — after_hours_callback, graceful_hangup,
+ * topic_no_longer_configured — have no suffix and are never promoted.
  */
 export type HandoffReason =
+  // Routing-time (ringing) — set by decideRouting()
+  | "topic_match_ringing"
+  | "fallback_any_on_duty_ringing"
+  | "no_staff_during_hours_ringing"
+  // Post-dial (answered) — set by handleDialStatus on completed
   | "topic_match_answered"
-  | "fallback_any_on_duty"
-  | "no_staff_during_hours"
-  | "after_hours_callback"
-  | "topic_no_longer_configured"
+  | "fallback_any_on_duty_answered"
+  | "no_staff_during_hours_answered"
+  // Post-dial escalation — set by handleDialStatus on no-answer
   | "all_staff_no_answer"
-  | "graceful_hangup";
+  // Terminal (no dial)
+  | "after_hours_callback"
+  | "graceful_hangup"
+  // Race flag — routing time, orthogonal to _ringing/_answered
+  | "topic_no_longer_configured";
 
 /**
  * Conventional values for calls.transfer_status. Not exhaustive — the
@@ -133,7 +148,7 @@ export function decideRouting(inputs: RoutingInputs): RoutingDecision {
       staffPhones: forTopic.map((s) => s.callbackRingNumber),
       staffUserIds: forTopic.map((s) => s.userId),
       legacyPhone: null,
-      handoffReason: "topic_match_answered",
+      handoffReason: "topic_match_ringing",
       transferStatus: "routing_topic_match",
     };
   }
@@ -146,7 +161,7 @@ export function decideRouting(inputs: RoutingInputs): RoutingDecision {
       staffPhones: any.map((s) => s.callbackRingNumber),
       staffUserIds: any.map((s) => s.userId),
       legacyPhone: null,
-      handoffReason: "fallback_any_on_duty",
+      handoffReason: "fallback_any_on_duty_ringing",
       transferStatus: "routing_any_on_duty",
     };
   }
@@ -165,7 +180,7 @@ function fallbackFromNoStaff(
       staffPhones: [],
       staffUserIds: [],
       legacyPhone: inputs.legacyTransferToPhone,
-      handoffReason: raceReason ?? "no_staff_during_hours",
+      handoffReason: raceReason ?? "no_staff_during_hours_ringing",
       transferStatus: "legacy_transfer_to_phone",
     };
   }

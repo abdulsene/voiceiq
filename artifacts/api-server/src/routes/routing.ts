@@ -91,12 +91,22 @@ const CALL_SID_MAX = 200;
  * the Twilio REST redirect. Gives Alex time to speak the "connecting
  * you now…" acknowledgement before the media stream is torn down.
  *
- * Env-tunable so live-call tuning during the first Phase 3.2c pilot can
- * dial this up/down without a redeploy. Default 2500 = ~1 short
- * sentence at typical ElevenLabs speech cadence.
+ * Phase 3.2c: reduced 2500 → 800. pre_tool_speech:'force' on the
+ * tool schema (agents.ts) already ensures Alex speaks the
+ * acknowledgement BEFORE the tool fires — the two mechanisms were
+ * stacked; only one is needed. 800ms is a safety margin for LLM
+ * finish-speaking + HTTP round-trip.
+ *
+ * Env-tunable for further live-call tuning without redeploy.
+ *
+ * ⚠️ Durability limitation: this uses in-process setTimeout — if the
+ * api-server restarts / redeploys inside the delay window, the
+ * redirect is LOST and the call sits in dead air until Twilio times
+ * out. Acceptable at pilot scale; needs a durable job (Redis queue
+ * / BullMQ) before multi-tenant. Tracked in PHASE_3_TRIAGE.md.
  */
 const ROUTING_REDIRECT_DELAY_MS = Number.parseInt(
-  process.env.ROUTING_REDIRECT_DELAY_MS || "2500",
+  process.env.ROUTING_REDIRECT_DELAY_MS || "800",
   10,
 );
 
@@ -301,12 +311,21 @@ export interface RouteToTopicResult {
   twiml: string | null;
 }
 
-function publicStatusFor(decision: RoutingDecision): PublicRoutingStatus {
+function publicStatusFor(
+  decision: RoutingDecision,
+  redirectWillFire: boolean,
+): PublicRoutingStatus {
   switch (decision.path) {
     case "topic_match":
     case "any_on_duty":
     case "legacy_transfer":
-      return "connecting";
+      // Phase 3.2c safe-failure: if the routing engine picked a dial
+      // path but we cannot actually redirect the call (missing
+      // call_sid, no Twilio client), tell the LLM to fall back to
+      // request_callback instead of promising a connection that will
+      // never happen. Otherwise Alex says "connecting you now…" and
+      // the caller sits in dead air.
+      return redirectWillFire ? "connecting" : "taking_message";
     case "after_hours_callback":
       return "taking_message";
     case "graceful_hangup":
@@ -397,46 +416,64 @@ export async function handleRouteToTopic(
     twiml = buildDialTwiml(decision, dialOpts);
   }
 
-  // Best-effort UPDATE of the calls row.
-  // Only write handoff_reason (canonical as of 3.2b). transfer_reason
-  // is deprecated — no new writes. Keep transfer_status because
-  // it's the state machine we mutate in dial-status webhook later.
+  // Phase 3.2c — UPSERT (not UPDATE) keyed on call_sid. The routing
+  // webhook fires mid-call, BEFORE the post-call ElevenLabs webhook
+  // (routes/api.ts:490) inserts the calls row. Previously we UPDATEd
+  // by conversation_id which is NULL on 100% of production rows — the
+  // routing metadata never persisted. Now:
+  //
+  //   * Row keyed on call_sid (which historically stores the ElevenLabs
+  //     conversation_id in this codebase — see migration 041 header
+  //     for the naming quirk). ON CONFLICT (call_sid) DO UPDATE via
+  //     supabase-js `upsert(..., { onConflict: "call_sid" })`.
+  //   * If a mid-call tool row already exists (e.g. from
+  //     appointment_booking), the post-call handler will find and
+  //     merge (routes/api.ts:490 uses caller_number + created_at
+  //     lookup; our routing row is most-recent so it wins in the
+  //     rare route+book combined-tool case).
+  //   * `conversation_id` column is populated too (as an attribute) so
+  //     future readers migrating away from the call_sid alias have
+  //     the value on the same row.
   try {
-    const { data: updated, error: updateErr } = await supabase
+    const { error: upsertErr } = await supabase
       .from("calls")
-      .update({
-        topic_slug,
-        rung_user_ids: decision.staffUserIds,
-        handoff_reason: decision.handoffReason,
-        transfer_status: decision.transferStatus,
-      })
-      .eq("business_id", business_id)
-      .eq("conversation_id", conversation_id)
-      .select("id")
-      .maybeSingle();
-    if (updateErr) {
-      Sentry.captureMessage("route_to_topic_calls_update_failed", {
-        level: "warning",
-        extra: { business_id, conversation_id, error: updateErr.message },
-      });
-    } else if (!updated) {
-      Sentry.captureMessage("route_to_topic_calls_row_missing", {
-        level: "warning",
-        extra: { business_id, conversation_id, note: "calls row not yet inserted; routing metadata not persisted" },
+      .upsert(
+        {
+          call_sid: conversation_id,
+          conversation_id,
+          business_id,
+          topic_slug,
+          rung_user_ids: decision.staffUserIds,
+          handoff_reason: decision.handoffReason,
+          transfer_status: decision.transferStatus,
+          direction: "inbound",
+        },
+        { onConflict: "call_sid" },
+      );
+    if (upsertErr) {
+      Sentry.captureMessage("route_to_topic_calls_upsert_failed", {
+        level: "error",
+        extra: { business_id, conversation_id, error: upsertErr.message },
       });
     }
   } catch (err: any) {
-    Sentry.captureMessage("route_to_topic_calls_update_threw", {
-      level: "warning",
+    Sentry.captureMessage("route_to_topic_calls_upsert_threw", {
+      level: "error",
       extra: { business_id, conversation_id, error: err?.message },
     });
   }
 
-  // Schedule the Twilio REST redirect on dial paths.
+  // Decide whether the REST redirect can actually fire, so we can
+  // return the honest status label. If a dial path was picked but we
+  // can't complete the redirect (missing call_sid OR no Twilio
+  // client), we must NOT tell the LLM "connecting" — the caller
+  // would sit in dead air. See publicStatusFor.
+  let redirectWillFire = false;
   if (isDialPath && twiml && call_sid) {
     const twilioClient = opts.twilioClient !== undefined ? opts.twilioClient : getTwilioClient();
     const delayMs = opts.redirectDelayMs ?? ROUTING_REDIRECT_DELAY_MS;
     if (twilioClient) {
+      redirectWillFire = true;
       opts.onRedirectScheduled?.({ callSid: call_sid, twiml, delayMs });
       setTimeout(() => {
         void twilioClient
@@ -473,7 +510,7 @@ export async function handleRouteToTopic(
   return {
     ok: true,
     result: {
-      status: publicStatusFor(decision),
+      status: publicStatusFor(decision, redirectWillFire),
       topic_name: topicName,
       staff_count: decision.staffPhones.length,
       handoff_reason: decision.handoffReason,
@@ -528,11 +565,37 @@ export interface DialStatusBody {
 }
 
 /**
+ * Normalize a phone number to its last 10 digits for comparison.
+ * Handles E.164 (+14155551234) vs national (415-555-1234) vs
+ * parenthesized ((415) 555-1234) vs raw digits. Non-strings and
+ * empties return "". Anything shorter than 10 digits after
+ * normalization returns the raw digits (partial numbers won't match
+ * anyway).
+ *
+ * Phase 3.2c — Twilio's `To` field on Dial callbacks is E.164 but our
+ * `callback_ring_number` column could be stored in various formats
+ * depending on the invite path; compare-by-normalized-last-10 avoids
+ * silently failing to resolve handled_by_user_id due to formatting.
+ */
+export function normalizePhone(input: string | undefined | null): string {
+  if (typeof input !== "string") return "";
+  const digits = input.replace(/\D+/g, "");
+  return digits.length >= 10 ? digits.slice(-10) : digits;
+}
+
+/**
  * Given the answered E.164 (`To` from Twilio's Dial callback), look up
  * which auth.users.id it maps to. Uses the rung_user_ids stored on the
  * calls row from route-to-topic + a per-user callback_ring_number join.
  * Best-effort: returns null if no match (Twilio can send this callback
  * even when nobody answered).
+ *
+ * Phase 3.2c — re-keyed to look up the calls row by call_sid
+ * (which stores the ElevenLabs conversation_id in this codebase, per
+ * migration 041 header). Phone comparison is normalized (last-10-digits)
+ * to survive E.164 vs national format mismatches between Twilio's
+ * callback (always E.164) and whatever the tenant admin entered in
+ * their team settings.
  */
 async function resolveHandledByUserId(
   supabase: SupabaseClient,
@@ -541,11 +604,14 @@ async function resolveHandledByUserId(
   answeredPhone: string | undefined,
 ): Promise<string | null> {
   if (!answeredPhone) return null;
+  const targetNorm = normalizePhone(answeredPhone);
+  if (!targetNorm) return null;
+
   const { data: callRow } = await supabase
     .from("calls")
     .select("rung_user_ids")
     .eq("business_id", businessId)
-    .eq("conversation_id", conversationId)
+    .eq("call_sid", conversationId)
     .maybeSingle();
   const rungIds = (callRow as { rung_user_ids?: string[] } | null)?.rung_user_ids;
   if (!Array.isArray(rungIds) || rungIds.length === 0) return null;
@@ -556,8 +622,22 @@ async function resolveHandledByUserId(
     .eq("business_id", businessId)
     .in("user_id", rungIds);
   const match = ((matches as Array<{ user_id: string; callback_ring_number: string | null }> | null) ?? [])
-    .find((r) => r.callback_ring_number && r.callback_ring_number.trim() === answeredPhone.trim());
+    .find((r) => normalizePhone(r.callback_ring_number) === targetNorm);
   return match?.user_id ?? null;
+}
+
+/**
+ * Promote a routing-time handoff_reason ending in "_ringing" to its
+ * "_answered" counterpart. Returns null if the reason isn't in the
+ * ringing family — the caller should NOT overwrite handoff_reason in
+ * that case. Race flags like `topic_no_longer_configured` are preserved.
+ */
+export function promoteHandoffReasonOnAnswer(current: string | null | undefined): string | null {
+  if (!current || typeof current !== "string") return null;
+  if (current.endsWith("_ringing")) {
+    return current.slice(0, -"_ringing".length) + "_answered";
+  }
+  return null;
 }
 
 export async function handleDialStatus(
@@ -574,6 +654,20 @@ export async function handleDialStatus(
     ? await resolveHandledByUserId(supabase, business_id, conversation_id, To)
     : null;
 
+  // Phase 3.2c — separate concerns:
+  //   * transfer_status   = ALWAYS updated (this is the state machine)
+  //   * transfer_answered = ALWAYS updated (mirrors DialCallStatus)
+  //   * handled_by_user_id + handled_at = only on answered
+  //   * handoff_reason    = ONLY touched in two cases:
+  //       (1) DialCallStatus=completed: promote *_ringing → *_answered
+  //           (routing labelled *_ringing at tool-time; dial-completed
+  //            confirms someone actually picked up).
+  //       (2) DialCallStatus=no-answer: escalate to
+  //           'all_staff_no_answer' (routing rang, everyone timed out).
+  //       Do NOT touch handoff_reason on busy / canceled / failed:
+  //       those are Twilio call-outcome details, orthogonal to which
+  //       routing PATH the engine took. The routing path stays in
+  //       handoff_reason; the outcome lives in transfer_status.
   const patch: Record<string, unknown> = {
     transfer_status: mapped.transferStatus,
     transfer_answered: mapped.transferAnswered,
@@ -582,10 +676,25 @@ export async function handleDialStatus(
     patch.handled_by_user_id = handledByUserId;
     patch.handled_at = now.toISOString();
   }
-  // If nobody answered, escalate handoff_reason to reflect the
-  // no-answer outcome. Don't overwrite an existing "answered" reason
-  // in the rare double-fire case.
-  if (!mapped.transferAnswered) {
+
+  if (mapped.transferAnswered) {
+    // Promote *_ringing → *_answered. Requires reading the current
+    // handoff_reason. If we can't read it (row missing, other error),
+    // leave the column alone — better to preserve than to overwrite
+    // with the wrong _answered variant.
+    const { data: currentRow } = await supabase
+      .from("calls")
+      .select("handoff_reason")
+      .eq("business_id", business_id)
+      .eq("call_sid", conversation_id)
+      .maybeSingle();
+    const current = (currentRow as { handoff_reason?: string | null } | null)?.handoff_reason;
+    const promoted = promoteHandoffReasonOnAnswer(current);
+    if (promoted) patch.handoff_reason = promoted;
+  } else if (DialCallStatus === "no-answer") {
+    // ONLY no-answer escalates — that's the "we tried, nobody picked
+    // up" signal. busy / canceled / failed reflect Twilio call-outcome
+    // metadata that doesn't invalidate the routing path chosen.
     patch.handoff_reason = "all_staff_no_answer";
   }
 
@@ -594,7 +703,7 @@ export async function handleDialStatus(
       .from("calls")
       .update(patch)
       .eq("business_id", business_id)
-      .eq("conversation_id", conversation_id);
+      .eq("call_sid", conversation_id);
   } catch (err: any) {
     Sentry.captureMessage("dial_status_update_failed", {
       level: "warning",

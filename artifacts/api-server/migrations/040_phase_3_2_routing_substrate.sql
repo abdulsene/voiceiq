@@ -14,13 +14,25 @@
 --   * `handled_at` — timestamp of pickup. Used for time-to-answer metrics.
 --   * `handoff_reason` — TEXT explaining the routing decision. Free-form
 --     but conventional values enumerated in the header of routes/routing.ts:
---       'topic_match_answered'          — routed to a topic specialist who picked up
---       'fallback_any_on_duty'          — no topic match; rang everyone on-duty
---       'no_staff_during_hours'         — nobody on-duty; used legacy transfer_to_phone
---       'after_hours_callback'          — after hours; AI took a message
---       'topic_no_longer_configured'    — race: departments cleared after Alex read them
---       'all_staff_no_answer'           — everyone rang, nobody answered
---       'graceful_hangup'               — no fallback config, AI said sorry and hung up
+--       Phase 3.2c lifecycle: routing-time reasons end in _ringing; the
+--       dial-status webhook promotes to _answered on completed OR
+--       escalates to all_staff_no_answer on no-answer. Terminal
+--       (no-dial) reasons are un-suffixed. Full list:
+--         Routing-time (ringing):
+--           'topic_match_ringing'            — matched topic specialists, ringing them
+--           'fallback_any_on_duty_ringing'   — no topic match; ringing anyone on-duty
+--           'no_staff_during_hours_ringing'  — nobody on-duty; ringing legacy transfer_to_phone
+--         Post-dial (answered) — set by handleDialStatus on completed:
+--           'topic_match_answered'
+--           'fallback_any_on_duty_answered'
+--           'no_staff_during_hours_answered'
+--         Post-dial escalation — set by handleDialStatus on no-answer:
+--           'all_staff_no_answer'            — rang, nobody picked up
+--         Terminal (no dial):
+--           'after_hours_callback'           — after hours; AI took a message
+--           'graceful_hangup'                — no fallback config, AI said sorry and hung up
+--         Race flag (routing-time, orthogonal to ringing/answered):
+--           'topic_no_longer_configured'     — departments cleared after Alex read them
 --   * `topic_slug` — the topic Alex identified (from business_configs.departments).
 --     Written even on fallback paths so reporting can measure "topics Alex
 --     identified but we couldn't route." Deliberately different from the
@@ -123,7 +135,7 @@ COMMENT ON COLUMN calls.handled_at IS
   'Phase 3.2: Timestamp when the staff member picked up (bridge connected). Powers time-to-answer metrics and per-staff reporting. NULL for calls that never bridged to a human.';
 
 COMMENT ON COLUMN calls.handoff_reason IS
-  'Phase 3.2: Which fallback path the routing engine took. Conventional values (enumerated in routes/routing.ts): topic_match_answered, fallback_any_on_duty, no_staff_during_hours, after_hours_callback, topic_no_longer_configured, all_staff_no_answer, graceful_hangup. NULL when the AI handled the call natively (no routing invoked).';
+  'Phase 3.2: Routing engine decision + lifecycle stage. Routing-time values end in _ringing (topic_match_ringing, fallback_any_on_duty_ringing, no_staff_during_hours_ringing); post-dial-completed values end in _answered (topic_match_answered, fallback_any_on_duty_answered, no_staff_during_hours_answered); no-answer escalates to all_staff_no_answer; race flag topic_no_longer_configured is orthogonal. Terminal no-dial reasons: after_hours_callback, graceful_hangup. NULL when the AI handled the call natively (no routing invoked). Full enum in src/lib/routing/fallback-logic.ts:HandoffReason.';
 
 COMMENT ON COLUMN calls.topic_slug IS
   'Phase 3.2: Topic Alex identified for this call, matching a slug in business_configs.departments. Written on every routing attempt — even ones that fell back or failed — so reporting can measure "topics identified but not routed." Different from the legacy calls.department_routed column (which is dead code — 0 rows populated in prod at migration time; superseded by this column).';

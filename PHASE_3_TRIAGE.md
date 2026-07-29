@@ -477,3 +477,37 @@ Two related items:
 Marketing dev, not engine work.
 
 **Labels:** `marketing`, `phase-3`
+
+---
+
+### Routing redirect uses in-process setTimeout (not durable) — Phase 3.2c
+
+**Body:**
+
+Filed from Phase 3.2c (commit forthcoming) to unblock durability
+before multi-tenant load.
+
+`routes/routing.ts:handleRouteToTopic` schedules the Twilio REST
+`client.calls(callSid).update({twiml})` redirect via a plain
+`setTimeout(fn, ROUTING_REDIRECT_DELAY_MS)` (default 800ms in 3.2c;
+was 2500ms in 3.2b). If the api-server process restarts / redeploys
+inside that delay window, the callback never fires and the caller
+sits in dead air until Twilio times out. Alex has ALREADY told them
+"connecting you now…" via `pre_tool_speech:'force'` — so the failure
+is silent and looks like a hard cutoff to the customer.
+
+Acceptable at Phase 3.2c pilot scale (one live tenant, low volume,
+redeploys are rare + manually scheduled). NOT acceptable before
+multi-tenant rollout, autoscaling, or any deployment cadence where
+a redeploy can plausibly land inside an 800ms window during a call.
+
+Fix: durable job queue. Options:
+  * BullMQ + Redis (heavier — adds infra)
+  * pg_boss (Postgres-backed queue, no new infra)
+  * Simple in-DB `pending_routing_redirects` table with a 250ms
+    poll worker (crude but survives restart)
+
+Whichever we pick, the redirect scheduling site is one function
+call (~5 lines) — the change is contained to `routes/routing.ts`.
+
+**Labels:** `phase-3`, `routing`, `durability`

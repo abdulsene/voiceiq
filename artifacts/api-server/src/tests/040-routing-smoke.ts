@@ -66,6 +66,8 @@ import {
   handleDialStatus,
   mapDialStatus,
   parseRouteBody,
+  normalizePhone,
+  promoteHandoffReasonOnAnswer,
   type TwilioCallControl,
 } from "../routes/routing";
 import { buildRouteToTopicTool } from "../agents";
@@ -94,6 +96,7 @@ type FakeCall = {
   inFilters: Array<{ column: string; values: any[] }>;
   orderBy?: { column: string; ascending: boolean };
   payload?: any;
+  upsertOptions?: any;
 };
 type FakeResponse = {
   match: (call: FakeCall) => boolean;
@@ -115,6 +118,12 @@ class FakeBuilder {
   update(payload: any) {
     this.call.op = "update";
     this.call.payload = payload;
+    return this;
+  }
+  upsert(payload: any, options?: any) {
+    this.call.op = "upsert";
+    this.call.payload = payload;
+    this.call.upsertOptions = options;
     return this;
   }
   delete() {
@@ -257,7 +266,13 @@ function stubDefaultBusiness(
     (c) => c.op === "select" && c.table === "business_configs" && c.selectColumns === "business_hours",
     { data: { business_hours: "Monday-Friday 9AM-5PM" } },
   );
-  // calls UPDATE — best-effort row match.
+  // Phase 3.2c: routing writes are UPSERTs (not UPDATEs) so a mid-call
+  // routing event creates the row if the post-call webhook hasn't fired.
+  // dial-status still uses plain UPDATE.
+  fake.on(
+    (c) => c.op === "upsert" && c.table === "calls",
+    { data: { id: CALL_ID } },
+  );
   fake.on(
     (c) => c.op === "update" && c.table === "calls",
     { data: { id: CALL_ID } },
@@ -314,9 +329,9 @@ async function T1_single_match_topic() {
   if (d.staffPhones.length !== 1) failures.push(`phones=${d.staffPhones.length}`);
   if (d.staffPhones[0] !== PHONE_A) failures.push(`phone[0]=${d.staffPhones[0]}`);
   if (d.staffUserIds[0] !== USER_A) failures.push(`user_id[0]=${d.staffUserIds[0]}`);
-  if (d.handoffReason !== "topic_match_answered") failures.push(`reason=${d.handoffReason}`);
+  if (d.handoffReason !== "topic_match_ringing") failures.push(`reason=${d.handoffReason}`);
   if (d.transferStatus !== "routing_topic_match") failures.push(`status=${d.transferStatus}`);
-  record("T1 single match topic", failures.length === 0, failures.join("; ") || "topic_match with 1 phone + user + correct labels");
+  record("T1 single match topic (routing time: _ringing)", failures.length === 0, failures.join("; ") || "topic_match with 1 phone + user + _ringing label");
 }
 
 async function T2_multiple_matches_simultaneous() {
@@ -360,9 +375,9 @@ async function T3_no_topic_match_any_on_duty() {
   const d = decideRouting(inputs);
   const failures: string[] = [];
   if (d.path !== "any_on_duty") failures.push(`path=${d.path}`);
-  if (d.handoffReason !== "fallback_any_on_duty") failures.push(`reason=${d.handoffReason}`);
+  if (d.handoffReason !== "fallback_any_on_duty_ringing") failures.push(`reason=${d.handoffReason}`);
   if (d.staffPhones[0] !== PHONE_B) failures.push(`phone[0]=${d.staffPhones[0]}`);
-  record("T3 no topic match → any_on_duty", failures.length === 0, failures.join("; ") || "any_on_duty w/ fallback_any_on_duty");
+  record("T3 no topic match → any_on_duty (routing time: _ringing)", failures.length === 0, failures.join("; ") || "any_on_duty w/ fallback_any_on_duty_ringing");
 }
 
 async function T4_no_on_duty_legacy_transfer() {
@@ -377,9 +392,9 @@ async function T4_no_on_duty_legacy_transfer() {
   const failures: string[] = [];
   if (d.path !== "legacy_transfer") failures.push(`path=${d.path}`);
   if (d.legacyPhone !== LEGACY_PHONE) failures.push(`legacyPhone=${d.legacyPhone}`);
-  if (d.handoffReason !== "no_staff_during_hours") failures.push(`reason=${d.handoffReason}`);
+  if (d.handoffReason !== "no_staff_during_hours_ringing") failures.push(`reason=${d.handoffReason}`);
   if (d.transferStatus !== "legacy_transfer_to_phone") failures.push(`status=${d.transferStatus}`);
-  record("T4 no on-duty + hours open → legacy_transfer", failures.length === 0, failures.join("; ") || "legacy_transfer w/ no_staff_during_hours");
+  record("T4 no on-duty + hours open → legacy_transfer (routing: _ringing)", failures.length === 0, failures.join("; ") || "legacy_transfer w/ no_staff_during_hours_ringing");
 }
 
 async function T5_no_on_duty_after_hours() {
@@ -529,15 +544,18 @@ async function T11_rung_user_ids_logged() {
   const result = await handleRouteToTopic(asClient(fake), baseBody);
   const failures: string[] = [];
   if (!result.ok) failures.push(`not ok: ${(result as any).error}`);
-  const update = fake.calls.find((c) => c.op === "update" && c.table === "calls");
-  if (!update) failures.push("no calls UPDATE issued");
-  const rung = update?.payload?.rung_user_ids as string[] | undefined;
+  // Phase 3.2c: routing writes are UPSERTs, not UPDATEs.
+  const upsert = fake.calls.find((c) => c.op === "upsert" && c.table === "calls");
+  if (!upsert) failures.push("no calls UPSERT issued");
+  const rung = upsert?.payload?.rung_user_ids as string[] | undefined;
   if (!Array.isArray(rung)) failures.push(`rung_user_ids not array: ${typeof rung}`);
   else {
     if (rung.length !== 2) failures.push(`rung length=${rung.length}`);
     if (!rung.includes(USER_A) || !rung.includes(USER_B)) failures.push(`rung missing users: ${rung.join(",")}`);
   }
-  record("T11 rung_user_ids logged with dialed users", failures.length === 0, failures.join("; ") || "calls.rung_user_ids = [USER_A, USER_B]");
+  // Verify onConflict target = "call_sid" (the whole point of 3.2c).
+  if (upsert?.upsertOptions?.onConflict !== "call_sid") failures.push(`onConflict=${upsert?.upsertOptions?.onConflict} (expected "call_sid")`);
+  record("T11 UPSERT rung_user_ids + onConflict=call_sid", failures.length === 0, failures.join("; ") || "upsert with rung_user_ids array + call_sid conflict target");
 }
 
 async function T12_topic_slug_and_reason_written() {
@@ -551,17 +569,23 @@ async function T12_topic_slug_and_reason_written() {
   const result = await handleRouteToTopic(asClient(fake), baseBody);
   const failures: string[] = [];
   if (!result.ok) failures.push(`not ok: ${(result as any).error}`);
-  const update = fake.calls.find((c) => c.op === "update" && c.table === "calls");
-  if (update?.payload?.topic_slug !== TOPIC_ROADSIDE) failures.push(`topic_slug=${update?.payload?.topic_slug}`);
-  if (update?.payload?.handoff_reason !== "topic_match_answered") failures.push(`handoff_reason=${update?.payload?.handoff_reason}`);
-  // Phase 3.2b: transfer_reason is DEPRECATED — the routing engine no
-  // longer writes to it. Ensure the update payload has NO transfer_reason
-  // key (canonical is handoff_reason).
-  if ("transfer_reason" in (update?.payload || {})) failures.push(`transfer_reason should NOT be written (deprecated): got ${update?.payload?.transfer_reason}`);
-  // Tenant-scoped UPDATE.
-  if (!update?.eqFilters.some((f) => f.column === "business_id" && f.value === BIZ)) failures.push("UPDATE missing business_id filter");
-  if (!update?.eqFilters.some((f) => f.column === "conversation_id" && f.value === CONV)) failures.push("UPDATE missing conversation_id filter");
-  record("T12 topic_slug + handoff_reason written (transfer_reason deprecated)", failures.length === 0, failures.join("; ") || "fields set + tenant scoped + no legacy transfer_reason");
+  // Phase 3.2c: UPSERT keyed on call_sid. The payload carries every
+  // routing-relevant column plus business_id + call_sid so a fresh
+  // INSERT would land a complete row for the post-call handler to
+  // merge into.
+  const upsert = fake.calls.find((c) => c.op === "upsert" && c.table === "calls");
+  if (!upsert) failures.push("no calls UPSERT issued");
+  if (upsert?.payload?.topic_slug !== TOPIC_ROADSIDE) failures.push(`topic_slug=${upsert?.payload?.topic_slug}`);
+  // Phase 3.2c: routing writes _ringing (not _answered) — dial-status
+  // promotes on DialCallStatus=completed.
+  if (upsert?.payload?.handoff_reason !== "topic_match_ringing") failures.push(`handoff_reason=${upsert?.payload?.handoff_reason}`);
+  if (upsert?.payload?.business_id !== BIZ) failures.push(`payload business_id=${upsert?.payload?.business_id}`);
+  // Phase 3.2c: call_sid on the payload = conversation_id from the tool
+  // body (per the historical calls.call_sid ← conversation_id alias).
+  if (upsert?.payload?.call_sid !== CONV) failures.push(`payload call_sid=${upsert?.payload?.call_sid}`);
+  // Phase 3.2b: transfer_reason DEPRECATED — no writes.
+  if ("transfer_reason" in (upsert?.payload || {})) failures.push(`transfer_reason should NOT be written (deprecated): got ${upsert?.payload?.transfer_reason}`);
+  record("T12 UPSERT payload: topic_slug + handoff_reason=_ringing + call_sid", failures.length === 0, failures.join("; ") || "upsert payload complete + _ringing at routing time + no deprecated writes");
 }
 
 async function T13_transfer_status_routing_topic_match() {
@@ -572,15 +596,23 @@ async function T13_transfer_status_routing_topic_match() {
     { user_id: USER_A, callback_ring_number: PHONE_A },
   ]);
 
-  const result = await handleRouteToTopic(asClient(fake), baseBody);
+  // Phase 3.2c: pass call_sid + mock Twilio client so redirect actually
+  // fires; public status should be "connecting". Without call_sid the
+  // safe-failure path returns "taking_message" instead (see T25).
+  const twilioMock = new MockTwilioClient();
+  const result = await handleRouteToTopic(
+    asClient(fake),
+    { ...baseBody, call_sid: "CA_test_t13" },
+    { twilioClient: twilioMock, redirectDelayMs: 0 },
+  );
+  await new Promise((r) => setTimeout(r, 5));
   const failures: string[] = [];
   if (!result.ok) failures.push(`not ok: ${(result as any).error}`);
-  // Phase 3.2b: public status label is 'connecting' (small alphabet for
-  // the LLM). Internal DB label transfer_status stays 'routing_topic_match'.
   if ((result as any).result?.status !== "connecting") failures.push(`public status=${(result as any).result?.status}`);
-  const update = fake.calls.find((c) => c.op === "update" && c.table === "calls");
-  if (update?.payload?.transfer_status !== "routing_topic_match") failures.push(`db transfer_status=${update?.payload?.transfer_status}`);
-  record("T13 public status='connecting' + db transfer_status='routing_topic_match'", failures.length === 0, failures.join("; ") || "public/internal split correct");
+  const upsert = fake.calls.find((c) => c.op === "upsert" && c.table === "calls");
+  if (upsert?.payload?.transfer_status !== "routing_topic_match") failures.push(`db transfer_status=${upsert?.payload?.transfer_status}`);
+  if (twilioMock.updates.length !== 1) failures.push(`Twilio update count=${twilioMock.updates.length}`);
+  record("T13 public status='connecting' + db transfer_status='routing_topic_match' + REST redirect fires", failures.length === 0, failures.join("; ") || "public 'connecting' matches redirect actually firing");
 }
 
 async function T14_handoff_reason_per_path() {
@@ -594,7 +626,7 @@ async function T14_handoff_reason_per_path() {
         legacyTransferToPhone: null,
         topicConfigured: true,
       },
-      expect: "topic_match_answered",
+      expect: "topic_match_ringing",
     },
     {
       inputs: {
@@ -604,7 +636,7 @@ async function T14_handoff_reason_per_path() {
         legacyTransferToPhone: null,
         topicConfigured: true,
       },
-      expect: "fallback_any_on_duty",
+      expect: "fallback_any_on_duty_ringing",
     },
     {
       inputs: {
@@ -614,7 +646,7 @@ async function T14_handoff_reason_per_path() {
         legacyTransferToPhone: LEGACY_PHONE,
         topicConfigured: true,
       },
-      expect: "no_staff_during_hours",
+      expect: "no_staff_during_hours_ringing",
     },
     {
       inputs: {
@@ -660,9 +692,9 @@ async function T15_topic_slug_written_on_no_match() {
   const result = await handleRouteToTopic(asClient(fake), baseBody); // asks for roadside
   const failures: string[] = [];
   if (!result.ok) failures.push(`not ok: ${(result as any).error}`);
-  const update = fake.calls.find((c) => c.op === "update" && c.table === "calls");
-  if (update?.payload?.topic_slug !== TOPIC_ROADSIDE) failures.push(`topic_slug=${update?.payload?.topic_slug} (should be logged even on no-match)`);
-  record("T15 topic_slug written even when no match", failures.length === 0, failures.join("; ") || "requested topic logged for reporting");
+  const upsert = fake.calls.find((c) => c.op === "upsert" && c.table === "calls");
+  if (upsert?.payload?.topic_slug !== TOPIC_ROADSIDE) failures.push(`topic_slug=${upsert?.payload?.topic_slug} (should be logged even on no-match)`);
+  record("T15 topic_slug written even when no match (UPSERT payload)", failures.length === 0, failures.join("; ") || "requested topic logged for reporting");
 }
 
 async function T16_body_validation() {
@@ -800,12 +832,14 @@ async function T21_topic_cleared_race() {
     const d = result.result.decision;
     if (d.path !== "any_on_duty") failures.push(`path=${d.path}`);
     if (d.handoffReason !== "topic_no_longer_configured") failures.push(`reason=${d.handoffReason}`);
-    // Phase 3.2b: public status 'connecting' (any_on_duty is a dial path).
-    if (result.result.status !== "connecting") failures.push(`public status=${result.result.status}`);
+    // Phase 3.2c: T21 doesn't pass call_sid → safe-failure path returns
+    // "taking_message" instead of "connecting". The routing DECISION
+    // itself is still any_on_duty; only the LLM-facing label degrades.
+    if (result.result.status !== "taking_message") failures.push(`public status=${result.result.status}`);
   }
-  const update = fake.calls.find((c) => c.op === "update" && c.table === "calls");
-  if (update?.payload?.handoff_reason !== "topic_no_longer_configured") failures.push(`persisted reason=${update?.payload?.handoff_reason}`);
-  if (update?.payload?.transfer_status !== "routing_any_on_duty") failures.push(`persisted transfer_status=${update?.payload?.transfer_status}`);
+  const upsert = fake.calls.find((c) => c.op === "upsert" && c.table === "calls");
+  if (upsert?.payload?.handoff_reason !== "topic_no_longer_configured") failures.push(`persisted reason=${upsert?.payload?.handoff_reason}`);
+  if (upsert?.payload?.transfer_status !== "routing_any_on_duty") failures.push(`persisted transfer_status=${upsert?.payload?.transfer_status}`);
   record("T21 topic cleared mid-call → any_on_duty w/ race reason", failures.length === 0, failures.join("; ") || "topic_no_longer_configured persists + any_on_duty path");
 }
 
@@ -918,12 +952,24 @@ async function T25_no_redirect_when_call_sid_missing() {
 
   const failures: string[] = [];
   if (!result.ok) failures.push(`not ok: ${(result as any).error}`);
-  // Handler should still produce a decision + response, but skip the REST redirect.
+  // Phase 3.2c: NO REST redirect issued (correct — no call_sid).
   if (scheduled.length !== 0) failures.push(`unexpected schedule: ${scheduled.length}`);
   if (twilioMock.updates.length !== 0) failures.push(`unexpected Twilio update: ${twilioMock.updates.length}`);
-  // The decision itself is still topic_match (we still logged rung_user_ids etc.).
-  if (result.ok && result.result.status !== "connecting") failures.push(`status=${(result as any).result?.status}`);
-  record("T25 no REST redirect when call_sid missing (graceful skip)", failures.length === 0, failures.join("; ") || "decision produced, no dial issued");
+  // Phase 3.2c safe-failure: LLM MUST get status='taking_message' so
+  // Alex pivots to request_callback. Returning 'connecting' would be
+  // a promise we can't keep — the previous test encoded the bug by
+  // asserting 'connecting'. Inverted here.
+  if (result.ok && result.result.status !== "taking_message") {
+    failures.push(`public status=${(result as any).result?.status} (expected 'taking_message' — safe-failure path)`);
+  }
+  // The routing decision itself is still topic_match (metadata logged
+  // via UPSERT so post-mortem can see we tried).
+  if (result.ok && result.result.decision.path !== "topic_match") {
+    failures.push(`decision.path=${result.result.decision.path} (should still be topic_match)`);
+  }
+  const upsert = fake.calls.find((c) => c.op === "upsert" && c.table === "calls");
+  if (!upsert) failures.push("expected UPSERT to still write routing metadata even w/o redirect");
+  record("T25 no call_sid → public status='taking_message' + no redirect + still UPSERTs metadata", failures.length === 0, failures.join("; ") || "safe-failure inverted: pivots to callback, no dead air");
 }
 
 async function T26_map_dial_status() {
@@ -947,10 +993,16 @@ async function T26_map_dial_status() {
 
 async function T27_dial_status_answered() {
   const fake = new FakeSupabaseClient();
-  // Stub the two SELECTs handleDialStatus fires (rung_user_ids lookup + user_businesses map).
+  // Column-specific stubs — handleDialStatus does TWO selects on
+  // `calls`: (1) rung_user_ids for handled_by resolution, (2)
+  // handoff_reason for _ringing → _answered promotion.
   fake.on(
-    (c) => c.op === "select" && c.table === "calls",
+    (c) => c.op === "select" && c.table === "calls" && c.selectColumns === "rung_user_ids",
     { data: { rung_user_ids: [USER_A, USER_B] } },
+  );
+  fake.on(
+    (c) => c.op === "select" && c.table === "calls" && c.selectColumns === "handoff_reason",
+    { data: { handoff_reason: "topic_match_ringing" } },
   );
   fake.on(
     (c) => c.op === "select" && c.table === "user_businesses",
@@ -980,7 +1032,15 @@ async function T27_dial_status_answered() {
   if (update?.payload?.transfer_answered !== true) failures.push(`update transfer_answered=${update?.payload?.transfer_answered}`);
   if (update?.payload?.handled_by_user_id !== USER_B) failures.push(`update handled_by_user_id=${update?.payload?.handled_by_user_id}`);
   if (!update?.payload?.handled_at) failures.push("update missing handled_at");
-  record("T27 dial-status answered → transfer_status + handled_by + handled_at", failures.length === 0, failures.join("; ") || "all writes correct, handled_by matched by To phone");
+  // Phase 3.2c: promotion — topic_match_ringing → topic_match_answered.
+  if (update?.payload?.handoff_reason !== "topic_match_answered") {
+    failures.push(`update handoff_reason=${update?.payload?.handoff_reason} (expected 'topic_match_answered' — promoted from _ringing)`);
+  }
+  // Update must be keyed on call_sid (not conversation_id, which is NULL in prod).
+  if (!update?.eqFilters.some((f) => f.column === "call_sid" && f.value === CONV)) {
+    failures.push("update missing eq(call_sid) filter — routing-key rekey missing");
+  }
+  record("T27 dial-status answered → transfer_status + handled_by + handoff promoted _answered + keyed on call_sid", failures.length === 0, failures.join("; ") || "all writes correct, promotion fires, call_sid keying used");
 }
 
 async function T28_dial_status_no_answer() {
@@ -1130,6 +1190,123 @@ async function T33_prompt_renders_departments_section() {
   record("T33 prompt-renderer: DEPARTMENTS section renders topics + omitted when absent", failures.length === 0, failures.join("; ") || "section renders w/ slug + name + utterances; omitted when no topics");
 }
 
+// ── Phase 3.2c additions ────────────────────────────────────────────
+
+async function T34_dial_status_busy_canceled_failed_preserve_handoff() {
+  // busy / canceled / failed reflect Twilio call-outcome — the routing
+  // PATH we took is orthogonal. handoff_reason must stay untouched.
+  const failures: string[] = [];
+  for (const status of ["busy", "canceled", "failed"] as const) {
+    const fake = new FakeSupabaseClient();
+    fake.on((c) => c.op === "update" && c.table === "calls", { data: { id: CALL_ID } });
+    // We also stub the calls SELECTs so we can assert they were NOT
+    // called for handoff_reason promotion (only completed does that).
+    let handoffSelectCount = 0;
+    fake.on(
+      (c) => c.op === "select" && c.table === "calls" && c.selectColumns === "handoff_reason",
+      { data: { handoff_reason: "topic_match_ringing" } },
+    );
+    const origResolve = fake.resolveCall.bind(fake);
+    fake.resolveCall = async function (call: any) {
+      if (call.op === "select" && call.table === "calls" && call.selectColumns === "handoff_reason") {
+        handoffSelectCount++;
+      }
+      return origResolve(call);
+    };
+
+    await handleDialStatus(asClient(fake), {
+      business_id: BIZ,
+      conversation_id: CONV,
+      DialCallStatus: status,
+      To: PHONE_A,
+    });
+    const update = fake.calls.find((c) => c.op === "update" && c.table === "calls");
+    if (!update) {
+      failures.push(`[${status}] no UPDATE issued`);
+      continue;
+    }
+    if (update.payload?.transfer_status !== status) failures.push(`[${status}] transfer_status=${update.payload?.transfer_status}`);
+    // Critical assertion — handoff_reason MUST NOT be in the payload.
+    if ("handoff_reason" in update.payload) {
+      failures.push(`[${status}] handoff_reason present in payload (${update.payload.handoff_reason}) — should NOT be touched`);
+    }
+    // Handoff SELECT should NOT have fired (only fires for answered → promotion).
+    if (handoffSelectCount !== 0) {
+      failures.push(`[${status}] handoff_reason SELECT fired ${handoffSelectCount} times (should be 0 — no promotion path)`);
+    }
+  }
+  record("T34 dial-status busy/canceled/failed preserve handoff_reason", failures.length === 0, failures.join("; ") || "3 outcomes: transfer_status updated, handoff_reason untouched, no promotion select");
+}
+
+async function T35_normalize_phone() {
+  const failures: string[] = [];
+  const cases: Array<{ input: string | null | undefined; want: string; label: string }> = [
+    { input: "+14155551234", want: "4155551234", label: "E.164 US" },
+    { input: "(415) 555-1234", want: "4155551234", label: "national parenthesized" },
+    { input: "415.555.1234", want: "4155551234", label: "dot-separated" },
+    { input: "1-415-555-1234", want: "4155551234", label: "leading 1 dashes" },
+    { input: "  +1 415 555 1234  ", want: "4155551234", label: "whitespace" },
+    { input: null, want: "", label: "null" },
+    { input: undefined, want: "", label: "undefined" },
+    { input: "", want: "", label: "empty" },
+    { input: "555", want: "555", label: "short (partial)" },
+  ];
+  for (const c of cases) {
+    const got = normalizePhone(c.input);
+    if (got !== c.want) failures.push(`[${c.label}] got "${got}" want "${c.want}"`);
+  }
+  record("T35 normalizePhone: last-10-digits comparison", failures.length === 0, failures.join("; ") || "9 formats all normalize to last-10 digits");
+}
+
+async function T36_promote_handoff_reason() {
+  const failures: string[] = [];
+  const cases: Array<{ input: string | null | undefined; want: string | null; label: string }> = [
+    { input: "topic_match_ringing", want: "topic_match_answered", label: "topic_match_ringing → _answered" },
+    { input: "fallback_any_on_duty_ringing", want: "fallback_any_on_duty_answered", label: "fallback_any_on_duty_ringing → _answered" },
+    { input: "no_staff_during_hours_ringing", want: "no_staff_during_hours_answered", label: "no_staff_during_hours_ringing → _answered" },
+    { input: "topic_no_longer_configured", want: null, label: "race flag preserved (no promotion)" },
+    { input: "after_hours_callback", want: null, label: "terminal preserved" },
+    { input: "graceful_hangup", want: null, label: "terminal preserved" },
+    { input: null, want: null, label: "null input" },
+    { input: "", want: null, label: "empty input" },
+    { input: "already_answered", want: null, label: "unknown suffix preserved" },
+  ];
+  for (const c of cases) {
+    const got = promoteHandoffReasonOnAnswer(c.input);
+    if (got !== c.want) failures.push(`[${c.label}] got ${JSON.stringify(got)} want ${JSON.stringify(c.want)}`);
+  }
+  record("T36 promoteHandoffReasonOnAnswer: only _ringing suffix promotes", failures.length === 0, failures.join("; ") || "3 ringing→answered + race + terminals + null all handled");
+}
+
+async function T37_zero_match_upsert_creates_row() {
+  // Simulates the primary Blocker-1 fix: routing webhook fires BEFORE
+  // the post-call handler has inserted the calls row. Under 3.2b's
+  // .update().eq("conversation_id",…) shape, no row matched and the
+  // routing metadata was lost. Under 3.2c's upsert, the row is
+  // CREATED with a complete payload.
+  const fake = new FakeSupabaseClient();
+  stubDefaultBusiness(fake);
+  stubStaffTopics(fake, [{ user_id: USER_A, topic_slug: TOPIC_ROADSIDE }]);
+  stubUserBusinessesOnDuty(fake, [
+    { user_id: USER_A, callback_ring_number: PHONE_A },
+  ]);
+  // stubDefaultBusiness stubs the upsert with data:{id: CALL_ID} —
+  // simulating a successful INSERT-via-UPSERT with no prior row.
+
+  const result = await handleRouteToTopic(asClient(fake), baseBody);
+  const failures: string[] = [];
+  if (!result.ok) failures.push(`not ok: ${(result as any).error}`);
+  const upsert = fake.calls.find((c) => c.op === "upsert" && c.table === "calls");
+  if (!upsert) failures.push("no upsert issued");
+  // Verify the payload has all fields needed to bootstrap a fresh row.
+  if (upsert?.payload?.business_id !== BIZ) failures.push(`payload business_id=${upsert?.payload?.business_id}`);
+  if (upsert?.payload?.call_sid !== CONV) failures.push(`payload call_sid=${upsert?.payload?.call_sid}`);
+  if (upsert?.payload?.conversation_id !== CONV) failures.push(`payload conversation_id=${upsert?.payload?.conversation_id} (mirrors for future readers)`);
+  if (upsert?.payload?.direction !== "inbound") failures.push(`payload direction=${upsert?.payload?.direction}`);
+  if (upsert?.upsertOptions?.onConflict !== "call_sid") failures.push(`onConflict=${upsert?.upsertOptions?.onConflict}`);
+  record("T37 UPSERT bootstraps row when post-call webhook hasn't fired", failures.length === 0, failures.join("; ") || "upsert with complete payload + onConflict=call_sid — Blocker 1 fix");
+}
+
 // ── Bonus: whisper composition and TwiML ────────────────────────────
 
 async function whisper_composition() {
@@ -1186,6 +1363,11 @@ async function main() {
   await T31_route_to_topic_tool_empty_throws();
   await T32_tool_dynamic_variable_call_sid();
   await T33_prompt_renders_departments_section();
+  // Phase 3.2c additions
+  await T34_dial_status_busy_canceled_failed_preserve_handoff();
+  await T35_normalize_phone();
+  await T36_promote_handoff_reason();
+  await T37_zero_match_upsert_creates_row();
   await whisper_composition();
 
   const fails = results.filter((r) => !r.pass);
