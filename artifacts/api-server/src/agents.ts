@@ -33,12 +33,33 @@ const TRANSFER_TOOL_NAME = 'transfer_to_number';
 const REQUEST_CALLBACK_TOOL_NAME = 'request_callback';
 // Phase 2.2.5 — record_appointment tool name + URL.
 const RECORD_APPOINTMENT_TOOL_NAME = 'record_appointment';
+// Phase 3.2b — route_to_topic tool name + URL.
+const ROUTE_TO_TOPIC_TOOL_NAME = 'route_to_topic';
 // Default capture URL. Override per environment via LEADS_CAPTURE_URL.
 // Baked into the ElevenLabs agent config at PATCH time, so changing this
 // requires re-running updateAgentTools for every agent — a one-shot
 // resync script is cheap.
 const DEFAULT_LEADS_CAPTURE_URL = 'https://voice-i-q.replit.app/api/leads/capture';
 const DEFAULT_RECORD_APPOINTMENT_URL = 'https://voice-i-q.replit.app/api/leads/record-appointment';
+const DEFAULT_ROUTE_TO_TOPIC_URL = 'https://voice-i-q.replit.app/api/routing/route-to-topic';
+
+// Phase 3.2b — description shown to the LLM. Tells it WHEN to invoke
+// route_to_topic and what to say before the tool fires. The tool takes
+// over the call via Twilio REST after a 2.5s delay so Alex gets to
+// finish speaking the acknowledgement before the stream is torn down.
+const ROUTE_TO_TOPIC_DESCRIPTION = `Use this tool to route the caller to an on-duty team member who specializes in the topic they need. Invoke this tool when:
+
+- The caller has a specific request that matches one of the departments listed in DEPARTMENTS & TOPIC EXPERTISE (e.g. roadside breakdown, billing, new reservation)
+- The caller explicitly asks to speak to someone in a specific department ("I need the billing team", "can I talk to a manager")
+- The issue requires real-time human problem-solving that you cannot handle yourself (e.g. active emergency, complex negotiation)
+
+Do NOT use this tool for simple questions you can answer yourself. Do NOT use it if the caller only wants an appointment (use record_appointment) or only wants a callback later (use request_callback).
+
+Pick the topic_slug that BEST matches the caller's request from the enum. If nothing matches, pick the closest one and let the routing engine handle it — the engine will fall back to any-on-duty staff when there's no topic match.
+
+Before invoking the tool, say ONE sentence telling the caller you're connecting them. Example: "Let me connect you with our roadside team right now." Then invoke the tool. The tool responds quickly with a short acknowledgement; after a brief pause, the caller will hear the team member's phone ring.
+
+If the tool returns status="taking_message", the team is closed or nobody is available — apologize and use request_callback instead. If status="no_help_available", apologize and offer to take a message via request_callback.`;
 
 // NL description shown to the LLM. Tells it WHEN to invoke and what to
 // confirm with the caller before invoking. Kept as a module constant so
@@ -325,6 +346,102 @@ export function buildRecordAppointmentTool(opts: {
   };
 }
 
+/**
+ * Phase 3.2b — build the tools-array entry for the route_to_topic
+ * webhook tool.
+ *
+ * Two load-bearing decisions in this shape:
+ *
+ *   1. `topic_slug` is an ENUM built from the business's configured
+ *      departments at PATCH time (NOT free-form). LLM adherence to a
+ *      free-form string was flagged as unreliable in Phase A. If
+ *      departments is empty the caller MUST skip registration entirely
+ *      — this builder trusts that guard and does not defensively
+ *      accept an empty topics list.
+ *
+ *   2. `call_sid` uses `dynamic_variable: 'system__call_sid'` so
+ *      ElevenLabs auto-injects the Twilio CallSid from SIP metadata.
+ *      The LLM never sees this field. The routing handler needs the
+ *      CallSid to redirect the live call via Twilio REST.
+ *
+ * `business_id` is `constant_value` (baked per-agent), matching the
+ * pattern from buildRequestCallbackTool + buildRecordAppointmentTool.
+ *
+ * `response_timeout_secs: 45` — deliberately generous to accommodate
+ * the DB reads (business_configs + staff_topics + user_businesses +
+ * business_hours) that fire before the response returns.
+ */
+export function buildRouteToTopicTool(opts: {
+  businessId: string;
+  routeToTopicUrl: string;
+  toolSecret: string;
+  topics: Array<{ slug: string; name: string; description?: string | null }>;
+}): unknown {
+  if (opts.topics.length === 0) {
+    // Defensive — callers MUST guard on this, but throwing here catches
+    // any future accidental empty-topics registration before we ship a
+    // broken enum to ElevenLabs.
+    throw new Error('buildRouteToTopicTool: topics must not be empty; guard in updateAgentTools instead');
+  }
+  const slugs = opts.topics.map((t) => t.slug);
+  return {
+    type: 'webhook',
+    name: ROUTE_TO_TOPIC_TOOL_NAME,
+    description: ROUTE_TO_TOPIC_DESCRIPTION,
+    response_timeout_secs: 45,
+    disable_interruptions: false,
+    // Force speech BEFORE the tool fires so the caller hears "let me
+    // connect you…" during the HTTP round-trip. Critical for perceived
+    // latency — the actual Twilio REST redirect happens 2.5s AFTER the
+    // response returns, so the caller must hear the acknowledgement to
+    // avoid dead air.
+    pre_tool_speech: 'force',
+    tool_error_handling_mode: 'summarized',
+    execution_mode: 'immediate',
+    api_schema: {
+      url: opts.routeToTopicUrl,
+      method: 'POST',
+      content_type: 'application/json',
+      request_headers: {
+        Authorization: `Bearer ${opts.toolSecret}`,
+        'Content-Type': 'application/json',
+      },
+      request_body_schema: {
+        type: 'object',
+        required: ['business_id', 'conversation_id', 'topic_slug', 'reason', 'call_sid'],
+        properties: {
+          business_id: {
+            type: 'string',
+            constant_value: opts.businessId,
+          },
+          conversation_id: {
+            type: 'string',
+            // Auto-injected by ElevenLabs from the system dynamic
+            // variable. LLM never touches this.
+            dynamic_variable: 'system__conversation_id',
+          },
+          call_sid: {
+            type: 'string',
+            // Auto-injected by ElevenLabs. This is the Twilio CallSid
+            // (NOT the ElevenLabs conversation_id) — populated from
+            // SIP call metadata on inbound Twilio→ElevenLabs bridge.
+            dynamic_variable: 'system__call_sid',
+          },
+          topic_slug: {
+            type: 'string',
+            enum: slugs,
+            description: `Which department best handles this caller's request. Must be one of the values in the enum. Pick the closest match; if nothing matches perfectly, still pick the closest — the routing engine will handle fallbacks.`,
+          },
+          reason: {
+            type: 'string',
+            description: 'A short (1 sentence) natural-language reason for the handoff — what the caller needs and why a human should take it. Used for reporting and for the handoff whisper to the answering staff member.',
+          },
+        },
+      },
+    },
+  };
+}
+
 export async function createAgentForBusiness(opts: {
   businessId: string;
   businessName: string;
@@ -499,7 +616,7 @@ export async function updateAgentTools(
   try {
     const { data: biz, error: readErr } = await supabase
       .from('business_configs')
-      .select('agent_id, business_name, transfer_enabled, transfer_to_phone, transfer_conditions, transfer_wait_message, transfer_warm_message, record_appointment_enabled')
+      .select('agent_id, business_name, transfer_enabled, transfer_to_phone, transfer_conditions, transfer_wait_message, transfer_warm_message, record_appointment_enabled, departments')
       .eq('business_id', businessId)
       .maybeSingle();
     if (readErr) {
@@ -521,6 +638,7 @@ export async function updateAgentTools(
       transfer_wait_message: string | null;
       transfer_warm_message: string | null;
       record_appointment_enabled: boolean | null;
+      departments: unknown;
     };
     if (!row.agent_id) {
       // No ElevenLabs agent yet (business hasn't completed onboarding).
@@ -561,6 +679,7 @@ export async function updateAgentTools(
       if (t?.name === TRANSFER_TOOL_NAME || t?.params?.system_tool_type === 'transfer_to_number') return false;
       if (t?.name === REQUEST_CALLBACK_TOOL_NAME) return false;
       if (t?.name === RECORD_APPOINTMENT_TOOL_NAME) return false;
+      if (t?.name === ROUTE_TO_TOPIC_TOOL_NAME) return false;
       return true;
     });
 
@@ -621,6 +740,38 @@ export async function updateAgentTools(
       );
     }
 
+    // Phase 3.2b — route_to_topic tool. Conditionally registered when
+    // business_configs.departments is a non-empty array. Empty departments
+    // → SKIP entirely (no empty enum sent to ElevenLabs; the tool would
+    // fail validation on their side). Log the skip so ops can see when a
+    // business is missing topic config.
+    const topics = Array.isArray(row.departments)
+      ? (row.departments as any[]).filter(
+          (t) => t && typeof t === 'object' && typeof t.slug === 'string' && typeof t.name === 'string',
+        ).map((t) => ({
+          slug: t.slug as string,
+          name: t.name as string,
+          description: typeof t.description === 'string' ? t.description : null,
+        }))
+      : [];
+    if (topics.length > 0) {
+      const routeToTopicUrl = process.env.ROUTE_TO_TOPIC_URL || DEFAULT_ROUTE_TO_TOPIC_URL;
+      nextTools.push(
+        buildRouteToTopicTool({
+          businessId,
+          routeToTopicUrl,
+          toolSecret,
+          topics,
+        }),
+      );
+    } else {
+      console.warn(
+        '[Agents] route_to_topic tool NOT registered for',
+        businessId,
+        '— business_configs.departments is empty. Set topics via Settings → Topics to enable smart routing.',
+      );
+    }
+
     const promptBody: any = { tools: nextTools };
     if (typeof currentPromptText === 'string') {
       promptBody.prompt = currentPromptText;
@@ -677,4 +828,5 @@ export default {
   updateAgentTools,
   buildTransferTool,
   buildRequestCallbackTool,
+  buildRouteToTopicTool,
 };

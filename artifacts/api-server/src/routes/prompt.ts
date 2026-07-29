@@ -593,7 +593,7 @@ async function performRegenerate(
   const { data: cfg, error: cfgErr } = await ctx.supabase
     .from("business_configs")
     .select(
-      "business_id, business_name, industry, business_hours, timezone, owner_name, services, website, phone_number, languages, spanish_enabled, french_enabled, custom_faqs, objection_handling, tone_preference, never_say_list, website_context_text, agent_id, system_prompt",
+      "business_id, business_name, industry, business_hours, timezone, owner_name, services, website, phone_number, languages, spanish_enabled, french_enabled, custom_faqs, objection_handling, tone_preference, never_say_list, website_context_text, agent_id, system_prompt, departments",
     )
     .eq("business_id", ctx.businessId)
     .maybeSingle();
@@ -647,6 +647,15 @@ async function performRegenerate(
     tonePreference: cfgRow.tone_preference ?? null,
     neverSayList: Array.isArray(cfgRow.never_say_list)
       ? cfgRow.never_say_list
+      : null,
+    // Phase 3.2b — pass the business's topics into the renderer so
+    // the DEPARTMENTS & TOPIC EXPERTISE section is included alongside
+    // the route_to_topic tool registration (agents.ts:updateAgentTools).
+    // Guarded on Array.isArray so a scalar / null column stays a no-op.
+    topics: Array.isArray(cfgRow.departments)
+      ? (cfgRow.departments as any[]).filter(
+          (t) => t && typeof t === "object" && typeof t.slug === "string" && typeof t.name === "string",
+        )
       : null,
   });
 

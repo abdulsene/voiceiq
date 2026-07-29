@@ -1,10 +1,15 @@
 /**
- * Phase 3.2a — routing engine smoke. 21 cases (T1-T21) covering:
+ * Phase 3.2 — routing engine + tool-wiring smoke. 33 cases covering:
  *   - Pure decision function (fallback-logic.decideRouting)
  *   - Pure TwiML builder (dial-builder.buildDialTwiml, composeWhisperText)
  *   - Handler (routes/routing.handleRouteToTopic) with FakeSupabaseClient
  *   - Body validation (routes/routing.parseRouteBody)
+ *   - Twilio REST redirect scheduling (mock Twilio client)
+ *   - Dial-status handler (routes/routing.handleDialStatus, mapDialStatus)
+ *   - agents.ts buildRouteToTopicTool + empty-departments guard
+ *   - prompt-renderer.ts DEPARTMENTS & TOPIC EXPERTISE section
  *
+ *   3.2a cases (unchanged from previous smoke):
  *   T1  Single match — one on-duty for topic → topic_match path
  *   T2  Multiple matches (3) — TwiML contains 3 <Number>
  *   T3  No topic match + on-duty exists → any_on_duty fallback
@@ -16,17 +21,30 @@
  *   T9  On-duty for topic but callback_ring_number NULL → skipped
  *   T10 topic_slug not in departments → any_on_duty w/ topic_no_longer_configured
  *   T11 rung_user_ids logged with all dialed user ids
- *   T12 topic_slug + handoff_reason written to calls on every routing attempt
- *   T13 transfer_status = 'routing_topic_match' on the topic-match path
+ *   T12 topic_slug + handoff_reason written to calls (transfer_reason DEPRECATED)
+ *   T13 status = 'connecting' on topic-match path (public label)
  *   T14 handoff_reason accurately reflects each fallback path
- *   T15 topic_slug written even when no match found (topic_no_longer_configured)
+ *   T15 topic_slug written even when no match found
  *   T16 parseRouteBody rejects missing fields / wrong types
- *   T17 buildDialTwiml includes timeout attribute (Phase A: 30s default)
+ *   T17 buildDialTwiml includes timeout attribute
  *   T18 buildDialTwiml includes recordingStatusCallback + record attrs
- *   T19 after_hours path: twiml=null, message_for_llm asks for callback
+ *   T19 after_hours path: status='taking_message', staff_count=0
  *   T20 handler is pure (two independent invocations don't interfere)
- *   T21 topic cleared mid-call: departments has other topics but not this
- *       one → any_on_duty w/ handoff_reason=topic_no_longer_configured
+ *   T21 topic cleared mid-call → any_on_duty w/ topic_no_longer_configured
+ *
+ *   3.2b additions:
+ *   T22 REST redirect scheduled when call_sid + dial path present
+ *   T23 REST redirect SKIPPED on after_hours (twiml=null, no calls.update)
+ *   T24 REST redirect SKIPPED on graceful_hangup
+ *   T25 REST redirect SKIPPED when call_sid missing (Sentry warn path)
+ *   T26 mapDialStatus enumeration (5 Twilio statuses → correct label)
+ *   T27 handleDialStatus answered → transfer_status + handled_by_user_id + handled_at
+ *   T28 handleDialStatus no-answer → transfer_status + handoff_reason='all_staff_no_answer'
+ *   T29 handleDialStatus resolves handled_by_user_id via To → callback_ring_number
+ *   T30 buildRouteToTopicTool: registers topic_slug enum from departments
+ *   T31 buildRouteToTopicTool: throws on empty topics (guard)
+ *   T32 buildRouteToTopicTool: uses dynamic_variable for system__call_sid
+ *   T33 renderPromptFromHelpers: DEPARTMENTS section renders topics correctly
  *
  * Run: pnpm --filter @workspace/api-server exec tsx \
  *        src/tests/040-routing-smoke.ts
@@ -45,8 +63,13 @@ import {
 } from "../lib/routing/dial-builder";
 import {
   handleRouteToTopic,
+  handleDialStatus,
+  mapDialStatus,
   parseRouteBody,
+  type TwilioCallControl,
 } from "../routes/routing";
+import { buildRouteToTopicTool } from "../agents";
+import { renderPromptFromHelpers } from "../lib/prompt-renderer";
 
 // ── Test harness ────────────────────────────────────────────────────
 
@@ -531,11 +554,14 @@ async function T12_topic_slug_and_reason_written() {
   const update = fake.calls.find((c) => c.op === "update" && c.table === "calls");
   if (update?.payload?.topic_slug !== TOPIC_ROADSIDE) failures.push(`topic_slug=${update?.payload?.topic_slug}`);
   if (update?.payload?.handoff_reason !== "topic_match_answered") failures.push(`handoff_reason=${update?.payload?.handoff_reason}`);
-  if (update?.payload?.transfer_reason !== baseBody.reason) failures.push(`transfer_reason=${update?.payload?.transfer_reason}`);
+  // Phase 3.2b: transfer_reason is DEPRECATED — the routing engine no
+  // longer writes to it. Ensure the update payload has NO transfer_reason
+  // key (canonical is handoff_reason).
+  if ("transfer_reason" in (update?.payload || {})) failures.push(`transfer_reason should NOT be written (deprecated): got ${update?.payload?.transfer_reason}`);
   // Tenant-scoped UPDATE.
   if (!update?.eqFilters.some((f) => f.column === "business_id" && f.value === BIZ)) failures.push("UPDATE missing business_id filter");
   if (!update?.eqFilters.some((f) => f.column === "conversation_id" && f.value === CONV)) failures.push("UPDATE missing conversation_id filter");
-  record("T12 topic_slug + handoff_reason + transfer_reason written", failures.length === 0, failures.join("; ") || "all 3 fields set + tenant scoped");
+  record("T12 topic_slug + handoff_reason written (transfer_reason deprecated)", failures.length === 0, failures.join("; ") || "fields set + tenant scoped + no legacy transfer_reason");
 }
 
 async function T13_transfer_status_routing_topic_match() {
@@ -549,10 +575,12 @@ async function T13_transfer_status_routing_topic_match() {
   const result = await handleRouteToTopic(asClient(fake), baseBody);
   const failures: string[] = [];
   if (!result.ok) failures.push(`not ok: ${(result as any).error}`);
-  if ((result as any).result?.status !== "routing_topic_match") failures.push(`status=${(result as any).result?.status}`);
+  // Phase 3.2b: public status label is 'connecting' (small alphabet for
+  // the LLM). Internal DB label transfer_status stays 'routing_topic_match'.
+  if ((result as any).result?.status !== "connecting") failures.push(`public status=${(result as any).result?.status}`);
   const update = fake.calls.find((c) => c.op === "update" && c.table === "calls");
-  if (update?.payload?.transfer_status !== "routing_topic_match") failures.push(`transfer_status=${update?.payload?.transfer_status}`);
-  record("T13 transfer_status = routing_topic_match", failures.length === 0, failures.join("; ") || "response + DB match");
+  if (update?.payload?.transfer_status !== "routing_topic_match") failures.push(`db transfer_status=${update?.payload?.transfer_status}`);
+  record("T13 public status='connecting' + db transfer_status='routing_topic_match'", failures.length === 0, failures.join("; ") || "public/internal split correct");
 }
 
 async function T14_handoff_reason_per_path() {
@@ -721,11 +749,11 @@ async function T19_after_hours_null_twiml() {
   else {
     const r = result.result;
     if (r.twiml !== null) failures.push(`twiml should be null on after_hours path, got: ${r.twiml?.slice(0, 80)}`);
-    if (r.status !== "after_hours_callback") failures.push(`status=${r.status}`);
-    if (!/callback|message|reopen/i.test(r.message_for_llm)) failures.push(`message_for_llm doesn't mention callback/message/reopen: "${r.message_for_llm}"`);
+    if (r.status !== "taking_message") failures.push(`public status=${r.status}`);
     if (r.staff_count !== 0) failures.push(`staff_count=${r.staff_count}`);
+    if (r.handoff_reason !== "after_hours_callback") failures.push(`handoff_reason=${r.handoff_reason}`);
   }
-  record("T19 after_hours: twiml=null + callback prompt", failures.length === 0, failures.join("; ") || "twiml null, status after_hours_callback, LLM asks for callback");
+  record("T19 after_hours: public status='taking_message' + twiml=null", failures.length === 0, failures.join("; ") || "public taking_message, twiml null, staff_count=0");
 }
 
 async function T20_handler_is_pure() {
@@ -772,11 +800,334 @@ async function T21_topic_cleared_race() {
     const d = result.result.decision;
     if (d.path !== "any_on_duty") failures.push(`path=${d.path}`);
     if (d.handoffReason !== "topic_no_longer_configured") failures.push(`reason=${d.handoffReason}`);
-    if (result.result.status !== "routing_any_on_duty") failures.push(`status=${result.result.status}`);
+    // Phase 3.2b: public status 'connecting' (any_on_duty is a dial path).
+    if (result.result.status !== "connecting") failures.push(`public status=${result.result.status}`);
   }
   const update = fake.calls.find((c) => c.op === "update" && c.table === "calls");
   if (update?.payload?.handoff_reason !== "topic_no_longer_configured") failures.push(`persisted reason=${update?.payload?.handoff_reason}`);
+  if (update?.payload?.transfer_status !== "routing_any_on_duty") failures.push(`persisted transfer_status=${update?.payload?.transfer_status}`);
   record("T21 topic cleared mid-call → any_on_duty w/ race reason", failures.length === 0, failures.join("; ") || "topic_no_longer_configured persists + any_on_duty path");
+}
+
+// ── Phase 3.2b: Twilio REST redirect + dial-status + tool wiring ────
+
+class MockTwilioClient implements TwilioCallControl {
+  updates: Array<{ callSid: string; twiml: string }> = [];
+  calls(sid: string) {
+    return {
+      update: async (opts: { twiml: string }) => {
+        this.updates.push({ callSid: sid, twiml: opts.twiml });
+      },
+    };
+  }
+}
+
+async function T22_rest_redirect_scheduled() {
+  const fake = new FakeSupabaseClient();
+  stubDefaultBusiness(fake);
+  stubStaffTopics(fake, [{ user_id: USER_A, topic_slug: TOPIC_ROADSIDE }]);
+  stubUserBusinessesOnDuty(fake, [
+    { user_id: USER_A, callback_ring_number: PHONE_A },
+  ]);
+
+  const twilioMock = new MockTwilioClient();
+  const scheduled: Array<{ callSid: string; twiml: string; delayMs: number }> = [];
+  const result = await handleRouteToTopic(asClient(fake), { ...baseBody, call_sid: "CA_test_sid" }, {
+    twilioClient: twilioMock,
+    redirectDelayMs: 0, // immediate for testing
+    onRedirectScheduled: (info) => scheduled.push(info),
+  });
+  // Give the setTimeout(0) a tick to fire.
+  await new Promise((r) => setTimeout(r, 10));
+
+  const failures: string[] = [];
+  if (!result.ok) failures.push(`not ok: ${(result as any).error}`);
+  if (scheduled.length !== 1) failures.push(`scheduled count=${scheduled.length}`);
+  else {
+    if (scheduled[0].callSid !== "CA_test_sid") failures.push(`callSid=${scheduled[0].callSid}`);
+    if (!/^<\?xml.*<Dial /s.test(scheduled[0].twiml)) failures.push(`twiml shape wrong: ${scheduled[0].twiml.slice(0, 80)}`);
+  }
+  if (twilioMock.updates.length !== 1) failures.push(`Twilio update count=${twilioMock.updates.length}`);
+  else {
+    if (twilioMock.updates[0].callSid !== "CA_test_sid") failures.push(`update callSid=${twilioMock.updates[0].callSid}`);
+    if (!twilioMock.updates[0].twiml.includes(PHONE_A)) failures.push("update twiml missing staff phone");
+  }
+  record("T22 REST redirect scheduled + fires with correct callSid + twiml", failures.length === 0, failures.join("; ") || "scheduled + fired via mock Twilio");
+}
+
+async function T23_no_redirect_on_after_hours() {
+  const fake = new FakeSupabaseClient();
+  stubDefaultBusiness(fake, { hoursOpen: false, legacyTransferToPhone: null });
+  stubStaffTopics(fake, []);
+  stubUserBusinessesOnDuty(fake, []);
+
+  const twilioMock = new MockTwilioClient();
+  const scheduled: Array<any> = [];
+  const result = await handleRouteToTopic(asClient(fake), { ...baseBody, call_sid: "CA_ah" }, {
+    twilioClient: twilioMock,
+    redirectDelayMs: 0,
+    onRedirectScheduled: (i) => scheduled.push(i),
+  });
+  await new Promise((r) => setTimeout(r, 10));
+
+  const failures: string[] = [];
+  if (!result.ok) failures.push(`not ok: ${(result as any).error}`);
+  if (scheduled.length !== 0) failures.push(`unexpected schedule: ${scheduled.length}`);
+  if (twilioMock.updates.length !== 0) failures.push(`unexpected Twilio update on after_hours path: ${twilioMock.updates.length}`);
+  record("T23 no REST redirect on after_hours", failures.length === 0, failures.join("; ") || "twilio.calls.update NOT invoked");
+}
+
+async function T24_no_redirect_on_graceful_hangup() {
+  const fake = new FakeSupabaseClient();
+  stubDefaultBusiness(fake, { hoursOpen: true, legacyTransferToPhone: null });
+  stubStaffTopics(fake, []);
+  stubUserBusinessesOnDuty(fake, []);
+
+  const twilioMock = new MockTwilioClient();
+  const result = await handleRouteToTopic(asClient(fake), { ...baseBody, call_sid: "CA_gh" }, {
+    twilioClient: twilioMock,
+    redirectDelayMs: 0,
+  });
+  await new Promise((r) => setTimeout(r, 10));
+
+  const failures: string[] = [];
+  if (!result.ok) failures.push(`not ok: ${(result as any).error}`);
+  else if (result.result.status !== "no_help_available") failures.push(`status=${result.result.status}`);
+  if (twilioMock.updates.length !== 0) failures.push(`unexpected Twilio update: ${twilioMock.updates.length}`);
+  record("T24 no REST redirect on graceful_hangup", failures.length === 0, failures.join("; ") || "twilio.calls.update NOT invoked, public status=no_help_available");
+}
+
+async function T25_no_redirect_when_call_sid_missing() {
+  const fake = new FakeSupabaseClient();
+  stubDefaultBusiness(fake);
+  stubStaffTopics(fake, [{ user_id: USER_A, topic_slug: TOPIC_ROADSIDE }]);
+  stubUserBusinessesOnDuty(fake, [
+    { user_id: USER_A, callback_ring_number: PHONE_A },
+  ]);
+
+  const twilioMock = new MockTwilioClient();
+  const scheduled: Array<any> = [];
+  // No call_sid in the body — simulates ElevenLabs failing to inject
+  // system__call_sid for some reason.
+  const result = await handleRouteToTopic(asClient(fake), baseBody, {
+    twilioClient: twilioMock,
+    redirectDelayMs: 0,
+    onRedirectScheduled: (i) => scheduled.push(i),
+  });
+  await new Promise((r) => setTimeout(r, 10));
+
+  const failures: string[] = [];
+  if (!result.ok) failures.push(`not ok: ${(result as any).error}`);
+  // Handler should still produce a decision + response, but skip the REST redirect.
+  if (scheduled.length !== 0) failures.push(`unexpected schedule: ${scheduled.length}`);
+  if (twilioMock.updates.length !== 0) failures.push(`unexpected Twilio update: ${twilioMock.updates.length}`);
+  // The decision itself is still topic_match (we still logged rung_user_ids etc.).
+  if (result.ok && result.result.status !== "connecting") failures.push(`status=${(result as any).result?.status}`);
+  record("T25 no REST redirect when call_sid missing (graceful skip)", failures.length === 0, failures.join("; ") || "decision produced, no dial issued");
+}
+
+async function T26_map_dial_status() {
+  const failures: string[] = [];
+  const cases: Array<{ input: string; wantStatus: string; wantAnswered: boolean }> = [
+    { input: "completed", wantStatus: "answered", wantAnswered: true },
+    { input: "answered", wantStatus: "answered", wantAnswered: true },
+    { input: "no-answer", wantStatus: "no_answer", wantAnswered: false },
+    { input: "busy", wantStatus: "busy", wantAnswered: false },
+    { input: "canceled", wantStatus: "canceled", wantAnswered: false },
+    { input: "failed", wantStatus: "failed", wantAnswered: false },
+    { input: "bogus", wantStatus: "failed", wantAnswered: false }, // default → failed
+  ];
+  for (const c of cases) {
+    const m = mapDialStatus(c.input);
+    if (m.transferStatus !== c.wantStatus) failures.push(`[${c.input}] status=${m.transferStatus} want=${c.wantStatus}`);
+    if (m.transferAnswered !== c.wantAnswered) failures.push(`[${c.input}] answered=${m.transferAnswered} want=${c.wantAnswered}`);
+  }
+  record("T26 mapDialStatus enumeration", failures.length === 0, failures.join("; ") || "7 statuses map correctly");
+}
+
+async function T27_dial_status_answered() {
+  const fake = new FakeSupabaseClient();
+  // Stub the two SELECTs handleDialStatus fires (rung_user_ids lookup + user_businesses map).
+  fake.on(
+    (c) => c.op === "select" && c.table === "calls",
+    { data: { rung_user_ids: [USER_A, USER_B] } },
+  );
+  fake.on(
+    (c) => c.op === "select" && c.table === "user_businesses",
+    {
+      data: [
+        { user_id: USER_A, callback_ring_number: PHONE_A },
+        { user_id: USER_B, callback_ring_number: PHONE_B },
+      ],
+    },
+  );
+  fake.on((c) => c.op === "update" && c.table === "calls", { data: { id: CALL_ID } });
+
+  const result = await handleDialStatus(asClient(fake), {
+    business_id: BIZ,
+    conversation_id: CONV,
+    DialCallStatus: "completed",
+    To: PHONE_B, // Bob's cell answered
+  });
+  const failures: string[] = [];
+  if (!result.ok) failures.push(`not ok: ${(result as any).error}`);
+  else {
+    if (result.transferStatus !== "answered") failures.push(`transferStatus=${result.transferStatus}`);
+    if (result.handledByUserId !== USER_B) failures.push(`handledByUserId=${result.handledByUserId}`);
+  }
+  const update = fake.calls.find((c) => c.op === "update" && c.table === "calls");
+  if (update?.payload?.transfer_status !== "answered") failures.push(`update transfer_status=${update?.payload?.transfer_status}`);
+  if (update?.payload?.transfer_answered !== true) failures.push(`update transfer_answered=${update?.payload?.transfer_answered}`);
+  if (update?.payload?.handled_by_user_id !== USER_B) failures.push(`update handled_by_user_id=${update?.payload?.handled_by_user_id}`);
+  if (!update?.payload?.handled_at) failures.push("update missing handled_at");
+  record("T27 dial-status answered → transfer_status + handled_by + handled_at", failures.length === 0, failures.join("; ") || "all writes correct, handled_by matched by To phone");
+}
+
+async function T28_dial_status_no_answer() {
+  const fake = new FakeSupabaseClient();
+  fake.on((c) => c.op === "update" && c.table === "calls", { data: { id: CALL_ID } });
+
+  const result = await handleDialStatus(asClient(fake), {
+    business_id: BIZ,
+    conversation_id: CONV,
+    DialCallStatus: "no-answer",
+    To: PHONE_A,
+  });
+  const failures: string[] = [];
+  if (!result.ok) failures.push(`not ok: ${(result as any).error}`);
+  const update = fake.calls.find((c) => c.op === "update" && c.table === "calls");
+  if (update?.payload?.transfer_status !== "no_answer") failures.push(`transfer_status=${update?.payload?.transfer_status}`);
+  if (update?.payload?.transfer_answered !== false) failures.push(`transfer_answered=${update?.payload?.transfer_answered}`);
+  if (update?.payload?.handoff_reason !== "all_staff_no_answer") failures.push(`handoff_reason=${update?.payload?.handoff_reason}`);
+  if ("handled_by_user_id" in (update?.payload || {})) failures.push("handled_by_user_id set on no-answer");
+  record("T28 dial-status no-answer → all_staff_no_answer + no handler set", failures.length === 0, failures.join("; ") || "escalates handoff_reason, no handler resolved");
+}
+
+async function T29_dial_status_missing_fields() {
+  const fake = new FakeSupabaseClient();
+  const r1 = await handleDialStatus(asClient(fake), {
+    business_id: "",
+    conversation_id: CONV,
+    DialCallStatus: "completed",
+  });
+  const r2 = await handleDialStatus(asClient(fake), {
+    business_id: BIZ,
+    conversation_id: CONV,
+    DialCallStatus: "",
+  });
+  const failures: string[] = [];
+  if (r1.ok) failures.push("empty business_id should reject");
+  if (r2.ok) failures.push("empty DialCallStatus should reject");
+  record("T29 dial-status validates required fields", failures.length === 0, failures.join("; ") || "both negatives rejected");
+}
+
+async function T30_route_to_topic_tool_shape() {
+  const tool = buildRouteToTopicTool({
+    businessId: BIZ,
+    routeToTopicUrl: "https://neverr.ai/api/routing/route-to-topic",
+    toolSecret: "shh",
+    topics: [
+      { slug: TOPIC_ROADSIDE, name: "Roadside & breakdown" },
+      { slug: TOPIC_PAYMENTS, name: "Payments & billing" },
+    ],
+  }) as any;
+  const failures: string[] = [];
+  if (tool?.type !== "webhook") failures.push(`type=${tool?.type}`);
+  if (tool?.name !== "route_to_topic") failures.push(`name=${tool?.name}`);
+  if (tool?.response_timeout_secs !== 45) failures.push(`response_timeout_secs=${tool?.response_timeout_secs}`);
+  const enumProp = tool?.api_schema?.request_body_schema?.properties?.topic_slug;
+  if (!Array.isArray(enumProp?.enum)) failures.push("topic_slug.enum missing");
+  else if (enumProp.enum.length !== 2) failures.push(`enum length=${enumProp.enum.length}`);
+  else if (!enumProp.enum.includes(TOPIC_ROADSIDE) || !enumProp.enum.includes(TOPIC_PAYMENTS)) {
+    failures.push(`enum missing expected slugs: ${enumProp.enum.join(",")}`);
+  }
+  const bizProp = tool?.api_schema?.request_body_schema?.properties?.business_id;
+  if (bizProp?.constant_value !== BIZ) failures.push(`business_id.constant_value=${bizProp?.constant_value}`);
+  record("T30 buildRouteToTopicTool: enum + constant_value", failures.length === 0, failures.join("; ") || "webhook + timeout + enum from departments + business_id constant");
+}
+
+async function T31_route_to_topic_tool_empty_throws() {
+  const failures: string[] = [];
+  try {
+    buildRouteToTopicTool({
+      businessId: BIZ,
+      routeToTopicUrl: "https://x/y",
+      toolSecret: "shh",
+      topics: [],
+    });
+    failures.push("expected throw on empty topics");
+  } catch (err: any) {
+    if (!/topics must not be empty/i.test(err?.message || "")) failures.push(`unexpected error: ${err?.message}`);
+  }
+  record("T31 buildRouteToTopicTool: throws on empty topics", failures.length === 0, failures.join("; ") || "guard triggered on empty departments");
+}
+
+async function T32_tool_dynamic_variable_call_sid() {
+  const tool = buildRouteToTopicTool({
+    businessId: BIZ,
+    routeToTopicUrl: "https://x/y",
+    toolSecret: "shh",
+    topics: [{ slug: TOPIC_ROADSIDE, name: "Roadside" }],
+  }) as any;
+  const failures: string[] = [];
+  const callSidProp = tool?.api_schema?.request_body_schema?.properties?.call_sid;
+  if (!callSidProp) failures.push("call_sid property missing");
+  else if (callSidProp.dynamic_variable !== "system__call_sid") {
+    failures.push(`call_sid.dynamic_variable=${callSidProp.dynamic_variable}`);
+  }
+  // Also verify conversation_id uses dynamic_variable (not description).
+  const convProp = tool?.api_schema?.request_body_schema?.properties?.conversation_id;
+  if (convProp?.dynamic_variable !== "system__conversation_id") {
+    failures.push(`conversation_id.dynamic_variable=${convProp?.dynamic_variable}`);
+  }
+  // Ensure call_sid is in required[].
+  const req = tool?.api_schema?.request_body_schema?.required;
+  if (!Array.isArray(req) || !req.includes("call_sid")) failures.push("call_sid missing from required[]");
+  record("T32 tool: dynamic_variable for system__call_sid + system__conversation_id", failures.length === 0, failures.join("; ") || "auto-injected system vars, no LLM adherence risk");
+}
+
+async function T33_prompt_renders_departments_section() {
+  const prompt = renderPromptFromHelpers({
+    business_name: "EZ Rentals",
+    industry: "car_rental",
+    business_hours: "Mon-Sat 9-4",
+    timezone: "America/New_York",
+    topics: [
+      {
+        slug: TOPIC_ROADSIDE,
+        name: "Roadside & breakdown",
+        description: "Emergency roadside assistance and mechanical issues",
+        example_utterances: [
+          "my rental broke down",
+          "I got a flat tire",
+        ],
+      },
+      {
+        slug: TOPIC_PAYMENTS,
+        name: "Payments & billing",
+        description: "Billing questions and payment plans",
+      },
+    ],
+  });
+  const failures: string[] = [];
+  if (!/DEPARTMENTS & TOPIC EXPERTISE/.test(prompt)) failures.push("missing DEPARTMENTS heading");
+  if (!/topic_slug: "roadside_breakdown"/.test(prompt)) failures.push("missing roadside_breakdown slug reference");
+  if (!/topic_slug: "payments"/.test(prompt)) failures.push("missing payments slug reference");
+  if (!/Roadside & breakdown/.test(prompt)) failures.push("missing roadside display name");
+  if (!/my rental broke down/.test(prompt)) failures.push("missing example utterance");
+  if (!/route_to_topic/.test(prompt)) failures.push("prompt doesn't cross-reference tool name");
+
+  // Empty/null topics → section omitted.
+  const noTopicsPrompt = renderPromptFromHelpers({
+    business_name: "EZ",
+    industry: "car_rental",
+    business_hours: "Mon-Fri 9-5",
+    timezone: "America/New_York",
+  });
+  if (/DEPARTMENTS & TOPIC EXPERTISE/.test(noTopicsPrompt)) {
+    failures.push("DEPARTMENTS section leaked when topics omitted");
+  }
+  record("T33 prompt-renderer: DEPARTMENTS section renders topics + omitted when absent", failures.length === 0, failures.join("; ") || "section renders w/ slug + name + utterances; omitted when no topics");
 }
 
 // ── Bonus: whisper composition and TwiML ────────────────────────────
@@ -822,6 +1173,19 @@ async function main() {
   await T19_after_hours_null_twiml();
   await T20_handler_is_pure();
   await T21_topic_cleared_race();
+  // Phase 3.2b
+  await T22_rest_redirect_scheduled();
+  await T23_no_redirect_on_after_hours();
+  await T24_no_redirect_on_graceful_hangup();
+  await T25_no_redirect_when_call_sid_missing();
+  await T26_map_dial_status();
+  await T27_dial_status_answered();
+  await T28_dial_status_no_answer();
+  await T29_dial_status_missing_fields();
+  await T30_route_to_topic_tool_shape();
+  await T31_route_to_topic_tool_empty_throws();
+  await T32_tool_dynamic_variable_call_sid();
+  await T33_prompt_renders_departments_section();
   await whisper_composition();
 
   const fails = results.filter((r) => !r.pass);

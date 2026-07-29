@@ -131,4 +131,18 @@ COMMENT ON COLUMN calls.topic_slug IS
 COMMENT ON COLUMN calls.rung_user_ids IS
   'Phase 3.2: auth.users.id[] of every staff cell dialed during simultaneous-ring, whether they answered or not. Not FK-enforced (Postgres does not support FK on array elements) — app layer tolerates stale UUIDs from deleted users. Enables post-incident "why did X not answer" forensics.';
 
+-- Phase 3.2b — attach the deprecation notice to the table itself so
+-- future readers grepping pg_description find it without needing to
+-- open this migration file. See file header (Deprecation notes) for
+-- full rationale.
+COMMENT ON TABLE business_transfer_configs IS
+  'DEPRECATED as of Phase 3.2 (migration 040). Superseded by topic-based routing via staff_topics + user_businesses.is_on_duty. Dead code — do not drop, do not extend.';
+
+-- Phase 3.2b — deprecation notice on calls.transfer_reason.
+-- handoff_reason (added in Phase 3.2a) is now the CANONICAL routing-
+-- decision column. transfer_reason keeps its legacy values for pre-3.2
+-- rows; new writes go to handoff_reason only.
+COMMENT ON COLUMN calls.transfer_reason IS
+  'DEPRECATED as of Phase 3.2b. handoff_reason is now the canonical routing-decision column. Pre-3.2 rows keep their legacy transfer_reason values; the Phase 3.2 routing engine does not write here. Future readers: use handoff_reason.';
+
 COMMIT;

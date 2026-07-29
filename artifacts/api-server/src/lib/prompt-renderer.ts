@@ -300,6 +300,19 @@ export function renderPromptFromHelpers(opts: {
   objectionHandlersFromTable?: Array<{ objection_phrase: string; ai_response: string; objection_category?: string }> | null;
   tonePreference?: string | null;
   neverSayList?: string[] | null;
+  // Phase 3.2b — the business's department / topic catalogue from
+  // business_configs.departments. When populated, renders a
+  // DEPARTMENTS & TOPIC EXPERTISE section that Alex uses to pick the
+  // right topic_slug when invoking the route_to_topic tool. Omitting
+  // topics is safe — the section is skipped and no routing hint appears
+  // in the prompt (route_to_topic tool won't be registered in that
+  // case either — see agents.ts:updateAgentTools guard).
+  topics?: Array<{
+    slug: string;
+    name: string;
+    description?: string | null;
+    example_utterances?: string[] | null;
+  }> | null;
 }): string {
   const tmpl = opts.industryTemplate;
   const industryLabel = tmpl?.name || opts.industry;
@@ -365,6 +378,41 @@ How to handle: ${s.script}
 
 APPOINTMENT TYPES you can help schedule:
 ${tmpl.appointment_types.map(a => `- ${a}`).join("\n")}`;
+  }
+
+  // Phase 3.2b — DEPARTMENTS & TOPIC EXPERTISE. Anchor for Alex to
+  // pick the right topic_slug when invoking route_to_topic. Renders
+  // slug + display name + description + up-to-4 example utterances
+  // (few-shot anchors from the seed catalogue in migration 036 or
+  // customer edits via /settings?tab=topics).
+  //
+  // The tool description in agents.ts:ROUTE_TO_TOPIC_DESCRIPTION
+  // cross-references this section by name — keep the heading string
+  // stable to preserve the LLM's mental link.
+  if (opts.topics && opts.topics.length > 0) {
+    prompt += `
+
+DEPARTMENTS & TOPIC EXPERTISE (when a caller's request matches one of these topics AND requires a real human on the phone, invoke the route_to_topic tool with the matching topic_slug — the routing engine will ring the on-duty specialist and connect them to the caller):
+`;
+    for (const topic of opts.topics) {
+      const desc = (topic.description || "").trim();
+      const utterances = Array.isArray(topic.example_utterances)
+        ? topic.example_utterances
+            .filter((u) => typeof u === "string" && u.trim().length > 0)
+            .slice(0, 4)
+        : [];
+      prompt += `
+- topic_slug: "${topic.slug}" — ${topic.name}`;
+      if (desc) prompt += `
+  ${desc}`;
+      if (utterances.length > 0) {
+        prompt += `
+  Example utterances the caller might say: ${utterances.map((u) => `"${u.trim()}"`).join(", ")}`;
+      }
+    }
+    prompt += `
+
+Do NOT invoke route_to_topic for simple questions you can answer yourself (business hours, address, general policies). Do NOT invoke it for scheduling — use record_appointment for that. Only invoke when the caller needs a specialist right now.`;
   }
 
   if (opts.tonePreference && opts.tonePreference.trim().length > 0) {

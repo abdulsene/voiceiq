@@ -1,61 +1,67 @@
 /**
- * Phase 3.2a — topic-aware routing webhook.
+ * Phase 3.2 — topic-aware routing webhook + call-control leg.
  *
  *   POST /api/routing/route-to-topic
  *     Bearer-authenticated via ELEVENLABS_TOOL_SECRET (same shared
  *     secret as /api/leads/capture and /api/leads/record-appointment).
- *     Invoked by Alex's `route_to_topic` ElevenLabs tool mid-conversation
- *     (Phase 3.2b will register the tool via updateAgentTools()).
+ *     Invoked by Alex's `route_to_topic` ElevenLabs tool mid-conversation.
  *
  *   GET  /api/routing/whisper
- *     PUBLIC (no auth). Twilio hits this URL when a rung staff member
- *     answers — the TwiML we return plays a whisper to the staff only
- *     (customer hears silence) before Twilio bridges the two legs.
- *     `text` query param is the pre-composed whisper string; kept as
- *     query rather than baked at agent-config time so per-call topic
- *     context can be injected.
+ *     PUBLIC (bypass-listed in app.ts). Twilio hits this URL when a rung
+ *     staff member answers — the TwiML we return plays a <Say> to the
+ *     staff only (customer hears silence) before Twilio bridges the two
+ *     legs. `text` query param is the pre-composed whisper string.
+ *
+ *   POST /api/routing/dial-status
+ *     PUBLIC (bypass-listed) but Twilio-signature-verified. Called by
+ *     Twilio as the <Dial action=""> callback when the simultaneous-ring
+ *     leg terminates (answered / no-answer / canceled). Writes handled_*
+ *     + transfer_status transition to the calls row.
  *
  * ─────────────────────────────────────────────────────────────────────
- * Request contract for /route-to-topic:
+ * Request contract for /route-to-topic (auto-injected by ElevenLabs
+ * from Twilio SIP metadata via dynamic_variable references in the tool
+ * schema — LLM never fills these):
+ *
  *   {
- *     business_id:     string,   // tenant scope
- *     conversation_id: string,   // ElevenLabs conversation id, used to
- *                                // locate the calls row for logging
- *     topic_slug:      string,   // Alex's identified topic (enum built
- *                                // from business_configs.departments)
- *     reason:          string,   // Alex's short natural-language reason
- *                                // (currently logged only; may drive
- *                                //  richer prompts in 3.5)
+ *     business_id:     string,   // constant_value baked at PATCH time
+ *     conversation_id: string,   // dynamic_variable system__conversation_id
+ *     topic_slug:      string,   // enum built from business_configs.departments
+ *     reason:          string,   // LLM-filled short natural-language reason
+ *     call_sid:        string,   // dynamic_variable system__call_sid (Twilio CallSid)
  *   }
  *
- * Response body (JSON):
+ * Response body (JSON) — INTENTIONALLY SMALL. Alex speaks the
+ * acknowledgement using topic_name; the actual dial happens
+ * out-of-band via Twilio REST after ROUTING_REDIRECT_DELAY_MS so the
+ * caller hears the acknowledgement before the stream is torn down.
+ *
  *   {
- *     status:          'routing_topic_match'
- *                     | 'routing_any_on_duty'
- *                     | 'legacy_transfer_to_phone'
- *                     | 'after_hours_callback'
- *                     | 'graceful_hangup',
- *     message_for_llm: string,   // Verbatim line Alex should say to the
- *                                // caller before / instead of transferring
- *     twiml:           string | null,  // Non-null for dial paths; null
- *                                // for after_hours / graceful (LLM
- *                                // stays on the line via existing tools)
- *     staff_count:     number,   // Rung count (0 for legacy/callback paths)
- *     handoff_reason:  string,   // Same value written to calls.handoff_reason
+ *     status:          'connecting' | 'taking_message' | 'no_help_available',
+ *     topic_name:      string,     // display name of the matched topic
+ *     staff_count:     number,     // number of cells being rung (0 for
+ *                                  // callback / graceful paths)
+ *     handoff_reason:  string,     // conventional label; also written to
+ *                                  // calls.handoff_reason for reporting
  *   }
  *
  * ─────────────────────────────────────────────────────────────────────
+ * handoff_reason vs transfer_reason: as of Phase 3.2b, `handoff_reason`
+ * is the CANONICAL routing-decision column. `transfer_reason` is
+ * deprecated (kept in the schema for legacy pre-Phase-3.2 rows, no new
+ * writes). See migration 040 header for the enumerated values.
+ *
  * calls row update: best-effort UPDATE by (business_id, conversation_id).
- * If the row doesn't exist yet (post-call webhook hasn't inserted it),
- * we log a Sentry warning and continue — routing metadata will still
- * ship in the response, but won't be persisted. Phase 3.2b integration
- * addresses this by either adding a UNIQUE(conversation_id) upsert
- * path or writing routing metadata via a mid-call INSERT.
+ * The routing webhook fires mid-call, before the post-call insertion
+ * webhook that populates the calls row. If the row doesn't exist we
+ * Sentry-log the miss and continue — the acknowledgement + redirect
+ * still succeed; only the logging degrades.
  */
 
 import { Router, type Request, type Response } from "express";
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import * as Sentry from "@sentry/node";
+import twilio from "twilio";
 
 import {
   decideRouting,
@@ -70,6 +76,7 @@ import {
   type DialBuilderOptions,
 } from "../lib/routing/dial-builder";
 import { handleHoursNow } from "./hours";
+import { verifyTwilioSignature } from "../lib/twilio-signature";
 
 const router = Router();
 
@@ -77,6 +84,23 @@ const CONVERSATION_ID_MAX = 200;
 const REASON_MAX = 500;
 const TOPIC_SLUG_MAX = 100;
 const BUSINESS_ID_MAX = 100;
+const CALL_SID_MAX = 200;
+
+/**
+ * Milliseconds to wait between returning the tool response and issuing
+ * the Twilio REST redirect. Gives Alex time to speak the "connecting
+ * you now…" acknowledgement before the media stream is torn down.
+ *
+ * Env-tunable so live-call tuning during the first Phase 3.2c pilot can
+ * dial this up/down without a redeploy. Default 2500 = ~1 short
+ * sentence at typical ElevenLabs speech cadence.
+ */
+const ROUTING_REDIRECT_DELAY_MS = Number.parseInt(
+  process.env.ROUTING_REDIRECT_DELAY_MS || "2500",
+  10,
+);
+
+// ── Client helpers ──────────────────────────────────────────────────
 
 function getSupabase(): SupabaseClient | null {
   const url = process.env.SUPABASE_URL;
@@ -94,10 +118,30 @@ function getPublicUrl(): string {
 }
 
 /**
+ * Minimal Twilio REST surface used by the routing handler. Kept as an
+ * interface (not the concrete twilio client type) so smoke tests can
+ * swap in a mock without pulling the whole client type surface.
+ */
+export interface TwilioCallControl {
+  calls(sid: string): {
+    update(opts: { twiml: string }): Promise<unknown>;
+  };
+}
+
+let _twilioClient: TwilioCallControl | null = null;
+function getTwilioClient(): TwilioCallControl | null {
+  if (_twilioClient) return _twilioClient;
+  const sid = process.env.TWILIO_ACCOUNT_SID;
+  const token = process.env.TWILIO_AUTH_TOKEN;
+  if (!sid || !token) return null;
+  _twilioClient = twilio(sid, token) as unknown as TwilioCallControl;
+  return _twilioClient;
+}
+
+/**
  * Constant-time compare of the presented Bearer token against
  * ELEVENLABS_TOOL_SECRET. Verbatim copy of the pattern in
- * routes/leads.ts:verifyToolSecret — kept local rather than exported
- * so the two auth paths are independently reviewable.
+ * routes/leads.ts:verifyToolSecret.
  */
 function verifyToolSecret(req: Request): boolean {
   const expected = process.env.ELEVENLABS_TOOL_SECRET;
@@ -120,6 +164,14 @@ export interface RouteToTopicBody {
   conversation_id: string;
   topic_slug: string;
   reason: string;
+  /**
+   * Twilio CallSid, auto-injected by ElevenLabs via
+   * dynamic_variable: 'system__call_sid' in the tool schema.
+   * Optional in the body validator so callers can still trigger the
+   * routing decision + logging even without a Twilio call (e.g. a
+   * dev/simulation path). Absence → skip REST redirect, log Sentry warning.
+   */
+  call_sid?: string;
 }
 
 export function parseRouteBody(body: unknown): RouteToTopicBody | { error: string } {
@@ -139,10 +191,19 @@ export function parseRouteBody(body: unknown): RouteToTopicBody | { error: strin
   if (typeof topic_slug !== "string") return topic_slug;
   const reason = need("reason", REASON_MAX);
   if (typeof reason !== "string") return reason;
-  return { business_id, conversation_id, topic_slug, reason };
+
+  const parsed: RouteToTopicBody = { business_id, conversation_id, topic_slug, reason };
+  const raw_sid = b["call_sid"];
+  if (typeof raw_sid === "string" && raw_sid.trim()) {
+    if (raw_sid.length > CALL_SID_MAX) {
+      return { error: `call_sid exceeds ${CALL_SID_MAX} characters` };
+    }
+    parsed.call_sid = raw_sid.trim();
+  }
+  return parsed;
 }
 
-// ── State-fetch helpers (pure inputs → tuple of DB reads) ───────────
+// ── State-fetch helpers ─────────────────────────────────────────────
 
 interface BusinessContext {
   business_name: string;
@@ -172,11 +233,6 @@ async function loadBusinessContext(
     business_name: row.business_name || "our team",
     legacyTransferToPhone: row.transfer_to_phone || null,
     transferWarmMessage: row.transfer_warm_message || null,
-    // Prefer Neverr-provisioned Twilio number as caller ID; fall back to
-    // business_configs.phone_number (their existing DID). Downstream
-    // libs (twilio-caller-id.ts) do fancier resolution but for the
-    // routing leg this baseline is enough — 3.2b integration can adopt
-    // the shared caller-id helper.
     callerId: row.twilio_phone_number || row.phone_number || "",
     departments,
   };
@@ -187,11 +243,6 @@ async function loadOnDutyForTopic(
   businessId: string,
   topicSlug: string,
 ): Promise<StaffCandidate[]> {
-  // Two-step: first find on-duty user_ids assigned to the topic, then
-  // fetch their callback_ring_number. supabase-js embedded joins don't
-  // fluently express "AND" across two source tables + a filter clause,
-  // and we already denormalize business_id onto staff_topics
-  // (migration 037) precisely to make this cheap.
   const { data: topicRows, error: topicErr } = await supabase
     .from("staff_topics")
     .select("user_id")
@@ -223,8 +274,6 @@ async function loadOnDutyAny(
     .select("user_id, callback_ring_number, on_duty_since")
     .eq("business_id", businessId)
     .eq("is_on_duty", true)
-    // Most-recently-clocked-in first (Phase A lock-in: fresh employees
-    // are more attentive than staff who've been on-duty for hours).
     .order("on_duty_since", { ascending: false });
   if (error) return [];
   return ((data as Array<{ user_id: string; callback_ring_number: string | null }> | null) ?? [])
@@ -232,50 +281,73 @@ async function loadOnDutyAny(
     .map((r) => ({ userId: r.user_id, callbackRingNumber: r.callback_ring_number as string }));
 }
 
-// ── Core handler (exported for smoke tests) ─────────────────────────
-
-export interface RouteToTopicResult {
-  status: string;
-  message_for_llm: string;
-  twiml: string | null;
-  staff_count: number;
-  handoff_reason: string;
-  /** Populated for observability — smoke tests assert against this. */
-  decision: RoutingDecision;
-}
+// ── Handler ─────────────────────────────────────────────────────────
 
 /**
- * Compose the line the LLM should say to the caller for a given path.
- * Kept small on purpose — the tone stays natural because the LLM will
- * paraphrase in the caller's language rather than reading verbatim.
+ * Public status label for the LLM-facing response — smaller alphabet
+ * than the internal transferStatus enum. The LLM only cares about the
+ * shape of "what do I say next".
  */
-function messageForLlm(
-  decision: RoutingDecision,
-  topicName: string,
-): string {
+export type PublicRoutingStatus = "connecting" | "taking_message" | "no_help_available";
+
+export interface RouteToTopicResult {
+  status: PublicRoutingStatus;
+  topic_name: string;
+  staff_count: number;
+  handoff_reason: string;
+  /** Internal — smoke tests assert against this. Not part of the wire response. */
+  decision: RoutingDecision;
+  /** Internal — the TwiML that will be pushed via REST after the delay. Null for non-dial paths. */
+  twiml: string | null;
+}
+
+function publicStatusFor(decision: RoutingDecision): PublicRoutingStatus {
   switch (decision.path) {
     case "topic_match":
-      return `Great — let me connect you with our ${topicName} team right now. One moment.`;
     case "any_on_duty":
-      return `Let me get someone on the line for you now. One moment.`;
     case "legacy_transfer":
-      return `Let me get you connected with the team right now.`;
+      return "connecting";
     case "after_hours_callback":
-      return `We're currently closed, but I can take a message and someone will get back to you as soon as we reopen. May I get your name and a callback number?`;
+      return "taking_message";
     case "graceful_hangup":
-      return `I don't have anyone available to help with that right now. Would you like me to take a message and have someone reach out to you?`;
+      return "no_help_available";
   }
+}
+
+export interface HandleRouteToTopicOptions {
+  /** Injected clock for deterministic tests. */
+  now?: Date;
+  /**
+   * When provided, the handler schedules the Twilio REST redirect on
+   * this client (dial paths only). Tests pass a mock; production wires
+   * `getTwilioClient()`. If null, redirect is skipped entirely (still
+   * logs) — useful for smoke-level tests that don't want to assert on
+   * setTimeout timing.
+   */
+  twilioClient?: TwilioCallControl | null;
+  /**
+   * Override redirect delay for tests. Production uses
+   * ROUTING_REDIRECT_DELAY_MS.
+   */
+  redirectDelayMs?: number;
+  /**
+   * Test hook: called synchronously with the REST call promise so
+   * smoke can await the underlying update() without relying on
+   * setTimeout timing. Fired after schedule, before delay elapses.
+   */
+  onRedirectScheduled?: (info: { callSid: string; twiml: string; delayMs: number }) => void;
 }
 
 export async function handleRouteToTopic(
   supabase: SupabaseClient,
   body: RouteToTopicBody,
-  now: Date = new Date(),
+  opts: HandleRouteToTopicOptions = {},
 ): Promise<
   | { ok: true; result: RouteToTopicResult }
   | { ok: false; status: number; error: string }
 > {
-  const { business_id, conversation_id, topic_slug, reason } = body;
+  const { business_id, conversation_id, topic_slug, reason, call_sid } = body;
+  const now = opts.now ?? new Date();
 
   const biz = await loadBusinessContext(supabase, business_id);
   if (!biz) return { ok: false, status: 404, error: "Business not found" };
@@ -284,7 +356,6 @@ export async function handleRouteToTopic(
   const topicName =
     biz.departments.find((t) => t.slug === topic_slug)?.name || topic_slug;
 
-  // Load on-duty candidates. Both fetches run concurrently.
   const [onDutyForTopic, onDutyAny, hoursNow] = await Promise.all([
     topicConfigured
       ? loadOnDutyForTopic(supabase, business_id, topic_slug)
@@ -293,10 +364,6 @@ export async function handleRouteToTopic(
     handleHoursNow(supabase, business_id, now),
   ]);
 
-  // "Open" only when the hours engine says so. On error, we conservatively
-  // treat as closed — that pushes callers to the callback path rather
-  // than blindly dialing legacy_transfer_to_phone with no idea whether
-  // the business is even open.
   const businessOpen = hoursNow.ok ? hoursNow.result.is_open : false;
 
   const inputs: RoutingInputs = {
@@ -310,7 +377,11 @@ export async function handleRouteToTopic(
 
   // Build TwiML only for the paths that actually dial.
   let twiml: string | null = null;
-  if (decision.path === "topic_match" || decision.path === "any_on_duty" || decision.path === "legacy_transfer") {
+  const isDialPath =
+    decision.path === "topic_match" ||
+    decision.path === "any_on_duty" ||
+    decision.path === "legacy_transfer";
+  if (isDialPath) {
     const whisperText = composeWhisperText({
       businessName: biz.business_name,
       topicName,
@@ -320,22 +391,16 @@ export async function handleRouteToTopic(
     const dialOpts: DialBuilderOptions = {
       callerId: biz.callerId,
       whisperUrl,
-      // Reuse existing recording-status webhook — same handler that
-      // processes lead-bridge recordings (Slice 2A).
       recordingStatusUrl: `${getPublicUrl()}/api/twilio/recording-status`,
-      // Dial status callback: emitted at end of the Dial verb so we can
-      // move transfer_status from "routing_*" → "answered" / "no_answer"
-      // in Phase 3.2b. For 3.2a we still populate the attribute so Twilio
-      // will send us the event when 3.2b lands the handler.
-      dialStatusUrl: `${getPublicUrl()}/api/routing/dial-status`,
+      dialStatusUrl: `${getPublicUrl()}/api/routing/dial-status?business_id=${encodeURIComponent(business_id)}&conversation_id=${encodeURIComponent(conversation_id)}`,
     };
     twiml = buildDialTwiml(decision, dialOpts);
   }
 
-  // Best-effort UPDATE of the calls row for logging. If the row doesn't
-  // exist yet (post-call webhook hasn't fired), log a Sentry warning
-  // and continue — routing metadata still ships in the response body
-  // so 3.2b can pipe it through a different mechanism.
+  // Best-effort UPDATE of the calls row.
+  // Only write handoff_reason (canonical as of 3.2b). transfer_reason
+  // is deprecated — no new writes. Keep transfer_status because
+  // it's the state machine we mutate in dial-status webhook later.
   try {
     const { data: updated, error: updateErr } = await supabase
       .from("calls")
@@ -344,7 +409,6 @@ export async function handleRouteToTopic(
         rung_user_ids: decision.staffUserIds,
         handoff_reason: decision.handoffReason,
         transfer_status: decision.transferStatus,
-        transfer_reason: reason,
       })
       .eq("business_id", business_id)
       .eq("conversation_id", conversation_id)
@@ -368,17 +432,177 @@ export async function handleRouteToTopic(
     });
   }
 
+  // Schedule the Twilio REST redirect on dial paths.
+  if (isDialPath && twiml && call_sid) {
+    const twilioClient = opts.twilioClient !== undefined ? opts.twilioClient : getTwilioClient();
+    const delayMs = opts.redirectDelayMs ?? ROUTING_REDIRECT_DELAY_MS;
+    if (twilioClient) {
+      opts.onRedirectScheduled?.({ callSid: call_sid, twiml, delayMs });
+      setTimeout(() => {
+        void twilioClient
+          .calls(call_sid)
+          .update({ twiml })
+          .catch((err: any) => {
+            Sentry.captureException(err, {
+              extra: {
+                where: "route_to_topic redirect",
+                business_id,
+                conversation_id,
+                call_sid,
+              },
+            });
+          });
+      }, delayMs);
+    } else {
+      Sentry.captureMessage("route_to_topic_redirect_skipped_no_twilio", {
+        level: "warning",
+        extra: { business_id, conversation_id, call_sid },
+      });
+    }
+  } else if (isDialPath && !call_sid) {
+    Sentry.captureMessage("route_to_topic_redirect_skipped_no_call_sid", {
+      level: "warning",
+      extra: {
+        business_id,
+        conversation_id,
+        note: "system__call_sid missing from tool body; ElevenLabs schema may need update",
+      },
+    });
+  }
+
   return {
     ok: true,
     result: {
-      status: decision.transferStatus,
-      message_for_llm: messageForLlm(decision, topicName),
-      twiml,
+      status: publicStatusFor(decision),
+      topic_name: topicName,
       staff_count: decision.staffPhones.length,
       handoff_reason: decision.handoffReason,
       decision,
+      twiml,
     },
   };
+}
+
+// ── Dial-status handler ─────────────────────────────────────────────
+
+/**
+ * Map Twilio's DialCallStatus to our transfer_status transition + the
+ * transfer_answered boolean. Twilio values per docs:
+ *   completed  — the called party answered and was connected
+ *   busy       — the called party was busy (no ring)
+ *   no-answer  — the called party did not answer within timeout
+ *   canceled   — the call was canceled before it was answered
+ *   failed     — a network failure prevented the dial
+ *
+ * For simultaneous ring, `completed` on ANY of the numbers means
+ * someone answered — Twilio surfaces the winning DialCallSid.
+ */
+export function mapDialStatus(dialCallStatus: string): {
+  transferStatus: string;
+  transferAnswered: boolean;
+} {
+  switch (dialCallStatus) {
+    case "completed":
+    case "answered":
+      return { transferStatus: "answered", transferAnswered: true };
+    case "no-answer":
+      return { transferStatus: "no_answer", transferAnswered: false };
+    case "busy":
+      return { transferStatus: "busy", transferAnswered: false };
+    case "canceled":
+      return { transferStatus: "canceled", transferAnswered: false };
+    case "failed":
+    default:
+      return { transferStatus: "failed", transferAnswered: false };
+  }
+}
+
+export interface DialStatusBody {
+  business_id: string;
+  conversation_id: string;
+  DialCallStatus: string;
+  DialCallSid?: string;
+  /** The E.164 that answered / was rung — Twilio populates this on Dial. */
+  To?: string;
+  From?: string;
+}
+
+/**
+ * Given the answered E.164 (`To` from Twilio's Dial callback), look up
+ * which auth.users.id it maps to. Uses the rung_user_ids stored on the
+ * calls row from route-to-topic + a per-user callback_ring_number join.
+ * Best-effort: returns null if no match (Twilio can send this callback
+ * even when nobody answered).
+ */
+async function resolveHandledByUserId(
+  supabase: SupabaseClient,
+  businessId: string,
+  conversationId: string,
+  answeredPhone: string | undefined,
+): Promise<string | null> {
+  if (!answeredPhone) return null;
+  const { data: callRow } = await supabase
+    .from("calls")
+    .select("rung_user_ids")
+    .eq("business_id", businessId)
+    .eq("conversation_id", conversationId)
+    .maybeSingle();
+  const rungIds = (callRow as { rung_user_ids?: string[] } | null)?.rung_user_ids;
+  if (!Array.isArray(rungIds) || rungIds.length === 0) return null;
+
+  const { data: matches } = await supabase
+    .from("user_businesses")
+    .select("user_id, callback_ring_number")
+    .eq("business_id", businessId)
+    .in("user_id", rungIds);
+  const match = ((matches as Array<{ user_id: string; callback_ring_number: string | null }> | null) ?? [])
+    .find((r) => r.callback_ring_number && r.callback_ring_number.trim() === answeredPhone.trim());
+  return match?.user_id ?? null;
+}
+
+export async function handleDialStatus(
+  supabase: SupabaseClient,
+  body: DialStatusBody,
+  now: Date = new Date(),
+): Promise<{ ok: true; transferStatus: string; handledByUserId: string | null } | { ok: false; error: string }> {
+  const { business_id, conversation_id, DialCallStatus, To } = body;
+  if (!business_id || !conversation_id) return { ok: false, error: "missing business_id or conversation_id" };
+  if (!DialCallStatus) return { ok: false, error: "missing DialCallStatus" };
+
+  const mapped = mapDialStatus(DialCallStatus);
+  const handledByUserId = mapped.transferAnswered
+    ? await resolveHandledByUserId(supabase, business_id, conversation_id, To)
+    : null;
+
+  const patch: Record<string, unknown> = {
+    transfer_status: mapped.transferStatus,
+    transfer_answered: mapped.transferAnswered,
+  };
+  if (handledByUserId) {
+    patch.handled_by_user_id = handledByUserId;
+    patch.handled_at = now.toISOString();
+  }
+  // If nobody answered, escalate handoff_reason to reflect the
+  // no-answer outcome. Don't overwrite an existing "answered" reason
+  // in the rare double-fire case.
+  if (!mapped.transferAnswered) {
+    patch.handoff_reason = "all_staff_no_answer";
+  }
+
+  try {
+    await supabase
+      .from("calls")
+      .update(patch)
+      .eq("business_id", business_id)
+      .eq("conversation_id", conversation_id);
+  } catch (err: any) {
+    Sentry.captureMessage("dial_status_update_failed", {
+      level: "warning",
+      extra: { business_id, conversation_id, error: err?.message },
+    });
+  }
+
+  return { ok: true, transferStatus: mapped.transferStatus, handledByUserId };
 }
 
 // ── Express route registrations ─────────────────────────────────────
@@ -405,22 +629,12 @@ router.post(
       res.status(result.status).json({ error: result.error });
       return;
     }
-    const { decision: _drop, ...publicPayload } = result.result;
+    // Strip internal-only fields before returning to ElevenLabs.
+    const { decision: _drop1, twiml: _drop2, ...publicPayload } = result.result;
     res.json(publicPayload);
   },
 );
 
-/**
- * Staff-side whisper endpoint. Twilio fetches this URL when the rung
- * staff answers — the TwiML we return plays a `<Say>` to the staff
- * only, then Twilio bridges the two legs. No auth: (a) it's called by
- * Twilio infra, and (b) the only sensitive input is the whisper text
- * which the caller (our own routing handler) already computed.
- *
- * Length-cap defensively so a maliciously long query string can't
- * balloon the Say payload. Twilio itself will reject <Say> > 4096
- * chars; we cap at 300 to keep the whisper conversational.
- */
 router.get(
   "/routing/whisper",
   (req: Request, res: Response): void => {
@@ -428,6 +642,42 @@ router.get(
     const text = raw.length > 300 ? raw.slice(0, 297) + "..." : raw;
     const fallback = text || "Incoming call. Connecting now.";
     res.type("text/xml").send(buildWhisperTwiml(fallback));
+  },
+);
+
+router.post(
+  "/routing/dial-status",
+  async (req: Request, res: Response): Promise<void> => {
+    // Signature verification: Twilio signs POSTs to our callback URLs.
+    // Refuse forged requests but always respond 200 (Twilio retries
+    // aggressively on non-2xx and there's nothing productive it can do
+    // with the retry).
+    if (!verifyTwilioSignature(req)) {
+      res.status(401).type("text/xml").send('<?xml version="1.0" encoding="UTF-8"?><Response/>');
+      return;
+    }
+    const supabase = getSupabase();
+    if (!supabase) {
+      // Nothing to log against — just 200 to end Twilio's retry loop.
+      res.status(200).type("text/xml").send('<?xml version="1.0" encoding="UTF-8"?><Response/>');
+      return;
+    }
+    const business_id =
+      (req.query.business_id as string) || (req.body?.business_id as string) || "";
+    const conversation_id =
+      (req.query.conversation_id as string) || (req.body?.conversation_id as string) || "";
+    const body: DialStatusBody = {
+      business_id,
+      conversation_id,
+      DialCallStatus: (req.body?.DialCallStatus as string) || "",
+      DialCallSid: (req.body?.DialCallSid as string) || undefined,
+      To: (req.body?.To as string) || undefined,
+      From: (req.body?.From as string) || undefined,
+    };
+    await handleDialStatus(supabase, body);
+    // Return an empty <Response> so Twilio ends the leg cleanly (the
+    // Dial verb has already terminated; nothing left to do).
+    res.status(200).type("text/xml").send('<?xml version="1.0" encoding="UTF-8"?><Response/>');
   },
 );
 
