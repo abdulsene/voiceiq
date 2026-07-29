@@ -24,6 +24,9 @@ import campaignsRouter from "./campaigns";
 import teamRouter from "./team";
 import topicsRouter from "./topics";
 import hoursRouter from "./hours";
+// Phase 3.2a: topic-aware routing webhook (invoked by Alex's
+// route_to_topic ElevenLabs tool in 3.2b).
+import routingRouter from "./routing";
 import leadOutcomesRouter from "./lead-outcomes";
 import publicLeadRouter from "./public-lead";
 import twilioCallbacksRouter from "./twilio-callbacks";
@@ -113,6 +116,11 @@ router.use(campaignsRouter);
 router.use(teamRouter);
 router.use(topicsRouter);
 router.use(hoursRouter);
+// Phase 3.2a: mounted alongside team/topics/hours — same slice, same
+// gating philosophy. The route itself is Bearer-authenticated
+// (ELEVENLABS_TOOL_SECRET) rather than requireAuth-guarded because
+// ElevenLabs's agent is the caller. Path bypass listed in app.ts.
+router.use(routingRouter);
 // Slice 3A pillar 1: outcome capture per lead-call.
 //   POST /api/business/leads/:id/calls/:callSid/outcome
 // Mounted alongside leadCallsRouter — both deal with the same

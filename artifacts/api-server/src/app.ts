@@ -164,6 +164,19 @@ const AUTH_BYPASS_PATTERNS = [
   // Phase 2.2.5: /api/leads/record-appointment is the record_appointment
   // tool endpoint. Same Bearer-token auth via ELEVENLABS_TOOL_SECRET.
   /^\/api\/leads\/record-appointment$/,
+  // Phase 3.2a: /api/routing/route-to-topic is the route_to_topic tool
+  // endpoint (registered on the agent in Phase 3.2b). Same Bearer-token
+  // auth via ELEVENLABS_TOOL_SECRET as the other tool endpoints.
+  /^\/api\/routing\/route-to-topic$/,
+  // Phase 3.2a: /api/routing/whisper is the staff-side whisper TwiML.
+  // Called by Twilio infra when a rung staff cell answers — no auth
+  // needed (the query text is public; Twilio is a trusted caller by
+  // network topology).
+  /^\/api\/routing\/whisper$/,
+  // Phase 3.2a: /api/routing/dial-status will be the Twilio Dial action
+  // callback wired in 3.2b. Bypass now so the URL is claimable when the
+  // handler ships. Signature verification happens inside the handler.
+  /^\/api\/routing\/dial-status$/,
   // Slice 3A pillar 3: customer trust portal. GET /api/public/lead/:token
   // and POST /api/public/lead/:token/action. Token IS the credential
   // (HS256-signed by lib/trust-portal-token.ts). Tight regex so future
