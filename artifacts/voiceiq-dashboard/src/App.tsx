@@ -49,6 +49,12 @@ import { LocationProvider } from "./components/LocationContext";
 import LocationSwitcher from "./components/LocationSwitcher";
 import BusinessSwitcher from "./components/BusinessSwitcher";
 import AddBusinessModal from "./components/AddBusinessModal";
+// Phase 3.1b: On-duty toggle for the dashboard header. Mounted alongside
+// BusinessSwitcher + LocationSwitcher so any staff member can clock in /
+// out from any dashboard page without navigating to /team.
+import OnDutyToggle from "./components/OnDutyToggle";
+// Phase 3.1b: new /team page.
+import TeamPage from "./pages/Team/TeamPage";
 import ActivateAccount from "./pages/ActivateAccount";
 import SmsOptInPage from "./pages/SmsOptInPage";
 import VerifyEmail from "./pages/VerifyEmail";
@@ -610,6 +616,9 @@ function DashboardLayout() {
           <main className="flex-1 min-w-0 md:ml-[220px] overflow-y-auto min-h-screen">
             <DemoBanner />
             <div className="flex justify-end items-center gap-3 px-6 pt-4 pb-0">
+              {/* Phase 3.1b: on-duty toggle. Sits leftmost in the header
+                  chip row so it's always accessible without hunting for it. */}
+              <OnDutyToggle />
               <BusinessSwitcher onAddBusiness={() => setShowAddBiz(true)} />
               <LocationSwitcher />
             </div>
@@ -637,6 +646,10 @@ function DashboardLayout() {
               <Route path="/campaigns/:id">
                 {(params) => <CampaignDetailPage campaignId={params.id} />}
               </Route>
+              {/* Phase 3.1b: team management (/team). Server routes at
+                  /api/business/team/* enforce requirePermission — non-admin
+                  members see the table read-only via a 403 on invite/remove. */}
+              <Route path="/team" component={TeamPage} />
               <Route path="/contacts" component={Contacts} />
               <Route path="/appointments" component={Appointments} />
               <Route path="/sms" component={SmsCampaigns} />
@@ -822,6 +835,7 @@ function App() {
         <Route path="/leads/:id" component={() => <DashboardLayout />} />
         <Route path="/campaigns" component={() => <DashboardLayout />} />
         <Route path="/campaigns/:id" component={() => <DashboardLayout />} />
+        <Route path="/team" component={() => <DashboardLayout />} />
         <Route path="/contacts" component={() => <DashboardLayout />} />
         <Route path="/appointments" component={() => <DashboardLayout />} />
         <Route path="/sms" component={() => <DashboardLayout />} />

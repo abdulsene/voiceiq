@@ -10,8 +10,27 @@ import {
   Swords, Headphones, MessageSquare, Code2, Sparkles, PhoneOutgoing,
 } from "lucide-react";
 import SalesDemosTab from "../components/SalesDemosTab";
+// Phase 3.1b: Topics + Business Hours tabs live in dedicated files so
+// SettingsPage's monolith doesn't grow another 500 lines. Both use
+// fetchApi + tenant-scoped /api/business/* endpoints (backed by
+// migrations 036-039).
+import TopicsTab from "./Settings/TopicsTab";
+import BusinessHoursTab from "./Settings/BusinessHoursTab";
+import { useTabQueryState } from "@/hooks/use-tab-query-state";
 
 const API = "/api";
+
+// Phase 3.1b: allowlist of tab IDs so useTabQueryState can validate
+// ?tab=… params and reject junk. Kept as a top-level const so
+// deep-links to newly-added tabs work without a code round-trip in
+// the component itself.
+const SETTINGS_TABS = [
+  "business", "ai", "callback", "website", "phone", "outbound",
+  "locations", "integrations", "team", "topics", "business_hours",
+  "security", "billing", "notifications", "objections", "competitors",
+  "widget", "sms_optin", "sales_demos",
+] as const;
+type SettingsTabId = (typeof SETTINGS_TABS)[number];
 
 const LANGUAGE_REGIONS = [
   {
@@ -2062,7 +2081,12 @@ function WebsiteTab({ businessId }: { businessId: string }) {
 
 export default function SettingsPage() {
   const { t } = useTranslation();
-  const [tab, setTab] = useState("business");
+  // Phase 3.1b: swapped useState → useTabQueryState so ?tab=topics /
+  // ?tab=business_hours deep-links resolve to the right pane and every
+  // tab click replaceStates back into the URL (bookmarkable). Allowlist
+  // ensures a bad param falls back to "business" instead of a blank
+  // page.
+  const [tab, setTab] = useTabQueryState<SettingsTabId>(SETTINGS_TABS, "business");
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
@@ -2293,6 +2317,10 @@ export default function SettingsPage() {
     { id: "locations", label: "Locations", icon: MapPin },
     { id: "integrations", label: "Integrations", icon: Plug },
     { id: "team", label: "Team", icon: Users },
+    // Phase 3.1b: Topics (routing intents) + Business hours (structured
+    // weekly schedule) — both drive the Phase 3.2 routing engine.
+    { id: "topics", label: "Topics", icon: Headphones },
+    { id: "business_hours", label: "Business hours", icon: Clock },
     { id: "security", label: "Security", icon: Shield },
     { id: "billing", label: "Billing", icon: CreditCard },
     { id: "notifications", label: "Notifications", icon: Bell },
@@ -2337,7 +2365,7 @@ export default function SettingsPage() {
           return (
             <button
               key={t.id}
-              onClick={() => setTab(t.id)}
+              onClick={() => setTab(t.id as SettingsTabId)}
               className={`flex items-center gap-2 px-4 py-2.5 rounded-xl text-sm font-medium transition-all whitespace-nowrap ${
                 tab === t.id
                   ? "bg-[#2E75B6] text-white shadow-md"
@@ -2892,6 +2920,15 @@ export default function SettingsPage() {
         })()}
 
         {tab === "team" && <TeamTab />}
+
+        {/* Phase 3.1b: routing-topic catalogue for this business. */}
+        {tab === "topics" && <TopicsTab />}
+
+        {/* Phase 3.1b: structured business_hours (backed by migration 038
+            + backfilled by 039). Free-form business_configs.business_hours
+            column is deprecated in the UI but stays populated for
+            backward-compat with the AI prompt renderer until 3.2. */}
+        {tab === "business_hours" && <BusinessHoursTab />}
 
         {tab === "sales_demos" && isAdmin && <SalesDemosTab />}
 

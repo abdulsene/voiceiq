@@ -19,6 +19,7 @@ import {
   Bot,
   Inbox,
   Megaphone,
+  UsersRound,
 } from "lucide-react";
 // Sprint 1 BUG-17 sub-step 3f: removed import of OnboardingWizard. The
 // in-sidebar "Start Setup" / "New Business" buttons used to open it and
@@ -67,6 +68,10 @@ const navItems: NavItem[] = [
   // Contacts so the outbound-call workflow lives alongside the lead
   // pipeline it draws from.
   { path: "/campaigns", labelKey: "nav.campaigns", icon: Megaphone },
+  // Phase 3.1b: team management — staff on this business, role +
+  // on-duty state + topic assignments. UsersRound (not Users) so it
+  // reads distinct from Contacts below.
+  { path: "/team", labelKey: "nav.team", icon: UsersRound },
   { path: "/contacts", labelKey: "nav.contacts", icon: Users },
   { path: "/appointments", labelKey: "nav.appointments", icon: Calendar },
   { path: "/sms", labelKey: "nav.sms", icon: MessageSquare },
