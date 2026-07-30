@@ -56,6 +56,11 @@ const navItems: NavItem[] = [
   // configuration. Placed directly under Command Center so it reads as a
   // first-class daily-driver feature, not a "deep settings" item.
   { path: "/settings/ai", labelKey: "nav.myReceptionist", icon: Bot },
+  // Phase 3.3c: the softphone as a first-class destination. Sits between
+  // My Receptionist (which configures the AI that fields the call) and
+  // Calls & Leads (which shows what happened after) — mirrors the actual
+  // "before / during / after" narrative of a call.
+  { path: "/phone", labelKey: "nav.phone", label: "Phone", icon: Phone },
   { path: "/calls", labelKey: "nav.callsLeads", icon: Phone },
   // Leads epic Slice 1: callback-first escalation flow. Slotted between
   // "Calls & Leads" (the existing transcript-focused view) and

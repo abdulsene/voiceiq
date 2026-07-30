@@ -34,6 +34,8 @@ import VoiceTab from "./AiSettings/VoiceTab";
 import PromptEditor from "./AiSettings/PromptEditor";
 import TransferTab from "./AiSettings/TransferTab";
 import HistoryViewer from "./AiSettings/HistoryViewer";
+// Phase 3.3c: explicit AI-receptionist resync + tool inspector.
+import AgentResyncCard from "../components/AgentResyncCard";
 
 // Order is Voice / Prompt / Transfer / History per the operator-transfer
 // spec — Transfer is more relevant than History for daily-driver use, so
@@ -69,6 +71,12 @@ export default function AiSettingsPage() {
         <h1 className="text-3xl font-bold tracking-tight">AI Receptionist</h1>
         <p className="text-gray-500">Customize how your AI sounds on every call.</p>
       </div>
+
+      {/* Phase 3.3c: explicit resync + tool list, above the tabs so it
+          reads as an ops action (not a settings tab). Answers "is
+          route_to_topic actually attached?" without the ElevenLabs
+          console. */}
+      <AgentResyncCard />
 
       {/* Tabs */}
       <Tabs value={tab} onValueChange={(v) => setTab(v as TabKey)}>

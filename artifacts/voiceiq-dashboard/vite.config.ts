@@ -2,7 +2,27 @@ import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 import path from "path";
+import { execSync } from "node:child_process";
 import runtimeErrorOverlay from "@replit/vite-plugin-runtime-error-modal";
+
+// Phase 3.3c — bake build metadata into the bundle so the /phone page
+// and system-bar can render "Bundle deployed at …" and users / ops can
+// distinguish "the last republish didn't actually rebuild" from "the
+// bundle is fresh but the code doesn't work". Both fields are static
+// strings substituted at build time via Vite's `define`.
+function readBuildInfo(): { commit: string; time: string } {
+  let commit = "unknown";
+  try {
+    commit = execSync("git rev-parse --short HEAD", { stdio: ["ignore", "pipe", "ignore"] })
+      .toString()
+      .trim() || "unknown";
+  } catch {
+    // Not a git checkout (e.g. Docker COPY without .git). Fall through.
+  }
+  return { commit, time: new Date().toISOString() };
+}
+
+const BUILD_INFO = readBuildInfo();
 
 const isBuild = process.argv.includes("build");
 
@@ -22,6 +42,12 @@ if (Number.isNaN(port) || port <= 0) {
 
 export default defineConfig({
   base: "/",
+  define: {
+    // Injected as literal strings at build time. `__` prefix + suffix
+    // is the Vite convention to signal a compile-time replacement.
+    __BUILD_COMMIT__: JSON.stringify(BUILD_INFO.commit),
+    __BUILD_TIME__: JSON.stringify(BUILD_INFO.time),
+  },
   plugins: [
     react(),
     tailwindcss(),

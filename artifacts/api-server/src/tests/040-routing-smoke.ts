@@ -76,6 +76,16 @@
  *   T55 getPreferenceForCaller: happy path + 404 branch (route delegates
  *       to the shared helper — same code that T51 exercises)
  *
+ *   3.3c additions (softphone as first-class surface):
+ *   T56 reachability matrix — callback OR (in_app AND fresh HB);
+ *       stale/absent HB blocks. Same predicate the routing engine uses.
+ *   T57 system-bar indicator: 4 spec states (Ready/Not receiving/Off/
+ *       Mic blocked) + transient states.
+ *   T58 agent-tools returns empty (not error) when business has no
+ *       agent yet — pre-onboarding is not an error state.
+ *   T59 preference PATCH→GET round-trip: dock + sidebar toggles agree
+ *       on the shared column.
+ *
  * Run: pnpm --filter @workspace/api-server exec tsx \
  *        src/tests/040-routing-smoke.ts
  */
@@ -110,7 +120,11 @@ import {
   mintVoiceAccessToken,
   updatePreferenceForCaller,
   getPreferenceForCaller,
+  // Phase 3.3c
+  getReachabilityForCaller,
 } from "../routes/voice";
+// Phase 3.3c — agent resync + tool inspector.
+import { fetchRegisteredToolNames } from "../routes/agent-sync";
 // Phase 3.3a — single source of truth for the identity formula. Tests
 // compute expected identities via the helper so a formula change in
 // buildClientIdentity is caught by the fixtures automatically.
@@ -2022,6 +2036,200 @@ async function T55_get_preference_shape() {
   record("T55 getPreferenceForCaller: happy path + 404 branch", failures.length === 0, failures.join("; ") || "route + tests share one implementation");
 }
 
+// ── Phase 3.3c: reachability guard + indicator states + agent tools ─
+
+/**
+ * Phase 3.3c T56 — reachability predicate matches routing candidate
+ * query exactly. This is the SAME rule the routing engine uses; if
+ * the two diverge, a user can clock in "reachable" per the guard and
+ * routing still won't ring them (the exact defect the first EZ
+ * Rentals attempt hit).
+ */
+async function T56_reachability_matrix() {
+  const cases: Array<{
+    label: string;
+    row: {
+      callback_ring_number: string | null;
+      in_app_calling_enabled: boolean;
+      voice_device_last_seen_at: string | null;
+    };
+    now?: Date;
+    expected: {
+      reachable: boolean;
+      has_callback_ring_number: boolean;
+      in_app_calling_enabled: boolean;
+      device_heartbeat_fresh: boolean;
+    };
+  }> = [
+    {
+      label: "callback + no device",
+      row: { callback_ring_number: "+14155550001", in_app_calling_enabled: false, voice_device_last_seen_at: null },
+      expected: { reachable: true, has_callback_ring_number: true, in_app_calling_enabled: false, device_heartbeat_fresh: false },
+    },
+    {
+      label: "no callback + fresh device",
+      row: { callback_ring_number: null, in_app_calling_enabled: true, voice_device_last_seen_at: new Date(Date.now() - 10_000).toISOString() },
+      expected: { reachable: true, has_callback_ring_number: false, in_app_calling_enabled: true, device_heartbeat_fresh: true },
+    },
+    {
+      label: "no callback + stale device (5 min old)",
+      row: { callback_ring_number: null, in_app_calling_enabled: true, voice_device_last_seen_at: new Date(Date.now() - 5 * 60_000).toISOString() },
+      expected: { reachable: false, has_callback_ring_number: false, in_app_calling_enabled: true, device_heartbeat_fresh: false },
+    },
+    {
+      label: "no callback + never registered",
+      row: { callback_ring_number: null, in_app_calling_enabled: true, voice_device_last_seen_at: null },
+      expected: { reachable: false, has_callback_ring_number: false, in_app_calling_enabled: true, device_heartbeat_fresh: false },
+    },
+    {
+      label: "no callback + device present but flag OFF",
+      row: { callback_ring_number: null, in_app_calling_enabled: false, voice_device_last_seen_at: new Date().toISOString() },
+      expected: { reachable: false, has_callback_ring_number: false, in_app_calling_enabled: false, device_heartbeat_fresh: true },
+    },
+    {
+      label: "the both-endpoints case (belt-and-braces)",
+      row: { callback_ring_number: "+14155550002", in_app_calling_enabled: true, voice_device_last_seen_at: new Date().toISOString() },
+      expected: { reachable: true, has_callback_ring_number: true, in_app_calling_enabled: true, device_heartbeat_fresh: true },
+    },
+  ];
+
+  const failures: string[] = [];
+  for (const c of cases) {
+    const fake = new FakeSupabaseClient();
+    fake.on(
+      (call) => call.op === "select" && call.table === "user_businesses",
+      { data: c.row },
+    );
+    const result = await getReachabilityForCaller(asClient(fake), USER_A, BIZ);
+    if (!result.ok) {
+      failures.push(`[${c.label}] not ok: ${(result as any).error}`);
+      continue;
+    }
+    for (const key of Object.keys(c.expected) as Array<keyof typeof c.expected>) {
+      if (result.state[key] !== c.expected[key]) {
+        failures.push(`[${c.label}] ${key}=${result.state[key]} want=${c.expected[key]}`);
+      }
+    }
+  }
+  // 404 branch — no membership row.
+  const fake404 = new FakeSupabaseClient();
+  fake404.on((c) => c.op === "select" && c.table === "user_businesses", { data: null });
+  const r404 = await getReachabilityForCaller(asClient(fake404), USER_A, BIZ);
+  if (r404.ok) failures.push("404 branch: expected not ok for missing membership");
+  else if (r404.status !== 404) failures.push(`404 branch: status=${r404.status}`);
+
+  record("T56 reachability matrix: callback OR (in_app AND fresh_hb); stale/absent HB blocks", failures.length === 0, failures.join("; ") || "6 states + 404 branch match the routing candidate predicate");
+}
+
+/**
+ * Phase 3.3c T57 — system-bar indicator maps to the four visible
+ * states from the spec (Ready / Not receiving / Off / Mic blocked)
+ * plus the transient/error states.
+ */
+async function T57_indicator_state_matrix() {
+  // deriveIndicatorState is pure but lives in the dashboard package,
+  // so we assert the same predicate inline here. This is a
+  // duplicate-implementation test; the intent is that the DASHBOARD
+  // side has a matching table and the two agree.
+  //
+  // The mapping is described in Softphone.tsx:deriveIndicatorState.
+  // Failure of any of the below indicates the frontend needs the
+  // same tweak.
+  const cases: Array<{
+    status: string;
+    serverEnabled: boolean | null;
+    wantLabel: string;
+  }> = [
+    { status: "permission-denied", serverEnabled: null, wantLabel: "Mic blocked" },
+    { status: "error", serverEnabled: true, wantLabel: "Offline" },
+    { status: "unregistered", serverEnabled: true, wantLabel: "Offline" },
+    { status: "connecting", serverEnabled: null, wantLabel: "Connecting…" },
+    { status: "requesting-permission", serverEnabled: null, wantLabel: "Connecting…" },
+    { status: "registered", serverEnabled: true, wantLabel: "Ready" },
+    { status: "registered", serverEnabled: false, wantLabel: "Not receiving" },
+    { status: "registered", serverEnabled: null, wantLabel: "Not receiving" },
+    { status: "idle", serverEnabled: null, wantLabel: "Off" },
+  ];
+  const failures: string[] = [];
+  for (const c of cases) {
+    const got = derivePillLabelForTest(c.status, c.serverEnabled);
+    if (got !== c.wantLabel) failures.push(`[${c.status}, se=${c.serverEnabled}] got=${got} want=${c.wantLabel}`);
+  }
+  record("T57 system-bar indicator: 4 spec states + transitional states", failures.length === 0, failures.join("; ") || "all indicator labels match spec");
+}
+
+// Local copy of the dashboard's derivation to smoke-test the mapping
+// contract without pulling React into the api-server tests.
+function derivePillLabelForTest(status: string, serverEnabled: boolean | null): string {
+  if (status === "permission-denied") return "Mic blocked";
+  if (status === "error" || status === "unregistered") return "Offline";
+  if (status === "connecting" || status === "requesting-permission") return "Connecting…";
+  if (status === "registered") return serverEnabled === true ? "Ready" : "Not receiving";
+  return "Off";
+}
+
+/**
+ * Phase 3.3c T58 — fetchRegisteredToolNames returns empty when the
+ * business has no agent yet (pre-onboarding). Prevents the resync
+ * card from rendering "No tools registered" as a bug when in fact
+ * the business simply hasn't onboarded.
+ */
+async function T58_agent_tools_no_agent_yet() {
+  const fake = new FakeSupabaseClient();
+  fake.on(
+    (c) => c.op === "select" && c.table === "business_configs",
+    { data: { agent_id: null } },
+  );
+  const result = await fetchRegisteredToolNames(asClient(fake), BIZ);
+  const failures: string[] = [];
+  if (!result.ok) failures.push(`not ok: ${(result as any).error}`);
+  else {
+    if (result.agentId !== null) failures.push(`agentId=${result.agentId} (expected null)`);
+    if (result.toolNames.length !== 0) failures.push(`toolNames=${JSON.stringify(result.toolNames)}`);
+  }
+  record("T58 agent-tools returns empty (not error) when business has no agent yet", failures.length === 0, failures.join("; ") || "pre-onboarding is not an error state");
+}
+
+/**
+ * Phase 3.3c T59 — dock and sidebar toggles write through the SAME
+ * PATCH endpoint. We already have T51 exercising updatePreferenceForCaller
+ * and T55 exercising getPreferenceForCaller through their shared helpers;
+ * this test asserts the round-trip: PATCH → GET returns the new value.
+ * Any drift where the two helpers stop touching the same column would
+ * be caught here.
+ */
+async function T59_preference_round_trip() {
+  const fake = new FakeSupabaseClient();
+  // Simulate a shared row that PATCH updates and GET reads.
+  let stored = false;
+  fake.on(
+    (c) => c.op === "update" && c.table === "user_businesses",
+    { data: { in_app_calling_enabled: true } },
+  );
+  const origResolve = fake.resolveCall.bind(fake);
+  fake.resolveCall = async function (call: any) {
+    if (call.op === "update" && call.table === "user_businesses") {
+      stored = call.payload?.in_app_calling_enabled === true;
+    }
+    if (call.op === "select" && call.table === "user_businesses") {
+      return { data: { in_app_calling_enabled: stored }, error: null };
+    }
+    return origResolve(call);
+  };
+
+  const patchResult = await updatePreferenceForCaller(asClient(fake), USER_A, BIZ, {
+    in_app_calling_enabled: true,
+  });
+  const getResult = await getPreferenceForCaller(asClient(fake), USER_A, BIZ);
+  const failures: string[] = [];
+  if (!patchResult.ok) failures.push(`patch not ok: ${(patchResult as any).error}`);
+  if (!getResult.ok) failures.push(`get not ok: ${(getResult as any).error}`);
+  if (getResult.ok && getResult.preferences.in_app_calling_enabled !== true) {
+    failures.push(`GET returned ${getResult.preferences.in_app_calling_enabled} after PATCH true`);
+  }
+  record("T59 preference PATCH→GET round-trip: dock + sidebar toggles agree on shared column", failures.length === 0, failures.join("; ") || "both toggles write same column, both reads see same value");
+}
+
 // ── Bonus: whisper composition and TwiML ────────────────────────────
 
 async function whisper_composition() {
@@ -2104,6 +2312,11 @@ async function main() {
   await T53_token_multi_membership_no_header_returns_400();
   await T54_token_single_membership_no_header_ok();
   await T55_get_preference_shape();
+  // Phase 3.3c — reachability guard + indicator states + agent tools
+  await T56_reachability_matrix();
+  await T57_indicator_state_matrix();
+  await T58_agent_tools_no_agent_yet();
+  await T59_preference_round_trip();
   await whisper_composition();
 
   const fails = results.filter((r) => !r.pass);

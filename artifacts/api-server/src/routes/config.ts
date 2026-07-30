@@ -55,11 +55,25 @@ function readVersion(): string {
 
 const VERSION = readVersion();
 
+// Phase 3.3c — process start-time as a proxy for "when did this deploy
+// go live". Restarts on every republish (Replit workflow); stable
+// within a running process. Powers the /phone page's "Deployed at:"
+// indicator so a user can tell whether the last republish actually
+// picked up a new bundle.
+const PROCESS_STARTED_AT = new Date().toISOString();
+
 // In-memory cache (60s TTL). Single-process — fine for the api-server,
 // which already keeps singletons (pg.Pool, supabase client, anthropic)
 // in module scope.
 const CACHE_TTL_MS = 60_000;
-let _cache: { payload: { discovery_call_url: string; version: string }; expires: number } | null = null;
+let _cache: {
+  payload: {
+    discovery_call_url: string;
+    version: string;
+    api_started_at: string;
+  };
+  expires: number;
+} | null = null;
 
 function getCachedPayload() {
   const now = Date.now();
@@ -67,6 +81,7 @@ function getCachedPayload() {
   const payload = {
     discovery_call_url: getDiscoveryCallUrl(),
     version: VERSION,
+    api_started_at: PROCESS_STARTED_AT,
   };
   _cache = { payload, expires: now + CACHE_TTL_MS };
   return payload;

@@ -44,8 +44,11 @@ import { verifyTwilioSignature } from "../lib/twilio-signature";
 import { buildClientIdentity } from "../lib/voice/client-identity";
 // Phase 3.3a — shared with routes/routing.ts (lives in lib/ to avoid
 // route → route imports). Previously duplicated as
-// DEVICE_FRESHNESS_SECS_ROUTING; that duplicate is gone.
-export { DEVICE_FRESHNESS_SECS } from "../lib/routing/constants";
+// DEVICE_FRESHNESS_SECS_ROUTING; that duplicate is gone. Imported for
+// local use in the reachability handler AND re-exported so downstream
+// consumers keep the routes/voice.ts import path they had.
+import { DEVICE_FRESHNESS_SECS } from "../lib/routing/constants";
+export { DEVICE_FRESHNESS_SECS };
 
 const router = Router();
 
@@ -411,7 +414,96 @@ router.post(
   },
 );
 
-// ── Heartbeat ───────────────────────────────────────────────────────
+// ── Reachability ────────────────────────────────────────────────────
+
+/**
+ * Phase 3.3c — server-side view of "can routing reach this staff
+ * member?". Same predicate the Phase 3.2 routing candidate query
+ * uses: has_callback_number OR (in_app_calling_enabled AND fresh
+ * heartbeat). Feeds the OnDutyToggle's reachability guard so a user
+ * can't clock in and go silently unreachable.
+ */
+export interface ReachabilityState {
+  in_app_calling_enabled: boolean;
+  has_callback_ring_number: boolean;
+  device_heartbeat_fresh: boolean;
+  /**
+   * True iff routing would actually ring this user. This is the SAME
+   * predicate the routing engine uses; drift here is the exact bug
+   * this endpoint exists to prevent.
+   */
+  reachable: boolean;
+  /** Age of last heartbeat in seconds, or null if never seen. */
+  device_heartbeat_age_secs: number | null;
+}
+
+export async function getReachabilityForCaller(
+  supabase: SupabaseClient,
+  callerUserId: string,
+  callerBusinessId: string,
+  now: Date = new Date(),
+): Promise<
+  | { ok: true; state: ReachabilityState }
+  | { ok: false; status: number; error: string }
+> {
+  const { data, error } = await supabase
+    .from("user_businesses")
+    .select("callback_ring_number, in_app_calling_enabled, voice_device_last_seen_at")
+    .eq("user_id", callerUserId)
+    .eq("business_id", callerBusinessId)
+    .maybeSingle();
+  if (error) return { ok: false, status: 500, error: error.message };
+  if (!data) return { ok: false, status: 404, error: "Membership not found" };
+  const row = data as {
+    callback_ring_number: string | null;
+    in_app_calling_enabled: boolean | null;
+    voice_device_last_seen_at: string | null;
+  };
+  const hasCallback = !!row.callback_ring_number;
+  const enabled = !!row.in_app_calling_enabled;
+  const lastMs = row.voice_device_last_seen_at
+    ? Date.parse(row.voice_device_last_seen_at)
+    : NaN;
+  const ageSecs = Number.isNaN(lastMs)
+    ? null
+    : Math.max(0, Math.floor((now.getTime() - lastMs) / 1000));
+  const fresh = ageSecs !== null && ageSecs <= DEVICE_FRESHNESS_SECS;
+  const reachable = hasCallback || (enabled && fresh);
+  return {
+    ok: true,
+    state: {
+      in_app_calling_enabled: enabled,
+      has_callback_ring_number: hasCallback,
+      device_heartbeat_fresh: fresh,
+      reachable,
+      device_heartbeat_age_secs: ageSecs,
+    },
+  };
+}
+
+router.get(
+  "/voice/reachability",
+  requireAuth,
+  async (req: Request, res: Response): Promise<void> => {
+    const userId = req.userId;
+    const businessId = req.businessId;
+    if (!userId || !businessId) {
+      res.status(401).json({ error: "Authentication required" });
+      return;
+    }
+    const supabase = getSupabase();
+    if (!supabase) {
+      res.status(500).json({ error: "Database not configured" });
+      return;
+    }
+    const result = await getReachabilityForCaller(supabase, userId, businessId);
+    if (!result.ok) {
+      res.status(result.status).json({ error: result.error });
+      return;
+    }
+    res.json(result.state);
+  },
+);
 
 // ── Preferences ─────────────────────────────────────────────────────
 

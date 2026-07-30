@@ -55,6 +55,8 @@ import AddBusinessModal from "./components/AddBusinessModal";
 import OnDutyToggle from "./components/OnDutyToggle";
 // Phase 3.1b: new /team page.
 import TeamPage from "./pages/Team/TeamPage";
+// Phase 3.3c: softphone as a first-class page.
+import PhonePage from "./pages/Phone";
 import ActivateAccount from "./pages/ActivateAccount";
 import SmsOptInPage from "./pages/SmsOptInPage";
 import VerifyEmail from "./pages/VerifyEmail";
@@ -630,6 +632,12 @@ function DashboardLayout() {
             </div>
             <Switch>
               <Route path="/dashboard" component={CommandCenter} />
+              {/* Phase 3.3c: softphone as a first-class destination —
+                  device status, mic state, dialpad, in-app-calling
+                  toggle, reachability panel. The floating dock still
+                  exists as a compact status pill but is no longer the
+                  ONLY place the toggle lives. */}
+              <Route path="/phone" component={PhonePage} />
               <Route path="/calls" component={CallsLeads} />
               {/* Leads epic Slice 1: the lead detail page deep-links to
                   /calls/:id when a source_call_id exists. CallsLeads

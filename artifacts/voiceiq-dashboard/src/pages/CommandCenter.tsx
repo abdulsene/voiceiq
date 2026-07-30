@@ -4,6 +4,10 @@ import { useTranslation } from "react-i18next";
 import { getCallStats, getRecentCalls, getActionItems, callOutbound, sendSms, getLocationStats, getSurveyFollowups, getProfiles } from "../lib/api";
 import UsageSummary from "../components/UsageSummary";
 import { useLocation as useLocationCtx } from "../components/LocationContext";
+// Phase 3.3c: softphone status alongside Alex / SMS / Calendar in the
+// bottom system bar so ops can see at a glance whether the WebRTC
+// device is reachable.
+import { SoftphoneIndicator } from "../components/Softphone";
 import {
   Phone,
   UserPlus,
@@ -900,6 +904,9 @@ export default function CommandCenter() {
             <Wifi className="w-3.5 h-3.5 text-gray-400" />
             <span className="text-[11px] font-medium text-gray-600">Outlook: <span className="text-emerald-600">{t("dashboard.connected")}</span></span>
           </div>
+          {/* Phase 3.3c: softphone status. Real state (unlike the four
+              above which are placeholders). Clicks navigate to /phone. */}
+          <SoftphoneIndicator />
         </div>
         <div className="flex items-center gap-1.5">
           <Clock className="w-3.5 h-3.5 text-gray-400" />

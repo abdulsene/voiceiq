@@ -33,6 +33,10 @@ import routingRouter from "./routing";
 //   POST /api/voice/heartbeat  (requireAuth)
 // Outbound path is bypass-listed in app.ts.
 import voiceRouter from "./voice";
+// Phase 3.3c — explicit AI-receptionist resync + tool inspector.
+//   POST /api/business/agent/resync
+//   GET  /api/business/agent/tools
+import agentSyncRouter from "./agent-sync";
 import leadOutcomesRouter from "./lead-outcomes";
 import publicLeadRouter from "./public-lead";
 import twilioCallbacksRouter from "./twilio-callbacks";
@@ -130,6 +134,9 @@ router.use(routingRouter);
 // Phase 3.3: in-app calling. Mounted alongside routingRouter — same
 // slice, extends (does not replace) Phase 3.2.
 router.use(voiceRouter);
+// Phase 3.3c: mounted alongside prompt/voices — same customer-settings
+// slice, same requireAuth + requirePermission gating pattern.
+router.use(agentSyncRouter);
 // Slice 3A pillar 1: outcome capture per lead-call.
 //   POST /api/business/leads/:id/calls/:callSid/outcome
 // Mounted alongside leadCallsRouter — both deal with the same
