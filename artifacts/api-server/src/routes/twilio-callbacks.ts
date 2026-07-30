@@ -84,7 +84,16 @@ function xmlEscape(s: string): string {
 
 router.post("/twilio/voice/lead-bridge", async (req: Request, res: Response) => {
   if (!verifyTwilioSignature(req)) {
-    res.status(401).type("text/xml").send('<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>');
+    // Phase 3.4 — mid-call TwiML callback. 401 makes Twilio play "an
+    // application error has occurred" to the customer (see the
+    // 2026-07-30 dial-status incident that motivated this slice).
+    // Return 200 with a benign <Response/> and let Sentry catch the
+    // config drift.
+    Sentry.captureMessage("lead_bridge_signature_rejected", {
+      level: "error",
+      extra: { path: req.originalUrl },
+    });
+    res.status(200).type("text/xml").send('<?xml version="1.0" encoding="UTF-8"?><Response/>');
     return;
   }
   const supabase = getSupabase();

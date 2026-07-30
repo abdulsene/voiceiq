@@ -81,6 +81,9 @@ import { verifyTwilioSignature } from "../lib/twilio-signature";
 // can import the same value (was previously duplicated locally as
 // DEVICE_FRESHNESS_SECS_ROUTING).
 import { DEVICE_FRESHNESS_SECS } from "../lib/routing/constants";
+// Phase 3.4 — see lib/public-url.ts header. Single source of truth
+// for the base URL Twilio callbacks use AND that we verify against.
+import { getPublicApiBase } from "../lib/public-url";
 
 const router = Router();
 
@@ -123,12 +126,14 @@ function getSupabase(): SupabaseClient | null {
   return createClient(url, key, { auth: { persistSession: false } });
 }
 
+// Phase 3.4 — delegate to the single-source-of-truth helper. The
+// local `PUBLIC_URL || APP_URL || "https://neverr.ai"` implementation
+// caused the sev-1 dial-status failure: the URL we told Twilio to
+// call back on didn't match the URL twilio-signature.ts reconstructed
+// for HMAC verification. See lib/public-url.ts header for the full
+// incident context.
 function getPublicUrl(): string {
-  return (
-    process.env.PUBLIC_URL ||
-    process.env.APP_URL ||
-    "https://neverr.ai"
-  ).replace(/\/$/, "");
+  return getPublicApiBase();
 }
 
 /**
@@ -223,6 +228,12 @@ interface BusinessContext {
   business_name: string;
   legacyTransferToPhone: string | null;
   transferWarmMessage: string | null;
+  /**
+   * Phase 3.4 — caller-facing "connecting you now" message played
+   * BEFORE the ring starts. Distinct from transferWarmMessage which
+   * is played to the STAFF (the whisper) on answer.
+   */
+  transferWaitMessage: string | null;
   callerId: string;
   departments: Array<{ slug: string; name: string }>;
 }
@@ -233,7 +244,7 @@ async function loadBusinessContext(
 ): Promise<BusinessContext | null> {
   const { data, error } = await supabase
     .from("business_configs")
-    .select("business_name, transfer_to_phone, transfer_warm_message, twilio_phone_number, phone_number, departments")
+    .select("business_name, transfer_to_phone, transfer_warm_message, transfer_wait_message, twilio_phone_number, phone_number, departments")
     .eq("business_id", businessId)
     .maybeSingle();
   if (error || !data) return null;
@@ -247,6 +258,7 @@ async function loadBusinessContext(
     business_name: row.business_name || "our team",
     legacyTransferToPhone: row.transfer_to_phone || null,
     transferWarmMessage: row.transfer_warm_message || null,
+    transferWaitMessage: row.transfer_wait_message || null,
     callerId: row.twilio_phone_number || row.phone_number || "",
     departments,
   };
@@ -462,6 +474,16 @@ export async function handleRouteToTopic(
       // <Client> CustomParameter so the softphone UI can render
       // context ("Roadside & breakdown — incoming").
       topicName,
+      // Phase 3.4 — caller-facing wait line + ringback so the customer
+      // hears "Connecting you now…" followed by a US double-ring
+      // during the up-to-30s browser ring window. Without both the
+      // caller sat in dead silence — verified live 2026-07-30.
+      waitMessage:
+        biz.transferWaitMessage?.trim() ||
+        "Connecting you now, one moment please.",
+      // ringTone defaults to "us" inside the builder; explicit here
+      // makes the intent visible at the call site.
+      ringTone: "us",
     };
     twiml = buildDialTwiml(decision, dialOpts);
   }
@@ -853,12 +875,26 @@ router.get(
 router.post(
   "/routing/dial-status",
   async (req: Request, res: Response): Promise<void> => {
-    // Signature verification: Twilio signs POSTs to our callback URLs.
-    // Refuse forged requests but always respond 200 (Twilio retries
-    // aggressively on non-2xx and there's nothing productive it can do
-    // with the retry).
+    // Phase 3.4 — ALWAYS return 200 to Twilio, even on signature
+    // failure. A mid-call <Dial action> callback that returns non-2xx
+    // makes Twilio play "an application error has occurred" AUDIBLY
+    // to the customer (verified live: two calls on 2026-07-30 rang
+    // the browser, our verify failed (URL-drift bug), and both
+    // callers heard the error message). Any auth failure here is our
+    // internal problem; the caller must never learn about it.
+    //
+    // Signature failures still get logged to Sentry with the full
+    // attempt list (twilio-signature.ts:twilio_signature_verify_failed_all_candidates)
+    // so ops can chase config drift without a customer-audible signal.
     if (!verifyTwilioSignature(req)) {
-      res.status(401).type("text/xml").send('<?xml version="1.0" encoding="UTF-8"?><Response/>');
+      Sentry.captureMessage("dial_status_signature_rejected", {
+        level: "error",
+        extra: {
+          path: req.originalUrl,
+          note: "Returning 200 anyway — a non-2xx here plays an error to the caller. See twilio_signature_verify_failed_all_candidates for URL attempt details.",
+        },
+      });
+      res.status(200).type("text/xml").send('<?xml version="1.0" encoding="UTF-8"?><Response/>');
       return;
     }
     const supabase = getSupabase();

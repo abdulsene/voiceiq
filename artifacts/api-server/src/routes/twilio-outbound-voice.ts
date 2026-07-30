@@ -127,7 +127,14 @@ function sendTwiml(res: Response, body: string, status = 200): void {
 
 router.post("/twilio/outbound-voice/twiml", async (req: Request, res: Response) => {
   if (!verifyTwilioSignature(req)) {
-    res.status(403).type("text/xml").send(buildHangupTwiml());
+    // Phase 3.4 — 403 on a mid-call TwiML callback makes Twilio play
+    // "an application error has occurred" to whoever picked up. Return
+    // 200 with an empty <Response/> and Sentry-log the drift.
+    Sentry.captureMessage("outbound_voice_twiml_signature_rejected", {
+      level: "error",
+      extra: { path: req.originalUrl },
+    });
+    res.status(200).type("text/xml").send(buildEmptyResponseTwiml());
     return;
   }
   const leadCallId = typeof req.query.lead_call_id === "string" ? req.query.lead_call_id : null;
@@ -255,7 +262,13 @@ router.post("/twilio/outbound-voice/twiml", async (req: Request, res: Response) 
 
 router.post("/twilio/outbound-voice/amd", async (req: Request, res: Response) => {
   if (!verifyTwilioSignature(req)) {
-    res.status(403).type("text/xml").send(buildEmptyResponseTwiml());
+    // Phase 3.4 — AMD callback is mid-call. Return 200 to prevent an
+    // audible error to the answerer / voicemail.
+    Sentry.captureMessage("outbound_voice_amd_signature_rejected", {
+      level: "error",
+      extra: { path: req.originalUrl },
+    });
+    res.status(200).type("text/xml").send(buildEmptyResponseTwiml());
     return;
   }
   const leadCallId = typeof req.query.lead_call_id === "string" ? req.query.lead_call_id : null;
@@ -377,7 +390,13 @@ async function tryRedirectToVoicemail(
 
 router.post("/twilio/outbound-voice/voicemail", async (req: Request, res: Response) => {
   if (!verifyTwilioSignature(req)) {
-    res.status(403).type("text/xml").send(buildHangupTwiml());
+    // Phase 3.4 — voicemail-leg TwiML is mid-call. Return 200 to
+    // prevent an audible error at the tail of the voicemail beep.
+    Sentry.captureMessage("outbound_voice_voicemail_signature_rejected", {
+      level: "error",
+      extra: { path: req.originalUrl },
+    });
+    res.status(200).type("text/xml").send(buildEmptyResponseTwiml());
     return;
   }
   const leadCallId = typeof req.query.lead_call_id === "string" ? req.query.lead_call_id : null;
@@ -412,7 +431,14 @@ router.post("/twilio/outbound-voice/voicemail", async (req: Request, res: Respon
 
 router.post("/twilio/outbound-voice/status", async (req: Request, res: Response) => {
   if (!verifyTwilioSignature(req)) {
-    res.status(403).type("text/xml").send(buildEmptyResponseTwiml());
+    // Phase 3.4 — status webhook is post-call, but 403 still triggers
+    // Twilio retries and eventual "webhook failure" state. Return 200
+    // and Sentry-log the drift.
+    Sentry.captureMessage("outbound_voice_status_signature_rejected", {
+      level: "error",
+      extra: { path: req.originalUrl },
+    });
+    res.status(200).type("text/xml").send(buildEmptyResponseTwiml());
     return;
   }
   const leadCallId = typeof req.query.lead_call_id === "string" ? req.query.lead_call_id : null;

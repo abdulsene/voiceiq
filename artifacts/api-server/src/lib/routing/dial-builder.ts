@@ -60,6 +60,28 @@ export interface DialBuilderOptions {
    * for <Number> (custom parameters only work with Twilio Client).
    */
   topicName?: string | null;
+  /**
+   * Phase 3.4 — pre-dial <Say> line the caller hears BEFORE the ring
+   * starts. Without it the caller sits in dead silence for the whole
+   * 30s Dial timeout while the browser rings. Null or empty → no
+   * <Say> is emitted (preserves the Phase 3.2 shape for tests that
+   * don't opt in).
+   *
+   * Composed by the handler, typically from business_configs
+   * .transfer_wait_message with a fallback like "Connecting you now,
+   * one moment please."
+   */
+  waitMessage?: string | null;
+  /**
+   * Phase 3.4 — ringTone attribute on <Dial>. Twilio's default for a
+   * <Client>-only dial is SILENCE (no ringback tone) — the caller
+   * hears nothing while the browser is ringing. Setting ringTone
+   * makes Twilio synthesize a locale-appropriate ringback: "us" is
+   * the North-American double-ring. See
+   * https://www.twilio.com/docs/voice/twiml/dial#attributes-ringtone
+   * for the enum. Defaults to "us"; pass null to opt out.
+   */
+  ringTone?: string | null;
 }
 
 const XML_ESCAPES: Record<string, string> = {
@@ -128,6 +150,15 @@ function renderDialAttrs(opts: DialBuilderOptions): string {
     `callerId="${xmlEscape(opts.callerId)}"`,
     `timeout="${opts.timeoutSecs ?? 30}"`,
   ];
+  // Phase 3.4 — default ringback so the caller doesn't sit in silence.
+  // ringTone === null (explicitly) suppresses the attribute; undefined
+  // (default) emits "us". Twilio accepts au / at / be / br / ca / cl /
+  // co / dk / fi / fr / de / gr / hu / il / in / it / jp / mx / nl /
+  // no / nz / pt / es / se / uk / us — see Twilio docs.
+  const ringTone = opts.ringTone === undefined ? "us" : opts.ringTone;
+  if (ringTone) {
+    parts.push(`ringTone="${xmlEscape(ringTone)}"`);
+  }
   if (opts.recordingStatusUrl) {
     parts.push(
       `record="record-from-ringing-dual"`,
@@ -195,7 +226,14 @@ export function buildDialTwiml(
   }
 
   const attrs = renderDialAttrs(opts);
-  return `<?xml version="1.0" encoding="UTF-8"?><Response><Dial ${attrs}>${children.join("")}</Dial></Response>`;
+  // Phase 3.4 — pre-dial <Say>: caller hears "Connecting you now…"
+  // before the ringback starts. Without this + ringTone, the caller
+  // heard 30s of dead air while the browser rang.
+  const saySnippet =
+    opts.waitMessage && opts.waitMessage.trim()
+      ? `<Say>${xmlEscape(opts.waitMessage.trim())}</Say>`
+      : "";
+  return `<?xml version="1.0" encoding="UTF-8"?><Response>${saySnippet}<Dial ${attrs}>${children.join("")}</Dial></Response>`;
 }
 
 /**

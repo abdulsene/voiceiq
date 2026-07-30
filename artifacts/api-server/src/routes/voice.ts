@@ -354,7 +354,15 @@ router.post(
   "/voice/outbound",
   async (req: Request, res: Response): Promise<void> => {
     if (!verifyTwilioSignature(req)) {
-      res.status(401).type("text/xml").send(twimlHangup("Unauthorized."));
+      // Phase 3.4 — mid-call TwiML. Non-2xx here makes Twilio play an
+      // error to the answerer. Return 200 with a benign hangup so the
+      // caller hears silence, not an error message; Sentry catches
+      // the drift.
+      Sentry.captureMessage("voice_outbound_signature_rejected", {
+        level: "error",
+        extra: { path: req.originalUrl },
+      });
+      res.status(200).type("text/xml").send(twimlHangup("Sorry, we couldn't connect that call."));
       return;
     }
     const supabase = getSupabase();

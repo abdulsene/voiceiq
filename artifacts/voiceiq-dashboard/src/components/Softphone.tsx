@@ -71,6 +71,8 @@ export interface SoftphoneContextValue {
   ringtoneMuted: boolean;
   preferenceError: string | null;
   reachability: Reachability | null;
+  /** Phase 3.4 — Chromium supports it, Firefox doesn't. */
+  outputDeviceSelectionSupported: boolean;
   refreshReachability: () => Promise<void>;
   setEnabled: (v: boolean) => Promise<void> | void;
   setRingtoneMuted: (v: boolean) => void;
@@ -104,6 +106,7 @@ export function useSoftphone(): SoftphoneContextValue {
       ringtoneMuted: false,
       preferenceError: null,
       reachability: null,
+      outputDeviceSelectionSupported: false,
       refreshReachability: async () => {},
       setEnabled: () => {},
       setRingtoneMuted: () => {},
@@ -408,6 +411,7 @@ export function SoftphoneProvider({ children }: { children: ReactNode }) {
       ringtoneMuted,
       preferenceError,
       reachability,
+      outputDeviceSelectionSupported: device.outputDeviceSelectionSupported,
       refreshReachability,
       setEnabled,
       setRingtoneMuted,
@@ -424,6 +428,7 @@ export function SoftphoneProvider({ children }: { children: ReactNode }) {
       device.active,
       device.hangup,
       device.toggleMute,
+      device.outputDeviceSelectionSupported,
       callerId,
       hasActiveCall,
       hasIncomingCall,

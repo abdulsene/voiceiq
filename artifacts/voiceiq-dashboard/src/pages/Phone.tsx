@@ -157,6 +157,26 @@ export default function PhonePage() {
         )}
       </section>
 
+      {/* Phase 3.4 — surface the Firefox-vs-Chromium output-device
+          gap so a user staring at a missing speaker picker on Firefox
+          understands why. */}
+      {!sp.outputDeviceSelectionSupported ? (
+        <section className="rounded-xl border border-amber-200 bg-amber-50 p-4">
+          <div className="flex items-start gap-2 text-xs text-amber-900">
+            <AlertTriangle className="h-4 w-4 mt-0.5 shrink-0" />
+            <div>
+              <div className="font-semibold text-sm">Speaker selection unavailable</div>
+              <p className="mt-1">
+                Your browser doesn't expose <code className="font-mono">HTMLAudioElement.setSinkId</code>
+                {" "}(this is a known Firefox limitation). Call audio still plays through your
+                default audio output, but you cannot pick a specific speaker from within Neverr.
+                If two-way audio fails on this browser, check the system-level output device.
+              </p>
+            </div>
+          </div>
+        </section>
+      ) : null}
+
       {/* Device diagnostics. */}
       <section className="rounded-xl border border-neutral-200 bg-white p-5">
         <h2 className="text-sm font-semibold text-neutral-900 mb-3">Device</h2>

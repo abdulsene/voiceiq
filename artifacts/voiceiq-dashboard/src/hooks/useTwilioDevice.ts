@@ -100,11 +100,82 @@ export interface UseTwilioDeviceResult {
   active: Call | null;
   isMuted: boolean;
   error: string | null;
+  /**
+   * Phase 3.4 — true iff the browser implements HTMLAudioElement
+   * .setSinkId (Chromium yes, Firefox no as of FF 141). Feature
+   * detection surfaced to the UI so the Phone page can render a
+   * warning explaining why the speaker picker isn't available.
+   */
+  outputDeviceSelectionSupported: boolean;
   accept: () => void;
   reject: () => void;
   hangup: () => void;
   toggleMute: () => void;
   dial: (to: string, callerId: string) => Promise<Call | null>;
+}
+
+/**
+ * Phase 3.4 — persistent hidden <audio> element for remote audio.
+ * We manage this ourselves (rather than relying on the SDK's default
+ * routing) because Firefox one-way audio was traced to the SDK's
+ * built-in attach path not always kicking in when setSinkId is
+ * unavailable. Explicit srcObject + .play() inside a user-gesture
+ * handler (accept / dial) works cross-browser.
+ */
+let remoteAudioEl: HTMLAudioElement | null = null;
+function getRemoteAudioEl(): HTMLAudioElement {
+  if (typeof document === "undefined") {
+    throw new Error("remote audio requires DOM");
+  }
+  if (remoteAudioEl) return remoteAudioEl;
+  const el = document.createElement("audio");
+  el.autoplay = true;
+  el.setAttribute("playsinline", "");
+  el.style.display = "none";
+  el.setAttribute("data-neverr-softphone-remote", "1");
+  document.body.appendChild(el);
+  remoteAudioEl = el;
+  return el;
+}
+
+/**
+ * Attach the call's remote MediaStream to the persistent <audio>
+ * element and .play() it. MUST be invoked from a user-gesture handler
+ * (accept click or dial click) so Firefox / Safari autoplay policies
+ * don't block. Safe to call more than once — sets srcObject each time.
+ */
+function attachRemoteAudio(call: Call): void {
+  try {
+    const el = getRemoteAudioEl();
+    const stream = (call as any).getRemoteStream?.() as MediaStream | undefined;
+    if (stream) el.srcObject = stream;
+    const p = el.play();
+    // Some browsers return a promise; swallow rejections rather than
+    // logging (the SDK also retries internally).
+    if (p && typeof (p as Promise<void>).catch === "function") {
+      (p as Promise<void>).catch(() => {});
+    }
+  } catch {
+    // getRemoteStream is available on Voice SDK v2 Call. If a future
+    // SDK removes it we still don't want to crash — the SDK's
+    // default routing will attempt to play in that case.
+  }
+}
+
+/**
+ * Feature-detect HTMLAudioElement.setSinkId. Firefox does not
+ * implement this API, so calling Device.audio.speakerDevices.set()
+ * would throw / no-op. We use this to (a) skip that call, (b) warn
+ * on the Phone page.
+ */
+function detectOutputDeviceSelectionSupport(): boolean {
+  if (typeof document === "undefined") return false;
+  try {
+    const el = document.createElement("audio");
+    return typeof (el as any).setSinkId === "function";
+  } catch {
+    return false;
+  }
 }
 
 export function useTwilioDevice(opts: UseTwilioDeviceOptions): UseTwilioDeviceResult {
@@ -115,6 +186,9 @@ export function useTwilioDevice(opts: UseTwilioDeviceOptions): UseTwilioDeviceRe
   const [active, setActive] = useState<Call | null>(null);
   const [isMuted, setIsMuted] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Phase 3.4 — snapshot at mount; the value can't change over the
+  // lifetime of a page.
+  const outputDeviceSelectionSupported = detectOutputDeviceSelectionSupport();
 
   const deviceRef = useRef<Device | null>(null);
   const refreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -223,6 +297,12 @@ export function useTwilioDevice(opts: UseTwilioDeviceOptions): UseTwilioDeviceRe
         const params = call.customParameters;
         const topic = params.get("topic_name") || undefined;
         onIncoming?.({ from: call.parameters.From || "unknown", topicName: topic });
+        // Phase 3.4 — attach remote MediaStream to our persistent
+        // <audio> element as soon as the SDK emits 'accept'. This is
+        // what fixes Firefox one-way audio: setSinkId is Chromium-only,
+        // so the SDK's default output routing may not activate. Doing
+        // srcObject + play() ourselves is cross-browser.
+        call.on("accept", () => attachRemoteAudio(call));
         call.on("cancel", () => setIncoming(null));
         call.on("disconnect", () => {
           setIncoming(null);
@@ -259,6 +339,18 @@ export function useTwilioDevice(opts: UseTwilioDeviceOptions): UseTwilioDeviceRe
 
   const accept = useCallback(() => {
     if (!incoming) return;
+    // Phase 3.4 — pre-touch the persistent <audio> element FROM this
+    // click handler so the user-gesture chain includes .play(). Some
+    // browsers otherwise refuse to start audio playback later when
+    // the SDK attaches the stream. attachRemoteAudio also runs from
+    // the SDK's 'accept' event as a belt-and-braces second attempt.
+    try {
+      const el = getRemoteAudioEl();
+      const p = el.play();
+      if (p && typeof (p as Promise<void>).catch === "function") {
+        (p as Promise<void>).catch(() => {});
+      }
+    } catch {}
     incoming.accept();
     setActive(incoming);
     setIncoming(null);
@@ -290,11 +382,24 @@ export function useTwilioDevice(opts: UseTwilioDeviceOptions): UseTwilioDeviceRe
     async (to: string, callerId: string): Promise<Call | null> => {
       const dev = deviceRef.current;
       if (!dev || status !== "registered") return null;
+      // Phase 3.4 — same user-gesture pre-touch as accept(). The dial
+      // click is a legitimate user gesture; call .play() on the
+      // persistent <audio> from THIS callback so the browser's
+      // autoplay policy authorises subsequent audio playback when the
+      // remote stream arrives.
+      try {
+        const el = getRemoteAudioEl();
+        const p = el.play();
+        if (p && typeof (p as Promise<void>).catch === "function") {
+          (p as Promise<void>).catch(() => {});
+        }
+      } catch {}
       const call = await dev.connect({
         params: { To: to, callerId },
       });
       setActive(call);
       setIsMuted(false);
+      call.on("accept", () => attachRemoteAudio(call));
       call.on("disconnect", () => {
         setActive(null);
         setIsMuted(false);
@@ -312,6 +417,7 @@ export function useTwilioDevice(opts: UseTwilioDeviceOptions): UseTwilioDeviceRe
     active,
     isMuted,
     error,
+    outputDeviceSelectionSupported,
     accept,
     reject,
     hangup,

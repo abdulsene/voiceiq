@@ -86,6 +86,22 @@
  *   T59 preference PATCH→GET round-trip: dock + sidebar toggles agree
  *       on the shared column.
  *
+ *   3.4 additions (dial-status hardening + ringback + signed-request):
+ *   T60 public-url helper: SINGLE source of truth. PUBLIC_API_URL
+ *       wins; PUBLIC_URL fallback; divergence prefers API + warns;
+ *       missing → hardcoded fallback + warns. Closes the sev-1 where
+ *       two different envs made HMAC verify silently fail.
+ *   T61 verifyTwilioSignature ON: accepts correctly-signed request,
+ *       rejects tampered body, rejects missing header. First smoke
+ *       coverage of the actual code path (prior suites all ran with
+ *       TWILIO_WEBHOOK_VERIFY=0 — that's how the URL-mismatch bug
+ *       shipped).
+ *   T62 sig verify falls back to x-forwarded-host URL when
+ *       PUBLIC_API_URL disagrees — in-flight callbacks survive an env
+ *       change mid-deploy.
+ *   T63 dial-builder emits ringTone="us" + wait-message <Say> so the
+ *       caller doesn't sit in silence during the browser ring.
+ *
  * Run: pnpm --filter @workspace/api-server exec tsx \
  *        src/tests/040-routing-smoke.ts
  */
@@ -125,6 +141,10 @@ import {
 } from "../routes/voice";
 // Phase 3.3c — agent resync + tool inspector.
 import { fetchRegisteredToolNames } from "../routes/agent-sync";
+// Phase 3.4 — public-url unification + signature verification.
+import { getPublicApiBase, _resetPublicUrlWarningsForTests } from "../lib/public-url";
+import { verifyTwilioSignature } from "../lib/twilio-signature";
+import twilio from "twilio";
 // Phase 3.3a — single source of truth for the identity formula. Tests
 // compute expected identities via the helper so a formula change in
 // buildClientIdentity is caught by the fixtures automatically.
@@ -2036,6 +2056,271 @@ async function T55_get_preference_shape() {
   record("T55 getPreferenceForCaller: happy path + 404 branch", failures.length === 0, failures.join("; ") || "route + tests share one implementation");
 }
 
+// ── Phase 3.4: dial-status hardening + ringback + signed-request smoke ─
+
+/**
+ * Phase 3.4 T60 — the sev-1 defect that motivated this slice.
+ * getPublicApiBase() must be a SINGLE source of truth: the URL used
+ * to BUILD callback URLs must equal the URL used to VERIFY signatures.
+ *
+ * Under 3.2c/3.3c we had TWO helpers:
+ *   routing.ts:getPublicUrl → PUBLIC_URL || APP_URL || "https://neverr.ai"
+ *   twilio-signature.ts:resolvePublicBase → PUBLIC_API_URL || fallback
+ * When those two envs disagreed in Replit Secrets, HMAC mismatched
+ * and dial-status returned 401 → Twilio played "an application error
+ * has occurred" to the caller. This asserts that BOTH sides now
+ * consult the same helper, and the helper explicitly prefers
+ * PUBLIC_API_URL over the legacy envs.
+ */
+async function T60_public_url_single_source_of_truth() {
+  const savedApi = process.env.PUBLIC_API_URL;
+  const savedPublic = process.env.PUBLIC_URL;
+  const savedApp = process.env.APP_URL;
+  const failures: string[] = [];
+  try {
+    // Case 1: only PUBLIC_API_URL set → that wins.
+    _resetPublicUrlWarningsForTests();
+    process.env.PUBLIC_API_URL = "https://api.example.com/";
+    delete process.env.PUBLIC_URL;
+    delete process.env.APP_URL;
+    if (getPublicApiBase() !== "https://api.example.com") {
+      failures.push(`[api-only] got=${getPublicApiBase()}`);
+    }
+
+    // Case 2: PUBLIC_API_URL absent, PUBLIC_URL set → fall back to
+    // PUBLIC_URL (compat with legacy Replit deploys).
+    _resetPublicUrlWarningsForTests();
+    delete process.env.PUBLIC_API_URL;
+    process.env.PUBLIC_URL = "https://neverr.ai";
+    if (getPublicApiBase() !== "https://neverr.ai") {
+      failures.push(`[public-fallback] got=${getPublicApiBase()}`);
+    }
+
+    // Case 3: both set and DISAGREE → PUBLIC_API_URL wins, warning
+    // fires (we can't inspect Sentry from here, but the fact we don't
+    // silently pick the wrong one is what matters).
+    _resetPublicUrlWarningsForTests();
+    process.env.PUBLIC_API_URL = "https://api.example.com";
+    process.env.PUBLIC_URL = "https://neverr.ai";
+    if (getPublicApiBase() !== "https://api.example.com") {
+      failures.push(`[divergent] got=${getPublicApiBase()} (must prefer PUBLIC_API_URL)`);
+    }
+
+    // Case 4: nothing set → hardcoded fallback (with a warning).
+    _resetPublicUrlWarningsForTests();
+    delete process.env.PUBLIC_API_URL;
+    delete process.env.PUBLIC_URL;
+    delete process.env.APP_URL;
+    if (!/replit\.app$/.test(getPublicApiBase())) {
+      failures.push(`[all-missing] got=${getPublicApiBase()}`);
+    }
+  } finally {
+    if (savedApi !== undefined) process.env.PUBLIC_API_URL = savedApi;
+    else delete process.env.PUBLIC_API_URL;
+    if (savedPublic !== undefined) process.env.PUBLIC_URL = savedPublic;
+    else delete process.env.PUBLIC_URL;
+    if (savedApp !== undefined) process.env.APP_URL = savedApp;
+    else delete process.env.APP_URL;
+    _resetPublicUrlWarningsForTests();
+  }
+  record("T60 public-url helper: single source of truth + preference order", failures.length === 0, failures.join("; ") || "PUBLIC_API_URL wins, PUBLIC_URL fallback, divergence prefers API, missing = fallback");
+}
+
+/**
+ * Phase 3.4 T61 — verifyTwilioSignature accepts a correctly-signed
+ * request when TWILIO_WEBHOOK_VERIFY is NOT set. All prior 040 runs
+ * used TWILIO_WEBHOOK_VERIFY=0 (the bypass) so this whole codepath
+ * had never actually been exercised — which is exactly how the URL-
+ * mismatch bug shipped.
+ */
+async function T61_signature_verify_accepts_valid_request() {
+  const failures: string[] = [];
+  const savedVerify = process.env.TWILIO_WEBHOOK_VERIFY;
+  const savedToken = process.env.TWILIO_AUTH_TOKEN;
+  const savedApi = process.env.PUBLIC_API_URL;
+  const authToken = "test_auth_token_" + "x".repeat(24);
+
+  try {
+    delete process.env.TWILIO_WEBHOOK_VERIFY;
+    process.env.TWILIO_AUTH_TOKEN = authToken;
+    process.env.PUBLIC_API_URL = "https://api.example.com";
+    _resetPublicUrlWarningsForTests();
+
+    const originalUrl = "/api/routing/dial-status?business_id=B&conversation_id=C";
+    const fullUrl = "https://api.example.com" + originalUrl;
+    const params = { DialCallStatus: "completed", To: "+14155551234" };
+    // Compute the same HMAC Twilio would produce for this URL+params.
+    const validSignature = twilio.getExpectedTwilioSignature(authToken, fullUrl, params as any);
+
+    const req: any = {
+      originalUrl,
+      body: params,
+      protocol: "https",
+      header(name: string) {
+        return this.headers?.[name.toLowerCase()];
+      },
+      headers: {
+        "x-twilio-signature": validSignature,
+        "x-forwarded-proto": "https",
+        "x-forwarded-host": "api.example.com",
+        host: "api.example.com",
+      },
+    };
+    if (!verifyTwilioSignature(req)) failures.push("valid signature rejected");
+
+    // Tampered params → must fail.
+    const req2: any = { ...req, body: { ...params, DialCallStatus: "no-answer" } };
+    if (verifyTwilioSignature(req2)) failures.push("tampered body accepted");
+
+    // Missing signature header → must fail.
+    const req3: any = {
+      ...req,
+      headers: { ...req.headers, "x-twilio-signature": undefined },
+    };
+    if (verifyTwilioSignature(req3)) failures.push("missing signature accepted");
+  } finally {
+    if (savedVerify !== undefined) process.env.TWILIO_WEBHOOK_VERIFY = savedVerify;
+    else delete process.env.TWILIO_WEBHOOK_VERIFY;
+    if (savedToken !== undefined) process.env.TWILIO_AUTH_TOKEN = savedToken;
+    else delete process.env.TWILIO_AUTH_TOKEN;
+    if (savedApi !== undefined) process.env.PUBLIC_API_URL = savedApi;
+    else delete process.env.PUBLIC_API_URL;
+    _resetPublicUrlWarningsForTests();
+  }
+  record("T61 verifyTwilioSignature ON: accepts valid, rejects tampered / missing", failures.length === 0, failures.join("; ") || "real HMAC round-trip works, tamper detection intact");
+}
+
+/**
+ * Phase 3.4 T62 — the fallback path. When PUBLIC_API_URL differs from
+ * the URL Twilio actually signed, verification should STILL succeed
+ * against the header-reconstructed URL (belt-and-braces) so an
+ * in-flight callback survives an env change mid-deploy.
+ */
+async function T62_signature_verify_fallback_urls() {
+  const failures: string[] = [];
+  const savedVerify = process.env.TWILIO_WEBHOOK_VERIFY;
+  const savedToken = process.env.TWILIO_AUTH_TOKEN;
+  const savedApi = process.env.PUBLIC_API_URL;
+  const authToken = "fallback_token_" + "y".repeat(24);
+  try {
+    delete process.env.TWILIO_WEBHOOK_VERIFY;
+    process.env.TWILIO_AUTH_TOKEN = authToken;
+    // Server thinks the public base is X, but Twilio actually signed
+    // for Y (host in x-forwarded-host). Verification must try the
+    // header-reconstructed URL too and accept.
+    process.env.PUBLIC_API_URL = "https://voice-i-q.replit.app";
+    _resetPublicUrlWarningsForTests();
+
+    const originalUrl = "/api/routing/dial-status?business_id=B";
+    const signedAgainst = "https://neverr.ai" + originalUrl;
+    const params = { DialCallStatus: "completed" };
+    const signature = twilio.getExpectedTwilioSignature(authToken, signedAgainst, params as any);
+
+    const req: any = {
+      originalUrl,
+      body: params,
+      protocol: "https",
+      header(name: string) {
+        return this.headers?.[name.toLowerCase()];
+      },
+      headers: {
+        "x-twilio-signature": signature,
+        "x-forwarded-proto": "https",
+        "x-forwarded-host": "neverr.ai",
+        host: "neverr.ai",
+      },
+    };
+    if (!verifyTwilioSignature(req)) {
+      failures.push("did not accept the header-reconstructed URL fallback");
+    }
+  } finally {
+    if (savedVerify !== undefined) process.env.TWILIO_WEBHOOK_VERIFY = savedVerify;
+    else delete process.env.TWILIO_WEBHOOK_VERIFY;
+    if (savedToken !== undefined) process.env.TWILIO_AUTH_TOKEN = savedToken;
+    else delete process.env.TWILIO_AUTH_TOKEN;
+    if (savedApi !== undefined) process.env.PUBLIC_API_URL = savedApi;
+    else delete process.env.PUBLIC_API_URL;
+    _resetPublicUrlWarningsForTests();
+  }
+  record("T62 sig verify falls back to x-forwarded-host URL when PUBLIC_API_URL disagrees", failures.length === 0, failures.join("; ") || "belt-and-braces: in-flight callbacks survive env drift");
+}
+
+/**
+ * Phase 3.4 T63 — dial-builder emits ringTone + wait-message <Say> so
+ * the caller doesn't sit in silence for the 30s ring window. Verified
+ * live 2026-07-30: without ringback the caller experience was dead
+ * air for the entire browser-ring duration.
+ */
+async function T63_ringback_and_wait_message_in_twiml() {
+  const d = decideRouting({
+    onDutyForTopic: [{ userId: USER_A, callbackRingNumber: PHONE_A }],
+    onDutyAny: [],
+    businessOpen: true,
+    legacyTransferToPhone: null,
+    topicConfigured: true,
+  });
+  const failures: string[] = [];
+
+  // Default: ringTone="us" AND wait-message <Say> prepended.
+  const t1 = buildDialTwiml(d, {
+    callerId: "+18005551234",
+    whisperUrl: null,
+    recordingStatusUrl: null,
+    dialStatusUrl: null,
+    waitMessage: "Connecting you now, one moment please.",
+  });
+  if (!/ringTone="us"/.test(t1)) failures.push("default: missing ringTone");
+  if (!/<Say>Connecting you now, one moment please\.<\/Say>\s*<Dial /.test(t1)) {
+    failures.push("default: <Say> not prepended before <Dial>");
+  }
+
+  // Override wait-message from business_configs.transfer_wait_message.
+  const t2 = buildDialTwiml(d, {
+    callerId: "+18005551234",
+    whisperUrl: null,
+    recordingStatusUrl: null,
+    dialStatusUrl: null,
+    waitMessage: "Please hold — reaching a specialist now.",
+  });
+  if (!/<Say>Please hold — reaching a specialist now\.<\/Say>/.test(t2)) {
+    failures.push("override wait-message not respected");
+  }
+
+  // Suppress ringback + wait message explicitly.
+  const t3 = buildDialTwiml(d, {
+    callerId: "+18005551234",
+    whisperUrl: null,
+    recordingStatusUrl: null,
+    dialStatusUrl: null,
+    ringTone: null,
+    waitMessage: null,
+  });
+  if (/ringTone=/.test(t3)) failures.push("ringTone should be absent when null");
+  if (/<Say>/.test(t3)) failures.push("<Say> should be absent when waitMessage null");
+
+  // Non-default ringTone value (e.g. UK ringback).
+  const t4 = buildDialTwiml(d, {
+    callerId: "+18005551234",
+    whisperUrl: null,
+    recordingStatusUrl: null,
+    dialStatusUrl: null,
+    ringTone: "uk",
+  });
+  if (!/ringTone="uk"/.test(t4)) failures.push("uk ringTone override not applied");
+
+  // XML escape check on wait message.
+  const t5 = buildDialTwiml(d, {
+    callerId: "+18005551234",
+    whisperUrl: null,
+    recordingStatusUrl: null,
+    dialStatusUrl: null,
+    waitMessage: "Hi & <you>",
+  });
+  if (!/<Say>Hi &amp; &lt;you&gt;<\/Say>/.test(t5)) failures.push("wait-message XML escape broken");
+
+  record("T63 caller ringback + wait-message: ringTone default 'us' + <Say> prepended + override + escape", failures.length === 0, failures.join("; ") || "no more dead-air-during-ring for the caller");
+}
+
 // ── Phase 3.3c: reachability guard + indicator states + agent tools ─
 
 /**
@@ -2317,6 +2602,11 @@ async function main() {
   await T57_indicator_state_matrix();
   await T58_agent_tools_no_agent_yet();
   await T59_preference_round_trip();
+  // Phase 3.4 — dial-status hardening + ringback + signed-request smoke
+  await T60_public_url_single_source_of_truth();
+  await T61_signature_verify_accepts_valid_request();
+  await T62_signature_verify_fallback_urls();
+  await T63_ringback_and_wait_message_in_twiml();
   await whisper_composition();
 
   const fails = results.filter((r) => !r.pass);
