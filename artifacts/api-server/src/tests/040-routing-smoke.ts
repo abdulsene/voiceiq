@@ -102,6 +102,26 @@
  *   T63 dial-builder emits ringTone="us" + wait-message <Say> so the
  *       caller doesn't sit in silence during the browser ring.
  *
+ *   3.5 additions (per-leg attribution via whisper + handler hardening):
+ *   T40 (rewritten): dial-status PRESERVES whisper-written attribution;
+ *       the callback `To` is the ORIGINAL inbound number (never the
+ *       child leg's target) so it cannot be trusted.
+ *   T40b REST fallback: whisper skipped → fetch child leg via Twilio
+ *       REST using DialCallSid → resolve attribution.
+ *   T41 (revalidated): false-match regression MOVED from callback path
+ *       to REST-fallback path (`To` from Twilio REST could be a
+ *       client:<uuid>). Client-branch short-circuit still holds.
+ *   T64 whisper URL is PER-CANDIDATE — <Client>/<Number> each carry
+ *       user_id + leg. Same shared URL across candidates would leave
+ *       the whisper handler unable to attribute.
+ *   T65 parseWhisperQuery + writeWhisperAttribution: whisper is
+ *       authoritative for handled_by / answered_via. UPDATE scoped
+ *       to (business_id, call_sid).
+ *   T66 whisper handler: degenerate inputs never throw. TwiML always
+ *       well-formed — no customer-audible "application error" path.
+ *   T67 writeWhisperAttribution swallows DB errors — a broken
+ *       attribution write must NEVER crash the whisper leg.
+ *
  * Run: pnpm --filter @workspace/api-server exec tsx \
  *        src/tests/040-routing-smoke.ts
  */
@@ -126,6 +146,9 @@ import {
   promoteHandoffReasonOnAnswer,
   parseClientTo,
   type TwilioCallControl,
+  // Phase 3.5 — whisper handler + parser exposed for testing.
+  parseWhisperQuery,
+  writeWhisperAttribution,
 } from "../routes/routing";
 // Phase 3.3
 import {
@@ -926,11 +949,16 @@ async function T21_topic_cleared_race() {
 
 class MockTwilioClient implements TwilioCallControl {
   updates: Array<{ callSid: string; twiml: string }> = [];
+  // Phase 3.5 — .fetch() added to TwilioCallControl for dial-status's
+  // child-leg REST fallback. This mock never fires it (redirect
+  // tests only exercise .update); return a null-shaped stub so the
+  // interface implements cleanly.
   calls(sid: string) {
     return {
       update: async (opts: { twiml: string }) => {
         this.updates.push({ callSid: sid, twiml: opts.twiml });
       },
+      fetch: async () => ({ to: null }),
     };
   }
 }
@@ -1072,16 +1100,35 @@ async function T26_map_dial_status() {
 
 async function T27_dial_status_answered() {
   const fake = new FakeSupabaseClient();
-  // Column-specific stubs — handleDialStatus does TWO selects on
-  // `calls`: (1) rung_user_ids for handled_by resolution, (2)
-  // handoff_reason for _ringing → _answered promotion.
+  // Phase 3.5 — handleDialStatus now reads the current row up-front
+  // (handoff_reason + handled_by_user_id + answered_via + rung_user_ids)
+  // in a SINGLE select so it can (a) promote handoff_reason, (b)
+  // avoid overwriting attribution the whisper already wrote, (c)
+  // still fall back to a phone lookup when nothing was pre-written.
+  fake.on(
+    (c) =>
+      c.op === "select" &&
+      c.table === "calls" &&
+      c.selectColumns.includes("handoff_reason") &&
+      c.selectColumns.includes("handled_by_user_id"),
+    {
+      // Whisper did NOT write attribution — simulates the case where
+      // the whisper URL had no user_id (legacy_transfer) or the
+      // whisper handler failed. dial-status falls back to phone
+      // matching against rung_user_ids.
+      data: {
+        handoff_reason: "topic_match_ringing",
+        handled_by_user_id: null,
+        answered_via: null,
+        rung_user_ids: [USER_A, USER_B],
+      },
+    },
+  );
+  // Legacy stubs kept in case resolveHandledByUserId still runs its
+  // own selects on paths I haven't touched.
   fake.on(
     (c) => c.op === "select" && c.table === "calls" && c.selectColumns === "rung_user_ids",
     { data: { rung_user_ids: [USER_A, USER_B] } },
-  );
-  fake.on(
-    (c) => c.op === "select" && c.table === "calls" && c.selectColumns === "handoff_reason",
-    { data: { handoff_reason: "topic_match_ringing" } },
   );
   fake.on(
     (c) => c.op === "select" && c.table === "user_businesses",
@@ -1501,52 +1548,158 @@ async function T39_mixed_client_number_simulring() {
 }
 
 /**
- * Phase 3.3 T40 — client:<identity> handled_by resolution. Answered
- * `To=client:user_xxx` must resolve to the auth.users.id via
- * user_businesses.client_identity, and calls.answered_via='browser'.
+ * Phase 3.5 T40 (rewritten) — REALISTIC Twilio <Dial action> payload.
+ *
+ * The prior 3.3/3.3b fixture injected `To: "client:${CLIENT_A}"`, a
+ * shape Twilio DOES NOT SEND on the action callback. The callback
+ * carries the ORIGINAL inbound call's params — `To` is the business's
+ * own inbound Twilio number, never the child leg's target. Verified
+ * live 2026-07-30 22:58: a browser-answered call landed with
+ * answered_via='pstn', handled_by_user_id=NULL because the client:
+ * branch never fired.
+ *
+ * The correct attribution source is the WHISPER, which fires on the
+ * winning leg by construction. This test now asserts that if the
+ * whisper already wrote handled_by_user_id + answered_via, dial-
+ * status PRESERVES those values (does not overwrite from the
+ * misleading callback `To`).
  */
-async function T40_client_identity_handled_by() {
+async function T40_dial_status_preserves_whisper_attribution() {
   const fake = new FakeSupabaseClient();
-  // Lookup by client_identity (Phase 3.3 code path). No rung_user_ids
-  // read, no callback_ring_number lookup — pure identity match.
+  // Simulate: whisper already wrote attribution (USER_A, browser).
+  // dial-status then arrives with the inbound-number `To` — must not
+  // clobber those fields.
   fake.on(
     (c) =>
       c.op === "select" &&
-      c.table === "user_businesses" &&
-      c.eqFilters.some((f) => f.column === "client_identity"),
-    { data: { user_id: USER_A } },
+      c.table === "calls" &&
+      c.selectColumns.includes("handoff_reason") &&
+      c.selectColumns.includes("handled_by_user_id"),
+    {
+      data: {
+        handoff_reason: "topic_match_ringing",
+        handled_by_user_id: USER_A,
+        answered_via: "browser",
+        rung_user_ids: [USER_A, USER_B],
+      },
+    },
   );
   fake.on((c) => c.op === "update" && c.table === "calls", { data: { id: CALL_ID } });
-  // Handoff-reason select for _ringing → _answered promotion.
-  fake.on(
-    (c) => c.op === "select" && c.table === "calls" && c.selectColumns === "handoff_reason",
-    { data: { handoff_reason: "topic_match_ringing" } },
-  );
 
   const result = await handleDialStatus(asClient(fake), {
     business_id: BIZ,
     conversation_id: CONV,
     DialCallStatus: "completed",
-    To: `client:${CLIENT_A}`,
+    // Realistic: Twilio sends the inbound business number here, NOT
+    // client:<identity>. Same value on both browser-answered and
+    // cell-answered calls.
+    To: "+14433314649",
+    DialCallSid: "CA_child_leg_test_40",
   });
   const failures: string[] = [];
   if (!result.ok) failures.push(`not ok: ${(result as any).error}`);
   else if (result.handledByUserId !== USER_A) failures.push(`handled_by=${result.handledByUserId}`);
   const update = fake.calls.find((c) => c.op === "update" && c.table === "calls");
-  if (update?.payload?.handled_by_user_id !== USER_A) failures.push(`update handled_by=${update?.payload?.handled_by_user_id}`);
-  if (update?.payload?.answered_via !== "browser") failures.push(`update answered_via=${update?.payload?.answered_via} (expected browser)`);
-  // Ensure NO phone-based rung_user_ids lookup happened — client: path
-  // must skip that entirely.
-  const rungLookup = fake.calls.find((c) => c.op === "select" && c.table === "calls" && c.selectColumns === "rung_user_ids");
-  if (rungLookup) failures.push("rung_user_ids lookup fired on client: path (should be short-circuited)");
-  record("T40 client:<identity> resolves via client_identity + answered_via=browser + skips phone lookup", failures.length === 0, failures.join("; ") || "browser leg resolves without phone-normalization");
+  // Status must be promoted, but attribution must NOT be re-written
+  // (whisper already owns it). Payload should NOT contain
+  // handled_by_user_id / answered_via keys — omitted, not re-set.
+  if (update?.payload?.transfer_status !== "answered") failures.push(`transfer_status=${update?.payload?.transfer_status}`);
+  if (update?.payload?.handoff_reason !== "topic_match_answered") failures.push(`handoff_reason=${update?.payload?.handoff_reason}`);
+  if ("handled_by_user_id" in (update?.payload || {})) {
+    failures.push(`payload should NOT re-write handled_by_user_id (whisper owns it); got ${update?.payload?.handled_by_user_id}`);
+  }
+  if ("answered_via" in (update?.payload || {})) {
+    failures.push(`payload should NOT re-write answered_via (whisper owns it); got ${update?.payload?.answered_via}`);
+  }
+  record("T40 dial-status preserves whisper-written attribution (does not clobber from inbound-number To)", failures.length === 0, failures.join("; ") || "whisper is authoritative for handled_by / answered_via");
 }
 
 /**
- * Phase 3.3 T41 — false-match regression. A client:<uuid> To must NOT
- * resolve via last-10-digits phone comparison. Pre-3.3 code stripped
- * non-digits from `client:user_abc123def456...` and could match a
- * staff cell ending in "123456". Verify that pathway is now dead.
+ * Phase 3.5 T40b — REST fallback: when whisper did NOT write
+ * attribution (legacy_transfer path OR whisper handler failed) and
+ * `To` on the callback is the useless inbound number, dial-status
+ * MUST fetch the child leg via Twilio REST using DialCallSid to
+ * learn what actually answered.
+ */
+async function T40b_dial_status_rest_fallback_attribution() {
+  const fake = new FakeSupabaseClient();
+  // Whisper did NOT write — attribution fields NULL, rung_user_ids
+  // populated so PSTN phone match can succeed.
+  fake.on(
+    (c) =>
+      c.op === "select" &&
+      c.table === "calls" &&
+      c.selectColumns.includes("handoff_reason") &&
+      c.selectColumns.includes("handled_by_user_id"),
+    {
+      data: {
+        handoff_reason: "no_staff_during_hours_ringing",
+        handled_by_user_id: null,
+        answered_via: null,
+        rung_user_ids: [USER_A, USER_B],
+      },
+    },
+  );
+  // resolveHandledByUserId's PSTN branch also reads rung_user_ids
+  // via a narrower select — stub that too.
+  fake.on(
+    (c) => c.op === "select" && c.table === "calls" && c.selectColumns === "rung_user_ids",
+    { data: { rung_user_ids: [USER_A, USER_B] } },
+  );
+  fake.on(
+    (c) => c.op === "select" && c.table === "user_businesses" && c.inFilters.some((f) => f.column === "user_id"),
+    { data: [{ user_id: USER_B, callback_ring_number: PHONE_B }] },
+  );
+  fake.on((c) => c.op === "update" && c.table === "calls", { data: { id: CALL_ID } });
+
+  // Mock Twilio REST — the child leg was Bob's cell.
+  const restCalls: string[] = [];
+  const twilioClient: TwilioCallControl = {
+    calls: (sid: string) => {
+      restCalls.push(sid);
+      return {
+        update: async () => ({}),
+        fetch: async () => ({ to: PHONE_B }),
+      };
+    },
+  };
+
+  const result = await handleDialStatus(
+    asClient(fake),
+    {
+      business_id: BIZ,
+      conversation_id: CONV,
+      DialCallStatus: "completed",
+      To: "+14433314649", // inbound number — useless for attribution
+      DialCallSid: "CA_child_leg_realistic",
+    },
+    new Date(),
+    { twilioClient },
+  );
+
+  const failures: string[] = [];
+  if (!result.ok) failures.push(`not ok: ${(result as any).error}`);
+  if (restCalls[0] !== "CA_child_leg_realistic") failures.push(`REST fetch sid=${restCalls[0]} (expected DialCallSid)`);
+  const update = fake.calls.find((c) => c.op === "update" && c.table === "calls");
+  if (update?.payload?.handled_by_user_id !== USER_B) failures.push(`handled_by_user_id=${update?.payload?.handled_by_user_id}`);
+  if (update?.payload?.answered_via !== "pstn") failures.push(`answered_via=${update?.payload?.answered_via}`);
+  if (!update?.payload?.handled_at) failures.push("handled_at missing");
+  record("T40b REST fallback attribution: whisper skipped → Twilio child-leg fetch resolves", failures.length === 0, failures.join("; ") || "DialCallSid → Twilio REST → child leg .to → handled_by");
+}
+
+/**
+ * Phase 3.5 T41 (revalidated) — false-match regression MOVED from the
+ * dial-status callback to the REST-fallback path.
+ *
+ * Original 3.3 concern: normalizePhone(client:<uuid>) could false-
+ * match a staff cell. That path is now guarded by the whisper being
+ * authoritative — dial-status only phone-matches when the whisper
+ * didn't write attribution AND Twilio REST returned a value. This
+ * test simulates the REST fallback returning a client:<uuid> whose
+ * stripped digits collide with a staff cell; the client: branch in
+ * resolveHandledByUserId MUST short-circuit before normalizePhone
+ * runs, or we'd wrongly attribute the browser leg to whoever's cell
+ * happens to end in those digits.
  */
 async function T41_false_match_regression() {
   const fake = new FakeSupabaseClient();
@@ -1577,7 +1730,24 @@ async function T41_false_match_regression() {
     record("T41 SETUP", false, `fixture identity last-10=${identityLast10}, USER_B last-10=${bLast10} — fixture no longer collides; T41 would be vacuous`);
     return;
   }
-  // NO row for this identity — client_identity lookup returns nothing.
+  // Row up-front read — whisper did NOT write attribution, so
+  // dial-status will try to resolve on its own.
+  fake.on(
+    (c) =>
+      c.op === "select" &&
+      c.table === "calls" &&
+      c.selectColumns.includes("handoff_reason") &&
+      c.selectColumns.includes("handled_by_user_id"),
+    {
+      data: {
+        handoff_reason: "topic_match_ringing",
+        handled_by_user_id: null,
+        answered_via: null,
+        rung_user_ids: [USER_B],
+      },
+    },
+  );
+  // Identity lookup returns nothing (client not on file).
   fake.on(
     (c) =>
       c.op === "select" &&
@@ -1585,38 +1755,44 @@ async function T41_false_match_regression() {
       c.eqFilters.some((f) => f.column === "client_identity"),
     { data: null },
   );
-  // Populate rung_user_ids + user_businesses with USER_B whose phone
-  // ends in 4155551234. If the buggy pre-3.3 path ran, this would
-  // false-match B.
-  fake.on(
-    (c) => c.op === "select" && c.table === "calls" && c.selectColumns === "rung_user_ids",
-    { data: { rung_user_ids: [USER_B] } },
-  );
   fake.on(
     (c) => c.op === "select" && c.table === "user_businesses" && c.inFilters.some((f) => f.column === "user_id"),
     { data: [{ user_id: USER_B, callback_ring_number: "+14155551234" }] },
   );
-  fake.on(
-    (c) => c.op === "select" && c.table === "calls" && c.selectColumns === "handoff_reason",
-    { data: { handoff_reason: "topic_match_ringing" } },
-  );
   fake.on((c) => c.op === "update" && c.table === "calls", { data: { id: CALL_ID } });
 
-  const result = await handleDialStatus(asClient(fake), {
-    business_id: BIZ,
-    conversation_id: CONV,
-    DialCallStatus: "completed",
-    To: `client:${evilClientId}`,
-  });
+  // Mock Twilio REST returning the EVIL client: URI as the child leg.
+  // If the client: branch short-circuits (correct), we get
+  // answered_via=browser and NO false-match. If normalizePhone runs
+  // on it (regression), USER_B would be wrongly attributed.
+  const twilioClient: TwilioCallControl = {
+    calls: (_sid: string) => ({
+      update: async () => ({}),
+      fetch: async () => ({ to: `client:${evilClientId}` }),
+    }),
+  };
+
+  const result = await handleDialStatus(
+    asClient(fake),
+    {
+      business_id: BIZ,
+      conversation_id: CONV,
+      DialCallStatus: "completed",
+      To: "+14433314649", // inbound number — triggers REST fallback
+      DialCallSid: "CA_evil_client_test",
+    },
+    new Date(),
+    { twilioClient },
+  );
   const failures: string[] = [];
   if (!result.ok) failures.push(`not ok: ${(result as any).error}`);
   else if (result.handledByUserId === USER_B) failures.push(`false-match: resolved to USER_B via phone normalization of a client: uri`);
   const update = fake.calls.find((c) => c.op === "update" && c.table === "calls");
   if (update?.payload?.handled_by_user_id === USER_B) failures.push("update wrote USER_B handled_by from evil client: (regression)");
-  // answered_via should still be browser (we saw a client: prefix even
-  // if we couldn't map it to a user).
+  // answered_via should still be browser (we saw a client: prefix
+  // even if we couldn't map it to a user).
   if (update?.payload?.answered_via !== "browser") failures.push(`update answered_via=${update?.payload?.answered_via} (expected browser)`);
-  record("T41 false-match regression: client:<uuid> never resolves via phone matching", failures.length === 0, failures.join("; ") || "client: bypasses normalizePhone entirely");
+  record("T41 false-match regression (post-3.5): REST child leg client:<uuid> never resolves via phone matching", failures.length === 0, failures.join("; ") || "client: bypasses normalizePhone entirely in REST-fallback path too");
 }
 
 /**
@@ -2515,6 +2691,188 @@ async function T59_preference_round_trip() {
   record("T59 preference PATCH→GET round-trip: dock + sidebar toggles agree on shared column", failures.length === 0, failures.join("; ") || "both toggles write same column, both reads see same value");
 }
 
+// ── Phase 3.5: per-leg attribution via whisper + handler hardening ──
+
+/**
+ * Phase 3.5 T64 — whisper URL is PER-CANDIDATE and carries user_id +
+ * leg. Prior code shared one whisper URL across all candidates, so
+ * the whisper handler had no way to know who answered.
+ */
+async function T64_whisper_url_per_candidate() {
+  const decision = decideRouting({
+    onDutyForTopic: [],
+    onDutyAny: [
+      // Two candidates — different users, different legs.
+      { userId: USER_A, callbackRingNumber: null, clientIdentity: CLIENT_A },
+      { userId: USER_B, callbackRingNumber: PHONE_B, clientIdentity: null },
+    ],
+    businessOpen: true,
+    legacyTransferToPhone: null,
+    topicConfigured: true,
+  });
+  const baseWhisper = "https://api.example.com/api/routing/whisper?text=Hi&business_id=biz1&conversation_id=conv1";
+  const twiml = buildDialTwiml(decision, {
+    callerId: "+18005551234",
+    whisperUrl: baseWhisper,
+    recordingStatusUrl: null,
+    dialStatusUrl: null,
+  });
+  const failures: string[] = [];
+  // <Client> must carry USER_A + leg=client.
+  const clientMatch = /<Client\s+url="([^"]+)">/.exec(twiml);
+  if (!clientMatch) failures.push("no <Client url=...> found");
+  else {
+    const url = clientMatch[1].replace(/&amp;/g, "&");
+    if (!url.includes(`user_id=${USER_A}`)) failures.push(`<Client> url missing user_id=${USER_A}: ${url}`);
+    if (!url.includes("leg=client")) failures.push(`<Client> url missing leg=client: ${url}`);
+    if (!url.startsWith(baseWhisper)) failures.push("<Client> url should append to base, not replace");
+  }
+  // <Number> must carry USER_B + leg=number.
+  const numberMatch = /<Number\s+url="([^"]+)">/.exec(twiml);
+  if (!numberMatch) failures.push("no <Number url=...> found");
+  else {
+    const url = numberMatch[1].replace(/&amp;/g, "&");
+    if (!url.includes(`user_id=${USER_B}`)) failures.push(`<Number> url missing user_id=${USER_B}: ${url}`);
+    if (!url.includes("leg=number")) failures.push(`<Number> url missing leg=number: ${url}`);
+  }
+  // The two whisper URLs MUST differ — that's the whole point.
+  if (clientMatch && numberMatch && clientMatch[1] === numberMatch[1]) {
+    failures.push("<Client> and <Number> whisper URLs are IDENTICAL — no per-candidate scoping");
+  }
+  record("T64 whisper URL is per-candidate: <Client>/<Number> each carry user_id + leg", failures.length === 0, failures.join("; ") || "attribution scoping baked into the URL, not the (unreliable) dial-status callback");
+}
+
+/**
+ * Phase 3.5 T65 — parseWhisperQuery + writeWhisperAttribution.
+ * The whisper handler is authoritative for handled_by_user_id and
+ * answered_via. Assert the parser handles all shapes and the writer
+ * scopes UPDATE by (business_id, conversation_id) only, never
+ * cross-tenant.
+ */
+async function T65_whisper_attribution_write() {
+  const failures: string[] = [];
+  // Parser: happy path.
+  const ctx = parseWhisperQuery({
+    text: "Incoming call for EZ Rentals about Roadside & breakdown. Connecting now.",
+    business_id: BIZ,
+    conversation_id: CONV,
+    user_id: USER_A,
+    leg: "client",
+  });
+  if (ctx.text.length < 10) failures.push("text truncated wrongly");
+  if (ctx.business_id !== BIZ) failures.push(`biz=${ctx.business_id}`);
+  if (ctx.user_id !== USER_A) failures.push(`user=${ctx.user_id}`);
+  if (ctx.leg !== "client") failures.push(`leg=${ctx.leg}`);
+  // Parser: unknown leg → null.
+  if (parseWhisperQuery({ leg: "foo" }).leg !== null) failures.push("unknown leg not nulled");
+  // Parser: missing fields → nulls (not undefined).
+  const empty = parseWhisperQuery({});
+  if (empty.business_id !== null) failures.push("missing biz not nulled");
+  if (empty.leg !== null) failures.push("missing leg not nulled");
+
+  // Writer: happy path (client leg → answered_via=browser).
+  const fake = new FakeSupabaseClient();
+  fake.on((c) => c.op === "update" && c.table === "calls", { data: { id: CALL_ID } });
+  const result = await writeWhisperAttribution(asClient(fake), ctx);
+  if (!result.wrote) failures.push(`wrote=false: ${result.skippedReason}`);
+  const update = fake.calls.find((c) => c.op === "update" && c.table === "calls");
+  if (update?.payload?.handled_by_user_id !== USER_A) failures.push(`payload user=${update?.payload?.handled_by_user_id}`);
+  if (update?.payload?.answered_via !== "browser") failures.push(`payload answered_via=${update?.payload?.answered_via}`);
+  if (!update?.payload?.handled_at) failures.push("payload missing handled_at");
+  // MUST filter by BOTH business_id AND call_sid — no cross-tenant write.
+  if (!update?.eqFilters.some((f) => f.column === "business_id" && f.value === BIZ)) {
+    failures.push("update missing business_id filter");
+  }
+  if (!update?.eqFilters.some((f) => f.column === "call_sid" && f.value === CONV)) {
+    failures.push("update missing call_sid filter");
+  }
+
+  // Writer: number leg → answered_via=pstn.
+  const fake2 = new FakeSupabaseClient();
+  fake2.on((c) => c.op === "update" && c.table === "calls", { data: { id: CALL_ID } });
+  await writeWhisperAttribution(asClient(fake2), { ...ctx, leg: "number" });
+  const update2 = fake2.calls.find((c) => c.op === "update" && c.table === "calls");
+  if (update2?.payload?.answered_via !== "pstn") failures.push(`number leg answered_via=${update2?.payload?.answered_via}`);
+
+  // Writer: missing user_id → skips write (legacy_transfer path).
+  const fake3 = new FakeSupabaseClient();
+  fake3.on((c) => c.op === "update" && c.table === "calls", { data: { id: CALL_ID } });
+  const r3 = await writeWhisperAttribution(asClient(fake3), { ...ctx, user_id: null });
+  if (r3.wrote) failures.push("wrote when user_id null (should skip)");
+  const update3 = fake3.calls.find((c) => c.op === "update" && c.table === "calls");
+  if (update3) failures.push("issued UPDATE when user_id null");
+
+  record("T65 whisper attribution: parse + write scoped to (biz, conv), leg → answered_via", failures.length === 0, failures.join("; ") || "whisper is authoritative for handled_by / answered_via");
+}
+
+/**
+ * Phase 3.5 T66 — whisper handler must ALWAYS return 200 with valid
+ * TwiML. Any non-2xx makes Twilio play "an application error has
+ * occurred" audibly to the answerer before the bridge. This asserts
+ * the parser's degenerate inputs still produce a working <Response>.
+ */
+async function T66_whisper_handler_always_200_shape() {
+  const failures: string[] = [];
+  // parseWhisperQuery on garbage inputs should not throw.
+  const cases: any[] = [
+    {},
+    { text: null },
+    { text: 42 },
+    { text: "x".repeat(500), business_id: 999 },
+    { leg: "junk", user_id: [] },
+  ];
+  for (const q of cases) {
+    try {
+      const ctx = parseWhisperQuery(q);
+      if (typeof ctx.text !== "string") failures.push(`text not string for ${JSON.stringify(q)}`);
+      if (ctx.text.length > 300) failures.push(`text length ${ctx.text.length} > 300 max`);
+    } catch (err: any) {
+      failures.push(`parse threw on ${JSON.stringify(q)}: ${err?.message}`);
+    }
+  }
+  // buildWhisperTwiml with empty / weird input must not throw.
+  try {
+    buildWhisperTwiml("");
+    buildWhisperTwiml("Hi & <bye>");
+    buildWhisperTwiml("Hi & <you>");
+  } catch (err: any) {
+    failures.push(`buildWhisperTwiml threw: ${err?.message}`);
+  }
+  record("T66 whisper handler: degenerate inputs never throw, TwiML always well-formed", failures.length === 0, failures.join("; ") || "no path can produce a customer-audible error");
+}
+
+/**
+ * Phase 3.5 T67 — writeWhisperAttribution SWALLOWS DB errors. The
+ * whisper leg must play successfully even if the DB write fails —
+ * a failed attribution is a reporting bug, but a customer-audible
+ * error is a sev-1.
+ */
+async function T67_whisper_write_swallows_errors() {
+  const fake = new FakeSupabaseClient();
+  fake.on(
+    (c) => c.op === "update" && c.table === "calls",
+    { error: { message: "database has gone away" } },
+  );
+  const ctx = parseWhisperQuery({
+    business_id: BIZ,
+    conversation_id: CONV,
+    user_id: USER_A,
+    leg: "client",
+    text: "hi",
+  });
+  const failures: string[] = [];
+  let threw = false;
+  try {
+    const r = await writeWhisperAttribution(asClient(fake), ctx);
+    if (r.wrote) failures.push("wrote=true despite DB error");
+    if (!r.skippedReason) failures.push("no skippedReason on failure");
+  } catch {
+    threw = true;
+  }
+  if (threw) failures.push("writeWhisperAttribution threw — must swallow");
+  record("T67 writeWhisperAttribution swallows DB errors (never crashes the whisper leg)", failures.length === 0, failures.join("; ") || "TwiML leg completes even when attribution write fails");
+}
+
 // ── Bonus: whisper composition and TwiML ────────────────────────────
 
 async function whisper_composition() {
@@ -2579,7 +2937,8 @@ async function main() {
   // Phase 3.3 — in-app calling (WebRTC softphone)
   await T38_client_only_twiml_shape();
   await T39_mixed_client_number_simulring();
-  await T40_client_identity_handled_by();
+  await T40_dial_status_preserves_whisper_attribution();
+  await T40b_dial_status_rest_fallback_attribution();
   await T41_false_match_regression();
   await T42_twilio_call_sid_upsert();
   await T43_stale_heartbeat_drops_candidate();
@@ -2607,6 +2966,11 @@ async function main() {
   await T61_signature_verify_accepts_valid_request();
   await T62_signature_verify_fallback_urls();
   await T63_ringback_and_wait_message_in_twiml();
+  // Phase 3.5 — per-leg attribution via whisper + handler hardening
+  await T64_whisper_url_per_candidate();
+  await T65_whisper_attribution_write();
+  await T66_whisper_handler_always_200_shape();
+  await T67_whisper_write_swallows_errors();
   await whisper_composition();
 
   const fails = results.filter((r) => !r.pass);

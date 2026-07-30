@@ -140,10 +140,18 @@ function getPublicUrl(): string {
  * Minimal Twilio REST surface used by the routing handler. Kept as an
  * interface (not the concrete twilio client type) so smoke tests can
  * swap in a mock without pulling the whole client type surface.
+ *
+ * Phase 3.5 — added .fetch() so handleDialStatus can look up the
+ * child leg's actual `to` field. Twilio's <Dial action> callback body
+ * only carries the ORIGINAL inbound call parameters (To = business's
+ * inbound number), NEVER the child leg's To. The reliable way to
+ * learn "did a browser or a cell win the race" from the action
+ * callback is to REST-fetch DialCallSid.
  */
 export interface TwilioCallControl {
   calls(sid: string): {
     update(opts: { twiml: string }): Promise<unknown>;
+    fetch(): Promise<{ to?: string | null } & Record<string, unknown>>;
   };
 }
 
@@ -464,7 +472,19 @@ export async function handleRouteToTopic(
       topicName,
       overrideTemplate: biz.transferWarmMessage,
     });
-    const whisperUrl = `${getPublicUrl()}/api/routing/whisper?text=${encodeURIComponent(whisperText)}`;
+    // Phase 3.5 — whisperUrl carries the shared params (text, business_id,
+    // conversation_id). dial-builder appends per-candidate user_id + leg
+    // so the whisper handler can attribute the answerer correctly. The
+    // handler was previously blind to which candidate answered because
+    // Twilio's <Dial action> callback carries the ORIGINAL inbound call
+    // parameters (To = business's own inbound number), not the child
+    // leg's — verified live 2026-07-30 22:58 (answered_via='pstn' on a
+    // browser-answered call).
+    const whisperUrl =
+      `${getPublicUrl()}/api/routing/whisper` +
+      `?text=${encodeURIComponent(whisperText)}` +
+      `&business_id=${encodeURIComponent(business_id)}` +
+      `&conversation_id=${encodeURIComponent(conversation_id)}`;
     const dialOpts: DialBuilderOptions = {
       callerId: biz.callerId,
       whisperUrl,
@@ -750,69 +770,153 @@ export function promoteHandoffReasonOnAnswer(current: string | null | undefined)
   return null;
 }
 
+/**
+ * Phase 3.5 — Twilio-REST fallback. When the whisper handler couldn't
+ * write attribution (legacy_transfer path with no user_id on the URL,
+ * or whisper hit an error), we can still learn "which leg answered"
+ * by fetching the child call via DialCallSid — Twilio populates the
+ * child's `.to` with the actual dial target (`client:<identity>` for
+ * browser, E.164 for cell).
+ *
+ * Returns null on any failure — the caller must treat null as "give
+ * up, don't overwrite what's already in the row."
+ */
+async function fetchChildLegTo(
+  twilioClient: TwilioCallControl | null,
+  dialCallSid: string | undefined,
+): Promise<string | null> {
+  if (!twilioClient || !dialCallSid) return null;
+  try {
+    const call = await twilioClient.calls(dialCallSid).fetch();
+    return typeof call?.to === "string" ? call.to : null;
+  } catch (err: any) {
+    Sentry.captureMessage("dial_status_child_leg_fetch_failed", {
+      level: "warning",
+      extra: { dialCallSid, error: err?.message },
+    });
+    return null;
+  }
+}
+
+export interface HandleDialStatusOptions {
+  /**
+   * Injected Twilio client for the child-leg fallback. If null, the
+   * REST lookup is skipped and attribution falls back to whatever
+   * the whisper wrote (if anything).
+   */
+  twilioClient?: TwilioCallControl | null;
+}
+
 export async function handleDialStatus(
   supabase: SupabaseClient,
   body: DialStatusBody,
   now: Date = new Date(),
+  opts: HandleDialStatusOptions = {},
 ): Promise<{ ok: true; transferStatus: string; handledByUserId: string | null } | { ok: false; error: string }> {
-  const { business_id, conversation_id, DialCallStatus, To } = body;
+  const { business_id, conversation_id, DialCallStatus, To, DialCallSid } = body;
   if (!business_id || !conversation_id) return { ok: false, error: "missing business_id or conversation_id" };
   if (!DialCallStatus) return { ok: false, error: "missing DialCallStatus" };
 
   const mapped = mapDialStatus(DialCallStatus);
-  const resolved = mapped.transferAnswered
-    ? await resolveHandledByUserId(supabase, business_id, conversation_id, To)
-    : { userId: null as string | null, answeredVia: null as "browser" | "pstn" | null };
-  const handledByUserId = resolved.userId;
 
-  // Phase 3.2c — separate concerns:
-  //   * transfer_status   = ALWAYS updated (this is the state machine)
-  //   * transfer_answered = ALWAYS updated (mirrors DialCallStatus)
-  //   * handled_by_user_id + handled_at = only on answered
-  //   * handoff_reason    = ONLY touched in two cases:
-  //       (1) DialCallStatus=completed: promote *_ringing → *_answered
-  //           (routing labelled *_ringing at tool-time; dial-completed
-  //            confirms someone actually picked up).
-  //       (2) DialCallStatus=no-answer: escalate to
-  //           'all_staff_no_answer' (routing rang, everyone timed out).
-  //       Do NOT touch handoff_reason on busy / canceled / failed:
-  //       those are Twilio call-outcome details, orthogonal to which
-  //       routing PATH the engine took. The routing path stays in
-  //       handoff_reason; the outcome lives in transfer_status.
+  // Phase 3.5 — read the current row FIRST. We need three things:
+  //   1. handoff_reason: for *_ringing → *_answered promotion.
+  //   2. handled_by_user_id: if the whisper already wrote it, DON'T
+  //      overwrite. Whisper is authoritative because it fires on the
+  //      leg that actually answered; the <Dial action> callback we're
+  //      in right now carries the ORIGINAL inbound call's params, not
+  //      the child leg's.
+  //   3. answered_via: same — if whisper already wrote 'browser' or
+  //      'pstn', preserve it.
+  let currentHandoff: string | null | undefined;
+  let existingHandledBy: string | null | undefined;
+  let existingAnsweredVia: string | null | undefined;
+  try {
+    const { data: currentRow } = await supabase
+      .from("calls")
+      .select("handoff_reason, handled_by_user_id, answered_via, rung_user_ids")
+      .eq("business_id", business_id)
+      .eq("call_sid", conversation_id)
+      .maybeSingle();
+    const row = currentRow as
+      | {
+          handoff_reason?: string | null;
+          handled_by_user_id?: string | null;
+          answered_via?: string | null;
+          rung_user_ids?: string[];
+        }
+      | null;
+    currentHandoff = row?.handoff_reason;
+    existingHandledBy = row?.handled_by_user_id;
+    existingAnsweredVia = row?.answered_via;
+  } catch (err: any) {
+    // If we can't even read the row we still need to write the
+    // status transition. Log and continue.
+    Sentry.captureMessage("dial_status_row_read_failed", {
+      level: "warning",
+      extra: { business_id, conversation_id, error: err?.message },
+    });
+  }
+
+  // Resolve attribution ONLY when we don't already have it AND the
+  // call was answered. Order of preference:
+  //   1. Value already in the row (whisper wrote it — authoritative).
+  //   2. `To` field on this callback (mostly unreliable — carries the
+  //      inbound number — but if it IS a client: uri, use it).
+  //   3. REST-fetched child leg from DialCallSid — the reliable
+  //      fallback for legacy_transfer where whisper had no user_id.
+  let resolvedUserId: string | null = existingHandledBy || null;
+  let resolvedAnsweredVia: "browser" | "pstn" | null =
+    existingAnsweredVia === "browser" || existingAnsweredVia === "pstn"
+      ? existingAnsweredVia
+      : null;
+
+  if (mapped.transferAnswered && (!resolvedUserId || !resolvedAnsweredVia)) {
+    // The callback's own `To` is USELESS for attribution — it always
+    // carries the ORIGINAL inbound call's To (the business's inbound
+    // number), NEVER the child leg's target. Documented in
+    // TwilioCallControl.fetch's header. Always REST-fetch the child
+    // leg via DialCallSid to learn what actually answered.
+    const attrTo = await fetchChildLegTo(opts.twilioClient ?? getTwilioClient(), DialCallSid);
+    if (attrTo) {
+      const resolved = await resolveHandledByUserId(supabase, business_id, conversation_id, attrTo);
+      if (!resolvedUserId && resolved.userId) resolvedUserId = resolved.userId;
+      if (!resolvedAnsweredVia && resolved.answeredVia) resolvedAnsweredVia = resolved.answeredVia;
+    } else if (To) {
+      // Last-ditch: if REST fails / no DialCallSid, try the callback
+      // To anyway. This will almost never yield useful attribution,
+      // but if a hypothetical caller shape ever DID pass the child
+      // leg's To, we'd honour it. Logged so we can see when it fires.
+      Sentry.captureMessage("dial_status_attribution_using_callback_to_fallback", {
+        level: "warning",
+        extra: { business_id, conversation_id, To, DialCallSid },
+      });
+      const resolved = await resolveHandledByUserId(supabase, business_id, conversation_id, To);
+      if (!resolvedUserId && resolved.userId) resolvedUserId = resolved.userId;
+      if (!resolvedAnsweredVia && resolved.answeredVia) resolvedAnsweredVia = resolved.answeredVia;
+    }
+  }
+
   const patch: Record<string, unknown> = {
     transfer_status: mapped.transferStatus,
     transfer_answered: mapped.transferAnswered,
   };
-  if (handledByUserId) {
-    patch.handled_by_user_id = handledByUserId;
-    patch.handled_at = now.toISOString();
-  }
-  // Phase 3.3 — record HOW the answering leg won the race (browser vs
-  // pstn). Written whenever the call was answered, even when we
-  // couldn't resolve WHICH user (e.g. Twilio callback with an unfamiliar
-  // client identity — still know it was a browser leg).
-  if (mapped.transferAnswered && resolved.answeredVia) {
-    patch.answered_via = resolved.answeredVia;
-  }
 
+  // Only write handled_by_user_id / handled_at if we HAVE a user AND
+  // the whisper hasn't already written it. Same for answered_via.
   if (mapped.transferAnswered) {
-    // Promote *_ringing → *_answered. Requires reading the current
-    // handoff_reason. If we can't read it (row missing, other error),
-    // leave the column alone — better to preserve than to overwrite
-    // with the wrong _answered variant.
-    const { data: currentRow } = await supabase
-      .from("calls")
-      .select("handoff_reason")
-      .eq("business_id", business_id)
-      .eq("call_sid", conversation_id)
-      .maybeSingle();
-    const current = (currentRow as { handoff_reason?: string | null } | null)?.handoff_reason;
-    const promoted = promoteHandoffReasonOnAnswer(current);
+    if (resolvedUserId && !existingHandledBy) {
+      patch.handled_by_user_id = resolvedUserId;
+      patch.handled_at = now.toISOString();
+    }
+    if (resolvedAnsweredVia && !existingAnsweredVia) {
+      patch.answered_via = resolvedAnsweredVia;
+    }
+    // handoff_reason promotion — same rule as before, but now uses
+    // the currentHandoff we read at the top.
+    const promoted = promoteHandoffReasonOnAnswer(currentHandoff ?? null);
     if (promoted) patch.handoff_reason = promoted;
   } else if (DialCallStatus === "no-answer") {
-    // ONLY no-answer escalates — that's the "we tried, nobody picked
-    // up" signal. busy / canceled / failed reflect Twilio call-outcome
-    // metadata that doesn't invalidate the routing path chosen.
     patch.handoff_reason = "all_staff_no_answer";
   }
 
@@ -829,7 +933,11 @@ export async function handleDialStatus(
     });
   }
 
-  return { ok: true, transferStatus: mapped.transferStatus, handledByUserId };
+  return {
+    ok: true,
+    transferStatus: mapped.transferStatus,
+    handledByUserId: resolvedUserId,
+  };
 }
 
 // ── Express route registrations ─────────────────────────────────────
@@ -862,13 +970,135 @@ router.post(
   },
 );
 
+/**
+ * Phase 3.5 — the whisper handler now doubles as our attribution
+ * writer. Twilio fetches the whisper URL from the leg that ANSWERED,
+ * before bridging, so this handler by construction knows which
+ * candidate won the race. That's the correct source of truth for
+ * handled_by_user_id / answered_via — much more reliable than
+ * inspecting the <Dial action> callback, which carries the ORIGINAL
+ * inbound call's parameters, not the answering child leg's.
+ *
+ * Contract:
+ *   - MUST always return 200 with valid TwiML. Twilio plays "an
+ *     application error has occurred" AUDIBLY to the answerer if
+ *     this handler ever returns non-2xx or malformed XML. Every
+ *     failure mode (missing text, DB down, exception thrown) falls
+ *     through to an empty <Response/>.
+ *   - Attribution writes are best-effort. A failed write logs to
+ *     Sentry; the TwiML still plays. handleDialStatus's Twilio-REST
+ *     fallback covers the miss.
+ */
+export interface WhisperHandlerContext {
+  text: string;
+  business_id: string | null;
+  conversation_id: string | null;
+  user_id: string | null;
+  leg: "client" | "number" | null;
+}
+
+export function parseWhisperQuery(query: Record<string, unknown>): WhisperHandlerContext {
+  const s = (v: unknown): string | null =>
+    typeof v === "string" && v.trim() ? v.trim() : null;
+  const raw = typeof query.text === "string" ? query.text : "";
+  const trimmedText = raw.length > 300 ? raw.slice(0, 297) + "..." : raw;
+  const legRaw = s(query.leg);
+  const leg = legRaw === "client" || legRaw === "number" ? legRaw : null;
+  return {
+    text: trimmedText,
+    business_id: s(query.business_id),
+    conversation_id: s(query.conversation_id),
+    user_id: s(query.user_id),
+    leg,
+  };
+}
+
+/**
+ * Do the attribution write. Exported for the smoke — asserts we
+ * write only when we have the (biz, conv, user, leg) tuple, and that
+ * every failure is swallowed rather than surfaced.
+ */
+export async function writeWhisperAttribution(
+  supabase: SupabaseClient,
+  ctx: WhisperHandlerContext,
+  now: Date = new Date(),
+): Promise<{ wrote: boolean; skippedReason?: string }> {
+  if (!ctx.business_id || !ctx.conversation_id) {
+    return { wrote: false, skippedReason: "missing business_id or conversation_id" };
+  }
+  if (!ctx.user_id || !ctx.leg) {
+    // Legacy_transfer path — no user_id on the URL. Attribution here
+    // is deferred to handleDialStatus's Twilio-REST fallback.
+    return { wrote: false, skippedReason: "no user_id/leg on whisper url" };
+  }
+  const patch = {
+    handled_by_user_id: ctx.user_id,
+    handled_at: now.toISOString(),
+    answered_via: ctx.leg === "client" ? "browser" : "pstn",
+  };
+  try {
+    const { error } = await supabase
+      .from("calls")
+      .update(patch)
+      .eq("business_id", ctx.business_id)
+      .eq("call_sid", ctx.conversation_id);
+    if (error) {
+      Sentry.captureMessage("whisper_attribution_write_failed", {
+        level: "warning",
+        extra: { business_id: ctx.business_id, conversation_id: ctx.conversation_id, error: error.message },
+      });
+      return { wrote: false, skippedReason: error.message };
+    }
+    return { wrote: true };
+  } catch (err: any) {
+    Sentry.captureException(err, {
+      extra: {
+        where: "writeWhisperAttribution",
+        business_id: ctx.business_id,
+        conversation_id: ctx.conversation_id,
+      },
+    });
+    return { wrote: false, skippedReason: err?.message || "threw" };
+  }
+}
+
 router.get(
   "/routing/whisper",
-  (req: Request, res: Response): void => {
-    const raw = typeof req.query.text === "string" ? req.query.text : "";
-    const text = raw.length > 300 ? raw.slice(0, 297) + "..." : raw;
-    const fallback = text || "Incoming call. Connecting now.";
-    res.type("text/xml").send(buildWhisperTwiml(fallback));
+  async (req: Request, res: Response): Promise<void> => {
+    // Compose the response FIRST — every path below must send 200
+    // valid TwiML no matter what fails. Attribution write is fire-
+    // and-forget after the response.
+    let ctx: WhisperHandlerContext;
+    try {
+      ctx = parseWhisperQuery(req.query as Record<string, unknown>);
+    } catch (err: any) {
+      Sentry.captureException(err, { extra: { where: "whisper.parseQuery" } });
+      res
+        .status(200)
+        .type("text/xml")
+        .send('<?xml version="1.0" encoding="UTF-8"?><Response/>');
+      return;
+    }
+
+    const speak = ctx.text || "Incoming call. Connecting now.";
+    let twimlOut: string;
+    try {
+      twimlOut = buildWhisperTwiml(speak);
+    } catch (err: any) {
+      Sentry.captureException(err, { extra: { where: "whisper.buildTwiml" } });
+      twimlOut = '<?xml version="1.0" encoding="UTF-8"?><Response/>';
+    }
+    res.status(200).type("text/xml").send(twimlOut);
+
+    // Attribution write — after the TwiML response so a slow DB
+    // never delays Twilio's bridge. Errors are captured to Sentry
+    // and swallowed.
+    const supabase = getSupabase();
+    if (supabase) {
+      void writeWhisperAttribution(supabase, ctx).catch((err) => {
+        Sentry.captureException(err, { extra: { where: "whisper.writeAttribution.reject" } });
+      });
+    }
   },
 );
 
@@ -915,7 +1145,13 @@ router.post(
       To: (req.body?.To as string) || undefined,
       From: (req.body?.From as string) || undefined,
     };
-    await handleDialStatus(supabase, body);
+    // Phase 3.5 — pass the Twilio client so handleDialStatus can
+    // REST-fetch the child leg's `to` field when the whisper didn't
+    // write attribution (legacy_transfer path, etc.). Without this
+    // the dial-status callback has no reliable way to learn which
+    // leg answered — the `To` on this callback carries the ORIGINAL
+    // inbound number, not the child leg.
+    await handleDialStatus(supabase, body, new Date(), { twilioClient: getTwilioClient() });
     // Return an empty <Response> so Twilio ends the leg cleanly (the
     // Dial verb has already terminated; nothing left to do).
     res.status(200).type("text/xml").send('<?xml version="1.0" encoding="UTF-8"?><Response/>');

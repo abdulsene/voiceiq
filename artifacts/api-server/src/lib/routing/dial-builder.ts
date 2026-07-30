@@ -97,11 +97,53 @@ function xmlEscape(input: string): string {
 }
 
 /**
+ * Phase 3.5 — per-candidate whisper URL. Each <Client> / <Number> gets
+ * its OWN whisper URL carrying user_id + leg. This is how we attribute
+ * the answerer: the whisper by definition fires ONLY on the leg that
+ * answered, so whichever whisper handler runs KNOWS which user / leg
+ * won the race. Previous code shared one URL across all candidates,
+ * so the whisper handler had no way to distinguish who picked up.
+ *
+ * Twilio does NOT sign whisper GETs (they're fetched from the answering
+ * leg's Twilio infra, not the app-signed webhook flow), so the URL
+ * carries all identity in the query string itself.
+ */
+export type WhisperLeg = "client" | "number";
+
+function appendQueryParam(url: string, key: string, value: string): string {
+  const sep = url.includes("?") ? "&" : "?";
+  return `${url}${sep}${key}=${encodeURIComponent(value)}`;
+}
+
+/**
+ * Build the per-candidate whisper URL. `whisperUrl` is the caller-
+ * supplied base (already carrying `text=...` and any other shared
+ * params); we append `user_id` (when known) and `leg`. Preserves the
+ * shared-URL behaviour when no leg/user info is available (e.g.
+ * legacy_transfer path with no candidate at all).
+ */
+function whisperUrlFor(
+  whisperUrl: string | null,
+  ctx: { leg: WhisperLeg; userId?: string | null },
+): string | null {
+  if (!whisperUrl) return null;
+  let url = whisperUrl;
+  if (ctx.userId) url = appendQueryParam(url, "user_id", ctx.userId);
+  url = appendQueryParam(url, "leg", ctx.leg);
+  return url;
+}
+
+/**
  * Render <Number> child. Includes url= only when whisperUrl is set.
  */
-function renderNumber(phone: string, whisperUrl: string | null): string {
-  if (whisperUrl) {
-    return `<Number url="${xmlEscape(whisperUrl)}">${xmlEscape(phone)}</Number>`;
+function renderNumber(
+  phone: string,
+  whisperUrl: string | null,
+  ctx: { leg: WhisperLeg; userId?: string | null },
+): string {
+  const url = whisperUrlFor(whisperUrl, ctx);
+  if (url) {
+    return `<Number url="${xmlEscape(url)}">${xmlEscape(phone)}</Number>`;
   }
   return `<Number>${xmlEscape(phone)}</Number>`;
 }
@@ -116,8 +158,10 @@ function renderClient(
   identity: string,
   whisperUrl: string | null,
   topicName: string | null | undefined,
+  ctx: { leg: WhisperLeg; userId?: string | null },
 ): string {
-  const attrs = whisperUrl ? ` url="${xmlEscape(whisperUrl)}"` : "";
+  const url = whisperUrlFor(whisperUrl, ctx);
+  const attrs = url ? ` url="${xmlEscape(url)}"` : "";
   const params = topicName
     ? `<Parameter name="topic_name" value="${xmlEscape(topicName)}"/>`
     : "";
@@ -128,6 +172,10 @@ function renderClient(
  * Phase 3.3 — walk one candidate. Emits <Client>, <Number>, or BOTH
  * depending on which fields are populated. Empty when neither is set
  * (caller should have filtered at the query layer, but defensive).
+ *
+ * Phase 3.5 — each rendered child carries a whisper URL scoped to
+ * (candidate.userId, leg), which lets the whisper handler write
+ * handled_by_user_id + answered_via correctly.
  */
 function renderCandidate(
   c: StaffCandidate,
@@ -135,8 +183,22 @@ function renderCandidate(
   topicName: string | null | undefined,
 ): string {
   const parts: string[] = [];
-  if (c.clientIdentity) parts.push(renderClient(c.clientIdentity, whisperUrl, topicName));
-  if (c.callbackRingNumber) parts.push(renderNumber(c.callbackRingNumber, whisperUrl));
+  if (c.clientIdentity) {
+    parts.push(
+      renderClient(c.clientIdentity, whisperUrl, topicName, {
+        leg: "client",
+        userId: c.userId,
+      }),
+    );
+  }
+  if (c.callbackRingNumber) {
+    parts.push(
+      renderNumber(c.callbackRingNumber, whisperUrl, {
+        leg: "number",
+        userId: c.userId,
+      }),
+    );
+  }
   return parts.join("");
 }
 
@@ -211,8 +273,13 @@ export function buildDialTwiml(
         );
       }
       // Whisper still applies to legacy — the phone-number owner is
-      // still a human answerer who benefits from context.
-      children = [renderNumber(decision.legacyPhone, opts.whisperUrl)];
+      // still a human answerer who benefits from context. No user_id
+      // on the whisper URL (legacy_transfer has no candidate); the
+      // handler will fall back to a Twilio REST child-leg lookup if
+      // it needs attribution.
+      children = [
+        renderNumber(decision.legacyPhone, opts.whisperUrl, { leg: "number" }),
+      ];
       break;
     case "after_hours_callback":
     case "graceful_hangup":
