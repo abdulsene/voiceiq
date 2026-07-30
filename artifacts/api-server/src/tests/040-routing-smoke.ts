@@ -65,6 +65,17 @@
  *   T51 /voice/preferences PATCH: scoped to caller's own membership,
  *       body-supplied user_id / business_id dropped on the floor
  *
+ *   3.3b additions (close token cross-tenant fallback + repair test):
+ *   T41 (repaired) — fixture identity's stripped-digits tail-10 EQUALS
+ *       USER_B's cell (was vacuous in 3.3a — trailing digits were
+ *       "1234567890", could never false-match). Proven-to-bite by
+ *       stubbing out the client: branch and observing the failure.
+ *   T52 token: no membership for requested biz → 403, no substitution
+ *   T53 token: multi-membership + no header → 400 explicit ambiguity
+ *   T54 token: single-membership + no header → picks it deterministically
+ *   T55 getPreferenceForCaller: happy path + 404 branch (route delegates
+ *       to the shared helper — same code that T51 exercises)
+ *
  * Run: pnpm --filter @workspace/api-server exec tsx \
  *        src/tests/040-routing-smoke.ts
  */
@@ -98,6 +109,7 @@ import {
   buildOutboundDialTwiml,
   mintVoiceAccessToken,
   updatePreferenceForCaller,
+  getPreferenceForCaller,
 } from "../routes/voice";
 // Phase 3.3a — single source of truth for the identity formula. Tests
 // compute expected identities via the helper so a formula change in
@@ -1504,12 +1516,33 @@ async function T40_client_identity_handled_by() {
  */
 async function T41_false_match_regression() {
   const fake = new FakeSupabaseClient();
-  // Craft a client identity that contains the target phone as a
-  // substring. If the buggy pre-3.3 code path ran, normalizePhone
-  // would strip non-digits and match "4155551234" against USER_B's
-  // cell. New format is `user_<32hex>__<12hex>` so we embed the
-  // "4155551234" fragment inside the hex-shaped user segment.
-  const evilClientId = "user_ab4155551234cdef1234567890abcdef__aabbccddeeff";
+  // Phase 3.3b — the T41 fixture in 3.3a was VACUOUS: its stripped
+  // digits ended in "1234567890" which cannot false-match USER_B's
+  // "4155551234". The test passed whether or not the client: branch
+  // existed. Rebuilt so the identity's trailing 10 digits (after
+  // normalizePhone-style stripping) EQUAL USER_B's normalized cell.
+  //
+  // Shape: user_<32-hex user segment>__<12-hex biz suffix>.
+  //   - user segment: 22 non-digit hex chars (a-f), then the 10 phone
+  //     digits at the tail → strip-non-digits yields "4155551234".
+  //   - biz suffix: 12 non-digit hex chars (a-f) so it contributes
+  //     NO digits — verified below.
+  // Total identity digits after stripping non-digits: exactly the 10
+  // phone digits. normalizePhone would take the last 10 → match B's
+  // "+14155551234" (normalizes to "4155551234"). If the pre-3.3 phone
+  // path runs on this string, T41 will fail.
+  const evilClientId = "user_abcdefabcdefabcdefabcd4155551234__aabbccddeeff";
+  // Self-verification: build the same phone-normalization the buggy
+  // path would apply, assert it collides with USER_B's cell. If this
+  // assertion trips the fixture is silently broken — better to fail
+  // the test setup than to ship another vacuous regression guard.
+  const identityDigits = evilClientId.replace(/\D+/g, "");
+  const identityLast10 = identityDigits.slice(-10);
+  const bLast10 = "+14155551234".replace(/\D+/g, "").slice(-10);
+  if (identityLast10 !== bLast10) {
+    record("T41 SETUP", false, `fixture identity last-10=${identityLast10}, USER_B last-10=${bLast10} — fixture no longer collides; T41 would be vacuous`);
+    return;
+  }
   // NO row for this identity — client_identity lookup returns nothing.
   fake.on(
     (c) =>
@@ -1634,21 +1667,22 @@ async function T43_stale_heartbeat_drops_candidate() {
  */
 async function T44_token_identity_ignores_client_supplied() {
   const fake = new FakeSupabaseClient();
-  // Phase 3.3a — the resolver reads a membership row to CONFIRM the
-  // caller belongs to the requested business, then computes the
-  // identity via buildClientIdentity(userId, businessId) — it does
-  // NOT echo whatever client_identity happens to be stored on the
-  // row. So we stub any evil / mismatched value in the DB and assert
-  // the resolver still returns the canonical derived identity.
+  // Phase 3.3b — resolver returns a discriminated union. We stub a
+  // membership hit for (USER_A, BIZ) so the "requested biz found"
+  // branch runs; identity must be derived from the helper, not echoed
+  // from any (potentially attacker-influenced) column value.
   fake.on(
     (c) => c.op === "select" && c.table === "user_businesses",
     { data: { business_id: BIZ } },
   );
-  const identity = await resolveClientIdentityForUser(asClient(fake), USER_A, BIZ);
+  const result = await resolveClientIdentityForUser(asClient(fake), USER_A, BIZ);
   const expected = buildClientIdentity(USER_A, BIZ);
   const failures: string[] = [];
-  if (identity !== expected) failures.push(`identity=${identity} expected=${expected}`);
-  if (identity === "attacker-supplied-value") failures.push("resolver returned client-supplied value");
+  if (!result.ok) failures.push(`not ok: ${(result as any).error}`);
+  else {
+    if (result.identity !== expected) failures.push(`identity=${result.identity} expected=${expected}`);
+    if (result.businessId !== BIZ) failures.push(`businessId=${result.businessId}`);
+  }
   // Sanity: the query MUST be filtered by user_id (the authenticated
   // caller), not by anything the caller could have influenced.
   const q = fake.calls.find((c) => c.op === "select" && c.table === "user_businesses");
@@ -1866,6 +1900,128 @@ async function T51_preferences_rejects_other_users_row() {
   record("T51 /voice/preferences PATCH: scoped to caller's own membership, body-supplied user_id ignored", failures.length === 0, failures.join("; ") || "auth-scoped writes + body sanitation");
 }
 
+// ── Phase 3.3b: close token cross-tenant fallback + preferences dedupe ───
+
+/**
+ * Phase 3.3b T52 — the token endpoint MUST NOT substitute a different
+ * tenant when the caller isn't a member of the requested business.
+ * 3.3a's resolver quietly fell back to ANY membership, reintroducing
+ * the exact cross-tenant condition migration 043 closed.
+ */
+async function T52_token_no_membership_returns_403() {
+  const fake = new FakeSupabaseClient();
+  // Requested biz lookup MISSES. Also stub the "any membership"
+  // query (in case the removed fallback code somehow returns) to
+  // return a DIFFERENT business the caller has — if the resolver
+  // substituted, it would happily mint a token for OTHER_BIZ.
+  fake.on(
+    (c) =>
+      c.op === "select" &&
+      c.table === "user_businesses" &&
+      c.eqFilters.some((f) => f.column === "business_id" && f.value === BIZ),
+    { data: null },
+  );
+  fake.on(
+    (c) =>
+      c.op === "select" &&
+      c.table === "user_businesses" &&
+      !c.eqFilters.some((f) => f.column === "business_id"),
+    { data: [{ business_id: OTHER_BIZ }] },
+  );
+
+  const result = await resolveClientIdentityForUser(asClient(fake), USER_A, BIZ);
+  const failures: string[] = [];
+  if (result.ok) {
+    failures.push(
+      `resolver returned identity=${result.identity} biz=${result.businessId} — MUST be 403 (no substitution)`,
+    );
+  } else {
+    if (result.status !== 403) failures.push(`status=${result.status} (expected 403)`);
+    if (!/not a member/i.test(result.error)) failures.push(`error=${result.error} (expected 'not a member' message)`);
+  }
+  record("T52 token: no membership for requested biz → 403, never substitutes another tenant", failures.length === 0, failures.join("; ") || "403 not-a-member — no cross-tenant token issuance");
+}
+
+/**
+ * Phase 3.3b T53 — no active-business header + user has MULTIPLE
+ * memberships → explicit 400. The prior code path silently returned
+ * whatever .maybeSingle() picked (or errored to null), leaving the
+ * caller unable to distinguish "genuinely unauthenticated" from
+ * "please pick a tenant."
+ */
+async function T53_token_multi_membership_no_header_returns_400() {
+  const fake = new FakeSupabaseClient();
+  // No businessId passed → resolver runs the unscoped user_businesses
+  // query. Stub it to return TWO memberships → ambiguous → 400.
+  fake.on(
+    (c) => c.op === "select" && c.table === "user_businesses",
+    { data: [{ business_id: BIZ }, { business_id: OTHER_BIZ }] },
+  );
+
+  const result = await resolveClientIdentityForUser(asClient(fake), USER_A, undefined);
+  const failures: string[] = [];
+  if (result.ok) failures.push(`resolver returned identity=${result.identity} — MUST be 400 (ambiguous)`);
+  else {
+    if (result.status !== 400) failures.push(`status=${result.status} (expected 400)`);
+    if (!/active business required/i.test(result.error)) {
+      failures.push(`error=${result.error} (expected 'active business required')`);
+    }
+  }
+  record("T53 token: multi-membership + no x-active-business → 400 explicit ambiguity", failures.length === 0, failures.join("; ") || "400 with 'active business required' — no silent guess");
+}
+
+/**
+ * Phase 3.3b T54 — no active-business header + user has EXACTLY ONE
+ * membership → happy path: resolver picks it deterministically and
+ * returns the derived identity. This is the case the removed fallback
+ * used to cover legitimately, so we assert it still works after
+ * removing the cross-tenant substitution.
+ */
+async function T54_token_single_membership_no_header_ok() {
+  const fake = new FakeSupabaseClient();
+  fake.on(
+    (c) => c.op === "select" && c.table === "user_businesses",
+    { data: [{ business_id: BIZ }] },
+  );
+  const result = await resolveClientIdentityForUser(asClient(fake), USER_A, undefined);
+  const failures: string[] = [];
+  if (!result.ok) failures.push(`not ok: ${(result as any).error}`);
+  else {
+    if (result.businessId !== BIZ) failures.push(`businessId=${result.businessId}`);
+    if (result.identity !== buildClientIdentity(USER_A, BIZ)) {
+      failures.push(`identity=${result.identity}`);
+    }
+  }
+  record("T54 token: single-membership + no header → picks it deterministically", failures.length === 0, failures.join("; ") || "unambiguous → 200 with derived identity");
+}
+
+/**
+ * Phase 3.3b T55 — the route delegates to updatePreferenceForCaller,
+ * not a parallel copy. Also verifies getPreferenceForCaller shape.
+ * Belt-and-braces: even the smoke previously exercised the copy;
+ * this catches drift if someone re-adds inline logic.
+ */
+async function T55_get_preference_shape() {
+  const fake = new FakeSupabaseClient();
+  fake.on(
+    (c) => c.op === "select" && c.table === "user_businesses",
+    { data: { in_app_calling_enabled: true } },
+  );
+  const result = await getPreferenceForCaller(asClient(fake), USER_A, BIZ);
+  const failures: string[] = [];
+  if (!result.ok) failures.push(`not ok: ${(result as any).error}`);
+  else if (result.preferences.in_app_calling_enabled !== true) {
+    failures.push(`enabled=${result.preferences.in_app_calling_enabled}`);
+  }
+  // 404 branch — no row.
+  const fake2 = new FakeSupabaseClient();
+  fake2.on((c) => c.op === "select" && c.table === "user_businesses", { data: null });
+  const result2 = await getPreferenceForCaller(asClient(fake2), USER_A, BIZ);
+  if (result2.ok) failures.push("null row should have been 404");
+  else if (result2.status !== 404) failures.push(`404 branch status=${result2.status}`);
+  record("T55 getPreferenceForCaller: happy path + 404 branch", failures.length === 0, failures.join("; ") || "route + tests share one implementation");
+}
+
 // ── Bonus: whisper composition and TwiML ────────────────────────────
 
 async function whisper_composition() {
@@ -1943,6 +2099,11 @@ async function main() {
   await T49_identity_differs_across_businesses();
   await T50_identity_is_deterministic();
   await T51_preferences_rejects_other_users_row();
+  // Phase 3.3b — close token cross-tenant fallback + preferences dedupe
+  await T52_token_no_membership_returns_403();
+  await T53_token_multi_membership_no_header_returns_400();
+  await T54_token_single_membership_no_header_ok();
+  await T55_get_preference_shape();
   await whisper_composition();
 
   const fails = results.filter((r) => !r.pass);

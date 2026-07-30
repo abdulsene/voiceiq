@@ -85,52 +85,103 @@ export interface TokenResponse {
 }
 
 /**
+ * Discriminated result for resolveClientIdentityForUser. The token
+ * route maps status → HTTP status; every failure path carries an
+ * explicit reason so we never silently substitute a different tenant.
+ *
+ * Phase 3.3b — the previous shape was `string | null`, which forced
+ * the route to guess between "no memberships" and "requested business
+ * not a member" and "multi-membership without x-active-business" —
+ * all rendered as null. The prior code path even fell back to ANY
+ * membership when the requested business row was missing, which
+ * reintroduced the exact cross-tenant condition migration 043 closed
+ * (a user could receive a token minted for a tenant they didn't ask
+ * for). Removed.
+ */
+export type IdentityResolution =
+  | { ok: true; identity: string; businessId: string }
+  | { ok: false; status: 400 | 403; error: string };
+
+/**
  * Resolve a user's Twilio Client identity for the given active
  * business.
  *
  * Phase 3.3a — the identity is derived from the (user_id, business_id)
- * pair via buildClientIdentity(). We still round-trip through the DB
- * to VERIFY the caller actually has a membership for the requested
- * business (an attacker could otherwise forge an x-active-business
- * header for a tenant they don't belong to). If the membership row
- * exists we return the deterministic identity computed by the helper;
- * we don't just echo the stored value, which would let a stale/
- * mis-shaped row in the DB silently override the canonical formula.
+ * pair via buildClientIdentity(). We round-trip through the DB to
+ * VERIFY the caller actually has a membership for the requested
+ * business — an attacker could otherwise forge an x-active-business
+ * header for a tenant they don't belong to.
  *
- * Returns null if the user has no membership for the requested
- * business AND no fallback membership at all.
+ * Phase 3.3b — three distinct failure modes, each with an explicit
+ * HTTP code:
+ *   - businessId absent + user has 0 memberships → 403 (nothing to
+ *     scope a token to)
+ *   - businessId absent + user has N>1 memberships → 400 (caller MUST
+ *     pick one via the x-active-business header; we will not guess)
+ *   - businessId provided + no matching membership → 403 (not a member
+ *     of the requested tenant; NEVER substitute)
+ * Success returns the derived identity + resolved businessId.
  */
 export async function resolveClientIdentityForUser(
   supabase: SupabaseClient,
   userId: string,
   businessId: string | undefined,
-): Promise<string | null> {
-  let query = supabase
-    .from("user_businesses")
-    .select("business_id")
-    .eq("user_id", userId);
-  if (businessId) query = query.eq("business_id", businessId);
-  const { data, error } = await query.maybeSingle();
-  const row = data as { business_id?: string } | null;
-
-  if (error || !row) {
-    if (!businessId) return null;
-    // Fallback: requested business membership missing — fall back to
-    // ANY membership so token issuance doesn't 500 for an edge-case
-    // row. Not ideal (caller sees a token for a tenant they didn't
-    // ask for) but preserves availability; auth already established
-    // that the user IS someone with memberships.
-    const { data: any } = await supabase
+): Promise<IdentityResolution> {
+  if (businessId) {
+    // Scoped lookup — (user_id, business_id) is unique so at most one row.
+    const { data, error } = await supabase
       .from("user_businesses")
       .select("business_id")
       .eq("user_id", userId)
-      .limit(1)
+      .eq("business_id", businessId)
       .maybeSingle();
-    const fallbackBiz = (any as { business_id?: string } | null)?.business_id;
-    return fallbackBiz ? buildClientIdentity(userId, fallbackBiz) : null;
+    if (error) {
+      return { ok: false, status: 403, error: "Membership lookup failed" };
+    }
+    const row = data as { business_id?: string } | null;
+    if (!row?.business_id) {
+      return {
+        ok: false,
+        status: 403,
+        error: "Not a member of the requested business",
+      };
+    }
+    return {
+      ok: true,
+      identity: buildClientIdentity(userId, row.business_id),
+      businessId: row.business_id,
+    };
   }
 
-  return row.business_id ? buildClientIdentity(userId, row.business_id) : null;
+  // No active-business hint — allowed only when the user has exactly
+  // one membership. Multi-membership users MUST pick a tenant via
+  // x-active-business; we surface that as an explicit 400 rather than
+  // silently picking one for them.
+  const { data, error } = await supabase
+    .from("user_businesses")
+    .select("business_id")
+    .eq("user_id", userId);
+  if (error) {
+    return { ok: false, status: 403, error: "Membership lookup failed" };
+  }
+  const list = (data as Array<{ business_id: string }> | null) ?? [];
+  if (list.length === 0) {
+    return { ok: false, status: 403, error: "No memberships found for this user" };
+  }
+  if (list.length > 1) {
+    return {
+      ok: false,
+      status: 400,
+      error:
+        "active business required — user has multiple memberships; send x-active-business header",
+    };
+  }
+  const bizId = list[0].business_id;
+  return {
+    ok: true,
+    identity: buildClientIdentity(userId, bizId),
+    businessId: bizId,
+  };
 }
 
 /**
@@ -179,23 +230,21 @@ router.post(
     // Identity is derived SERVER-SIDE. We deliberately do not read
     // req.body — any client-supplied identity is dropped on the floor.
     // This is the whole security model of the feature.
-    const identity = await resolveClientIdentityForUser(
+    const resolved = await resolveClientIdentityForUser(
       supabase,
       userId,
       req.businessId,
     );
-    if (!identity) {
-      res
-        .status(403)
-        .json({ error: "No client_identity on file for this user — no memberships found" });
+    if (!resolved.ok) {
+      res.status(resolved.status).json({ error: resolved.error });
       return;
     }
 
     try {
-      const { jwt, expiresAt } = mintVoiceAccessToken(identity);
+      const { jwt, expiresAt } = mintVoiceAccessToken(resolved.identity);
       const body: TokenResponse = {
         token: jwt,
-        identity,
+        identity: resolved.identity,
         expires_at: expiresAt.toISOString(),
       };
       res.json(body);
@@ -382,102 +431,51 @@ router.post(
  * preference by forging a body.
  */
 
-interface VoicePreferences {
+export interface VoicePreferences {
   in_app_calling_enabled: boolean;
 }
 
-router.get(
-  "/voice/preferences",
-  requireAuth,
-  async (req: Request, res: Response): Promise<void> => {
-    const userId = req.userId;
-    const businessId = req.businessId;
-    if (!userId || !businessId) {
-      res.status(401).json({ error: "Authentication required" });
-      return;
-    }
-    const supabase = getSupabase();
-    if (!supabase) {
-      res.status(500).json({ error: "Database not configured" });
-      return;
-    }
-    const { data } = await supabase
-      .from("user_businesses")
-      .select("in_app_calling_enabled")
-      .eq("user_id", userId)
-      .eq("business_id", businessId)
-      .maybeSingle();
-    const enabled = !!(data as { in_app_calling_enabled?: boolean } | null)
-      ?.in_app_calling_enabled;
-    const payload: VoicePreferences = { in_app_calling_enabled: enabled };
-    res.json(payload);
-  },
-);
-
-router.patch(
-  "/voice/preferences",
-  requireAuth,
-  async (req: Request, res: Response): Promise<void> => {
-    const userId = req.userId;
-    const businessId = req.businessId;
-    if (!userId || !businessId) {
-      res.status(401).json({ error: "Authentication required" });
-      return;
-    }
-    const supabase = getSupabase();
-    if (!supabase) {
-      res.status(500).json({ error: "Database not configured" });
-      return;
-    }
-    // Scope: caller's OWN membership only. We deliberately ignore any
-    // user_id / business_id fields the client might have sent — no
-    // path exists here to write another user's row.
-    const body = (req.body || {}) as Record<string, unknown>;
-    if (typeof body.in_app_calling_enabled !== "boolean") {
-      res.status(400).json({ error: "in_app_calling_enabled must be boolean" });
-      return;
-    }
-    const enabled = body.in_app_calling_enabled;
-
-    try {
-      const { data, error } = await supabase
-        .from("user_businesses")
-        .update({ in_app_calling_enabled: enabled })
-        .eq("user_id", userId)
-        .eq("business_id", businessId)
-        .select("in_app_calling_enabled")
-        .maybeSingle();
-      if (error) {
-        Sentry.captureException(error, { extra: { where: "voice.preferences.patch", userId, businessId } });
-        res.status(500).json({ error: "Failed to update preference" });
-        return;
-      }
-      if (!data) {
-        // No matching (user, biz) row — the caller isn't a member of
-        // their own claimed active business. Should not happen if
-        // requireAuth is honest; return 404 rather than silently
-        // writing 0 rows.
-        res.status(404).json({ error: "Membership not found" });
-        return;
-      }
-      const payload: VoicePreferences = {
-        in_app_calling_enabled: !!(data as { in_app_calling_enabled?: boolean })
-          .in_app_calling_enabled,
-      };
-      res.json(payload);
-    } catch (err: any) {
-      Sentry.captureException(err, { extra: { where: "voice.preferences.patch.throw", userId } });
-      res.status(500).json({ error: "Failed to update preference" });
-    }
-  },
-);
+/**
+ * Phase 3.3b — single implementation for GET /voice/preferences.
+ * Route handler delegates here; T51-style tests call it directly so
+ * we're not covering a copy. Returns 404 when the caller has no row
+ * for the requested business (requireAuth should have prevented this,
+ * but defensive).
+ */
+export async function getPreferenceForCaller(
+  supabase: SupabaseClient,
+  callerUserId: string,
+  callerBusinessId: string,
+): Promise<
+  | { ok: true; preferences: VoicePreferences }
+  | { ok: false; status: number; error: string }
+> {
+  const { data, error } = await supabase
+    .from("user_businesses")
+    .select("in_app_calling_enabled")
+    .eq("user_id", callerUserId)
+    .eq("business_id", callerBusinessId)
+    .maybeSingle();
+  if (error) return { ok: false, status: 500, error: error.message };
+  if (!data) return { ok: false, status: 404, error: "Membership not found" };
+  return {
+    ok: true,
+    preferences: {
+      in_app_calling_enabled: !!(data as { in_app_calling_enabled?: boolean })
+        .in_app_calling_enabled,
+    },
+  };
+}
 
 /**
- * Exported handler shape for the smoke test — lets us assert the
- * "reject writing another user's membership" case without booting
- * Express. The endpoint only ever touches (req.userId, req.businessId)
- * from auth middleware; a body-supplied user_id is dropped on the
- * floor. This helper embodies the same contract for tests.
+ * Phase 3.3b — single implementation for PATCH /voice/preferences.
+ * The route handler now delegates to this helper so T51 exercises the
+ * ACTUAL request path, not a parallel copy that could drift silently.
+ *
+ * Scoped to caller's OWN (user_id, business_id). Any user_id /
+ * business_id supplied in the request body is dropped on the floor —
+ * the parameters here are the caller's credentials from requireAuth,
+ * period.
  */
 export async function updatePreferenceForCaller(
   supabase: SupabaseClient,
@@ -509,6 +507,65 @@ export async function updatePreferenceForCaller(
     },
   };
 }
+
+router.get(
+  "/voice/preferences",
+  requireAuth,
+  async (req: Request, res: Response): Promise<void> => {
+    const userId = req.userId;
+    const businessId = req.businessId;
+    if (!userId || !businessId) {
+      res.status(401).json({ error: "Authentication required" });
+      return;
+    }
+    const supabase = getSupabase();
+    if (!supabase) {
+      res.status(500).json({ error: "Database not configured" });
+      return;
+    }
+    const result = await getPreferenceForCaller(supabase, userId, businessId);
+    if (!result.ok) {
+      res.status(result.status).json({ error: result.error });
+      return;
+    }
+    res.json(result.preferences);
+  },
+);
+
+router.patch(
+  "/voice/preferences",
+  requireAuth,
+  async (req: Request, res: Response): Promise<void> => {
+    const userId = req.userId;
+    const businessId = req.businessId;
+    if (!userId || !businessId) {
+      res.status(401).json({ error: "Authentication required" });
+      return;
+    }
+    const supabase = getSupabase();
+    if (!supabase) {
+      res.status(500).json({ error: "Database not configured" });
+      return;
+    }
+    try {
+      const result = await updatePreferenceForCaller(supabase, userId, businessId, req.body);
+      if (!result.ok) {
+        if (result.status >= 500) {
+          Sentry.captureMessage("voice_preferences_patch_helper_error", {
+            level: "error",
+            extra: { userId, businessId, error: result.error },
+          });
+        }
+        res.status(result.status).json({ error: result.error });
+        return;
+      }
+      res.json(result.preferences);
+    } catch (err: any) {
+      Sentry.captureException(err, { extra: { where: "voice.preferences.patch.throw", userId } });
+      res.status(500).json({ error: "Failed to update preference" });
+    }
+  },
+);
 
 // ── Heartbeat ───────────────────────────────────────────────────────
 
