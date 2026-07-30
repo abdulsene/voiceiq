@@ -27,6 +27,12 @@ import hoursRouter from "./hours";
 // Phase 3.2a: topic-aware routing webhook (invoked by Alex's
 // route_to_topic ElevenLabs tool in 3.2b).
 import routingRouter from "./routing";
+// Phase 3.3: in-app calling — Twilio Voice WebRTC softphone.
+//   POST /api/voice/token      (requireAuth)
+//   POST /api/voice/outbound   (public, Twilio-signature-verified inside)
+//   POST /api/voice/heartbeat  (requireAuth)
+// Outbound path is bypass-listed in app.ts.
+import voiceRouter from "./voice";
 import leadOutcomesRouter from "./lead-outcomes";
 import publicLeadRouter from "./public-lead";
 import twilioCallbacksRouter from "./twilio-callbacks";
@@ -121,6 +127,9 @@ router.use(hoursRouter);
 // (ELEVENLABS_TOOL_SECRET) rather than requireAuth-guarded because
 // ElevenLabs's agent is the caller. Path bypass listed in app.ts.
 router.use(routingRouter);
+// Phase 3.3: in-app calling. Mounted alongside routingRouter — same
+// slice, extends (does not replace) Phase 3.2.
+router.use(voiceRouter);
 // Slice 3A pillar 1: outcome capture per lead-call.
 //   POST /api/business/leads/:id/calls/:callSid/outcome
 // Mounted alongside leadCallsRouter — both deal with the same

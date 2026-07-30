@@ -24,8 +24,20 @@
 export interface StaffCandidate {
   /** auth.users.id — what gets written to calls.rung_user_ids / handled_by_user_id. */
   userId: string;
-  /** E.164 phone to dial. Callers MUST have filtered out nulls before passing. */
-  callbackRingNumber: string;
+  /**
+   * E.164 cell phone to dial via <Number>. Phase 3.3: nullable — a
+   * candidate is now valid with EITHER a callback number OR a live
+   * <Client> device (or both). The routing candidate query filters out
+   * rows that have neither.
+   */
+  callbackRingNumber: string | null;
+  /**
+   * Phase 3.3 — Twilio Client identity to dial via <Client>. Non-null
+   * only when the staff member has in_app_calling_enabled=true AND a
+   * fresh heartbeat (see DEVICE_FRESHNESS_SECS in routes/voice.ts).
+   * Null → dial-builder emits no <Client> for this candidate.
+   */
+  clientIdentity?: string | null;
 }
 
 export type RoutingPath =
@@ -78,9 +90,22 @@ export type TransferStatusInitial =
 
 export interface RoutingDecision {
   path: RoutingPath;
+  /**
+   * Phase 3.3 — the full ordered list of dial candidates. The dial-
+   * builder walks these and emits <Client> and/or <Number> children for
+   * each. Each candidate contributes zero, one, or two elements
+   * (candidates with only a client identity yield <Client>; candidates
+   * with only a callback number yield <Number>; candidates with both
+   * yield both, simultaneously ringing browser + cell).
+   *
+   * staffPhones/staffUserIds below are legacy projections kept for the
+   * routing UPSERT + Phase 3.2 tests. staffPhones now reflects the
+   * subset of candidates that have a non-null callbackRingNumber.
+   */
+  staffCandidates: StaffCandidate[];
   /** Phones to dial simultaneously via TwiML `<Dial><Number>...</Number></Dial>`. */
   staffPhones: string[];
-  /** auth.users.id parallel to staffPhones — logged into calls.rung_user_ids. */
+  /** auth.users.id parallel to staffCandidates — logged into calls.rung_user_ids. */
   staffUserIds: string[];
   /** Only populated on legacy_transfer path. */
   legacyPhone: string | null;
@@ -128,7 +153,8 @@ export function decideRouting(inputs: RoutingInputs): RoutingDecision {
     if (any.length > 0) {
       return {
         path: "any_on_duty",
-        staffPhones: any.map((s) => s.callbackRingNumber),
+        staffCandidates: any,
+        staffPhones: any.map((s) => s.callbackRingNumber).filter((p): p is string => !!p),
         staffUserIds: any.map((s) => s.userId),
         legacyPhone: null,
         handoffReason: "topic_no_longer_configured",
@@ -145,7 +171,8 @@ export function decideRouting(inputs: RoutingInputs): RoutingDecision {
   if (forTopic.length > 0) {
     return {
       path: "topic_match",
-      staffPhones: forTopic.map((s) => s.callbackRingNumber),
+      staffCandidates: forTopic,
+      staffPhones: forTopic.map((s) => s.callbackRingNumber).filter((p): p is string => !!p),
       staffUserIds: forTopic.map((s) => s.userId),
       legacyPhone: null,
       handoffReason: "topic_match_ringing",
@@ -158,7 +185,8 @@ export function decideRouting(inputs: RoutingInputs): RoutingDecision {
   if (any.length > 0) {
     return {
       path: "any_on_duty",
-      staffPhones: any.map((s) => s.callbackRingNumber),
+      staffCandidates: any,
+      staffPhones: any.map((s) => s.callbackRingNumber).filter((p): p is string => !!p),
       staffUserIds: any.map((s) => s.userId),
       legacyPhone: null,
       handoffReason: "fallback_any_on_duty_ringing",
@@ -177,6 +205,7 @@ function fallbackFromNoStaff(
   if (inputs.businessOpen && inputs.legacyTransferToPhone) {
     return {
       path: "legacy_transfer",
+      staffCandidates: [],
       staffPhones: [],
       staffUserIds: [],
       legacyPhone: inputs.legacyTransferToPhone,
@@ -187,6 +216,7 @@ function fallbackFromNoStaff(
   if (!inputs.businessOpen) {
     return {
       path: "after_hours_callback",
+      staffCandidates: [],
       staffPhones: [],
       staffUserIds: [],
       legacyPhone: null,
@@ -197,6 +227,7 @@ function fallbackFromNoStaff(
   // Business is open but no legacy transfer configured and nobody on-duty.
   return {
     path: "graceful_hangup",
+    staffCandidates: [],
     staffPhones: [],
     staffUserIds: [],
     legacyPhone: null,

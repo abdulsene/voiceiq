@@ -30,6 +30,13 @@ import {
   scheduleCampaignExpansionWorker,
 } from "./cron";
 import { runReconciliation } from "./lib/twilio-reconciliation";
+import { assertVoiceEnvOrThrow } from "./routes/voice";
+
+// Phase 3.3 prereq: crash loudly at boot if the in-app calling env vars
+// aren't provisioned. Silent degradation would surface as generic 500s
+// on token issuance and misleading dead-endpoint routing — much harder
+// to diagnose than a boot-time crash.
+assertVoiceEnvOrThrow();
 
 const rawPort = process.env["PORT"];
 

@@ -248,10 +248,59 @@ async function loadBusinessContext(
   };
 }
 
+/**
+ * Phase 3.3 — device presence freshness in seconds. Mirrors the value
+ * in routes/voice.ts (DEVICE_FRESHNESS_SECS = 90). Duplicated here as a
+ * local constant to keep the routing engine from cross-importing a
+ * route file (would create a dependency cycle).
+ */
+const DEVICE_FRESHNESS_SECS_ROUTING = 90;
+
+interface UserBusinessRow {
+  user_id: string;
+  callback_ring_number: string | null;
+  client_identity?: string | null;
+  in_app_calling_enabled?: boolean | null;
+  voice_device_last_seen_at?: string | null;
+}
+
+/**
+ * Phase 3.3 — decide whether a user_businesses row contributes a live
+ * <Client> leg. Returns the client_identity iff in-app calling is
+ * enabled AND the device has been seen within DEVICE_FRESHNESS_SECS.
+ * Otherwise null → the dial-builder emits no <Client> for this user.
+ */
+function liveClientIdentity(row: UserBusinessRow, now: Date = new Date()): string | null {
+  if (!row.in_app_calling_enabled) return null;
+  if (!row.client_identity) return null;
+  const last = row.voice_device_last_seen_at ? Date.parse(row.voice_device_last_seen_at) : NaN;
+  if (Number.isNaN(last)) return null;
+  const ageMs = now.getTime() - last;
+  if (ageMs > DEVICE_FRESHNESS_SECS_ROUTING * 1000) return null;
+  return row.client_identity;
+}
+
+/**
+ * Phase 3.3 — a candidate is dialable iff EITHER a callback_ring_number
+ * is set OR their device is live (returns a client identity). Anyone
+ * who matches neither is dropped from the ring list so we don't emit
+ * an empty <Client>-less <Number>-less TwiML fragment.
+ */
+function toCandidateOrNull(row: UserBusinessRow, now: Date = new Date()): StaffCandidate | null {
+  const client = liveClientIdentity(row, now);
+  if (!row.callback_ring_number && !client) return null;
+  return {
+    userId: row.user_id,
+    callbackRingNumber: row.callback_ring_number,
+    clientIdentity: client,
+  };
+}
+
 async function loadOnDutyForTopic(
   supabase: SupabaseClient,
   businessId: string,
   topicSlug: string,
+  now: Date = new Date(),
 ): Promise<StaffCandidate[]> {
   const { data: topicRows, error: topicErr } = await supabase
     .from("staff_topics")
@@ -264,31 +313,32 @@ async function loadOnDutyForTopic(
 
   const { data: ubRows, error: ubErr } = await supabase
     .from("user_businesses")
-    .select("user_id, callback_ring_number")
+    .select("user_id, callback_ring_number, client_identity, in_app_calling_enabled, voice_device_last_seen_at")
     .eq("business_id", businessId)
     .eq("is_on_duty", true)
     .in("user_id", topicUserIds);
   if (ubErr) return [];
 
-  return ((ubRows as Array<{ user_id: string; callback_ring_number: string | null }> | null) ?? [])
-    .filter((r) => r.callback_ring_number)
-    .map((r) => ({ userId: r.user_id, callbackRingNumber: r.callback_ring_number as string }));
+  return ((ubRows as UserBusinessRow[] | null) ?? [])
+    .map((r) => toCandidateOrNull(r, now))
+    .filter((c): c is StaffCandidate => c !== null);
 }
 
 async function loadOnDutyAny(
   supabase: SupabaseClient,
   businessId: string,
+  now: Date = new Date(),
 ): Promise<StaffCandidate[]> {
   const { data, error } = await supabase
     .from("user_businesses")
-    .select("user_id, callback_ring_number, on_duty_since")
+    .select("user_id, callback_ring_number, client_identity, in_app_calling_enabled, voice_device_last_seen_at, on_duty_since")
     .eq("business_id", businessId)
     .eq("is_on_duty", true)
     .order("on_duty_since", { ascending: false });
   if (error) return [];
-  return ((data as Array<{ user_id: string; callback_ring_number: string | null }> | null) ?? [])
-    .filter((r) => r.callback_ring_number)
-    .map((r) => ({ userId: r.user_id, callbackRingNumber: r.callback_ring_number as string }));
+  return ((data as UserBusinessRow[] | null) ?? [])
+    .map((r) => toCandidateOrNull(r, now))
+    .filter((c): c is StaffCandidate => c !== null);
 }
 
 // ── Handler ─────────────────────────────────────────────────────────
@@ -377,9 +427,9 @@ export async function handleRouteToTopic(
 
   const [onDutyForTopic, onDutyAny, hoursNow] = await Promise.all([
     topicConfigured
-      ? loadOnDutyForTopic(supabase, business_id, topic_slug)
+      ? loadOnDutyForTopic(supabase, business_id, topic_slug, now)
       : Promise.resolve([] as StaffCandidate[]),
-    loadOnDutyAny(supabase, business_id),
+    loadOnDutyAny(supabase, business_id, now),
     handleHoursNow(supabase, business_id, now),
   ]);
 
@@ -412,6 +462,10 @@ export async function handleRouteToTopic(
       whisperUrl,
       recordingStatusUrl: `${getPublicUrl()}/api/twilio/recording-status`,
       dialStatusUrl: `${getPublicUrl()}/api/routing/dial-status?business_id=${encodeURIComponent(business_id)}&conversation_id=${encodeURIComponent(conversation_id)}`,
+      // Phase 3.3 — pass the human-readable topic through as a
+      // <Client> CustomParameter so the softphone UI can render
+      // context ("Roadside & breakdown — incoming").
+      topicName,
     };
     twiml = buildDialTwiml(decision, dialOpts);
   }
@@ -435,21 +489,26 @@ export async function handleRouteToTopic(
   //     future readers migrating away from the call_sid alias have
   //     the value on the same row.
   try {
+    const upsertPayload: Record<string, unknown> = {
+      call_sid: conversation_id,
+      conversation_id,
+      business_id,
+      topic_slug,
+      rung_user_ids: decision.staffUserIds,
+      handoff_reason: decision.handoffReason,
+      transfer_status: decision.transferStatus,
+      direction: "inbound",
+    };
+    // Phase 3.3 — persist the real Twilio CallSid so failed-redirect
+    // forensics don't require Sentry↔Twilio-console correlation. Only
+    // written when present in the tool body (system__call_sid);
+    // omitting keeps a fresh row NULL rather than overwriting a
+    // legitimate value on re-run.
+    if (call_sid) upsertPayload.twilio_call_sid = call_sid;
+
     const { error: upsertErr } = await supabase
       .from("calls")
-      .upsert(
-        {
-          call_sid: conversation_id,
-          conversation_id,
-          business_id,
-          topic_slug,
-          rung_user_ids: decision.staffUserIds,
-          handoff_reason: decision.handoffReason,
-          transfer_status: decision.transferStatus,
-          direction: "inbound",
-        },
-        { onConflict: "call_sid" },
-      );
+      .upsert(upsertPayload, { onConflict: "call_sid" });
     if (upsertErr) {
       Sentry.captureMessage("route_to_topic_calls_upsert_failed", {
         level: "error",
@@ -584,28 +643,59 @@ export function normalizePhone(input: string | undefined | null): string {
 }
 
 /**
- * Given the answered E.164 (`To` from Twilio's Dial callback), look up
- * which auth.users.id it maps to. Uses the rung_user_ids stored on the
- * calls row from route-to-topic + a per-user callback_ring_number join.
- * Best-effort: returns null if no match (Twilio can send this callback
- * even when nobody answered).
+ * Parse a Twilio `To` field of shape `client:<identity>`. Returns the
+ * identity string, or null for any other shape (E.164, sip:, empty,
+ * non-string). Exported for tests.
+ */
+export function parseClientTo(to: string | undefined | null): string | null {
+  if (typeof to !== "string") return null;
+  const trimmed = to.trim();
+  if (!trimmed.toLowerCase().startsWith("client:")) return null;
+  const identity = trimmed.slice("client:".length).trim();
+  return identity || null;
+}
+
+/**
+ * Given the answered `To` from Twilio's Dial callback, look up which
+ * auth.users.id it maps to AND how they answered (browser vs pstn).
  *
- * Phase 3.2c — re-keyed to look up the calls row by call_sid
- * (which stores the ElevenLabs conversation_id in this codebase, per
- * migration 041 header). Phone comparison is normalized (last-10-digits)
- * to survive E.164 vs national format mismatches between Twilio's
- * callback (always E.164) and whatever the tenant admin entered in
- * their team settings.
+ * Phase 3.3 — the `To` can now be `client:<identity>` (browser Client
+ * leg won the ring) or an E.164 (cell won the ring). We MUST branch
+ * on shape first — pre-3.3 code ran the raw string through
+ * normalizePhone(), which strips non-digits, meaning
+ * "client:user_abc123def456" would collapse to "123456" and false-match
+ * ANY staff whose cell ends in those digits. That's WRONG ATTRIBUTION,
+ * not just a miss.
+ *
+ * Returns { userId, answeredVia } — answeredVia goes into
+ * calls.answered_via for downstream reporting.
  */
 async function resolveHandledByUserId(
   supabase: SupabaseClient,
   businessId: string,
   conversationId: string,
-  answeredPhone: string | undefined,
-): Promise<string | null> {
-  if (!answeredPhone) return null;
-  const targetNorm = normalizePhone(answeredPhone);
-  if (!targetNorm) return null;
+  answeredTo: string | undefined,
+): Promise<{ userId: string | null; answeredVia: "browser" | "pstn" | null }> {
+  if (!answeredTo) return { userId: null, answeredVia: null };
+
+  // Branch FIRST on client: — bypass normalizePhone entirely so a UUID
+  // can never accidentally match a cell number.
+  const clientIdentity = parseClientTo(answeredTo);
+  if (clientIdentity) {
+    const { data } = await supabase
+      .from("user_businesses")
+      .select("user_id")
+      .eq("business_id", businessId)
+      .eq("client_identity", clientIdentity)
+      .maybeSingle();
+    const userId = (data as { user_id?: string } | null)?.user_id ?? null;
+    return { userId, answeredVia: "browser" };
+  }
+
+  // PSTN path — same as Phase 3.2c: last-10-digits comparison against
+  // rung_user_ids' callback_ring_number.
+  const targetNorm = normalizePhone(answeredTo);
+  if (!targetNorm) return { userId: null, answeredVia: null };
 
   const { data: callRow } = await supabase
     .from("calls")
@@ -614,7 +704,9 @@ async function resolveHandledByUserId(
     .eq("call_sid", conversationId)
     .maybeSingle();
   const rungIds = (callRow as { rung_user_ids?: string[] } | null)?.rung_user_ids;
-  if (!Array.isArray(rungIds) || rungIds.length === 0) return null;
+  if (!Array.isArray(rungIds) || rungIds.length === 0) {
+    return { userId: null, answeredVia: "pstn" };
+  }
 
   const { data: matches } = await supabase
     .from("user_businesses")
@@ -623,7 +715,7 @@ async function resolveHandledByUserId(
     .in("user_id", rungIds);
   const match = ((matches as Array<{ user_id: string; callback_ring_number: string | null }> | null) ?? [])
     .find((r) => normalizePhone(r.callback_ring_number) === targetNorm);
-  return match?.user_id ?? null;
+  return { userId: match?.user_id ?? null, answeredVia: "pstn" };
 }
 
 /**
@@ -650,9 +742,10 @@ export async function handleDialStatus(
   if (!DialCallStatus) return { ok: false, error: "missing DialCallStatus" };
 
   const mapped = mapDialStatus(DialCallStatus);
-  const handledByUserId = mapped.transferAnswered
+  const resolved = mapped.transferAnswered
     ? await resolveHandledByUserId(supabase, business_id, conversation_id, To)
-    : null;
+    : { userId: null as string | null, answeredVia: null as "browser" | "pstn" | null };
+  const handledByUserId = resolved.userId;
 
   // Phase 3.2c — separate concerns:
   //   * transfer_status   = ALWAYS updated (this is the state machine)
@@ -675,6 +768,13 @@ export async function handleDialStatus(
   if (handledByUserId) {
     patch.handled_by_user_id = handledByUserId;
     patch.handled_at = now.toISOString();
+  }
+  // Phase 3.3 — record HOW the answering leg won the race (browser vs
+  // pstn). Written whenever the call was answered, even when we
+  // couldn't resolve WHICH user (e.g. Twilio callback with an unfamiliar
+  // client identity — still know it was a browser leg).
+  if (mapped.transferAnswered && resolved.answeredVia) {
+    patch.answered_via = resolved.answeredVia;
   }
 
   if (mapped.transferAnswered) {

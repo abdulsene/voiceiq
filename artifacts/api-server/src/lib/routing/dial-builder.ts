@@ -27,7 +27,7 @@
  * Pure — no I/O, no logging. XML-escapes every dynamic value.
  */
 
-import type { RoutingDecision } from "./fallback-logic";
+import type { RoutingDecision, StaffCandidate } from "./fallback-logic";
 
 export interface DialBuilderOptions {
   /**
@@ -53,6 +53,13 @@ export interface DialBuilderOptions {
    * HTTP round-trip.
    */
   timeoutSecs?: number;
+  /**
+   * Phase 3.3 — pass-through the human-readable topic name so the
+   * in-app softphone UI can show WHY they're being rung. Emitted as a
+   * <Parameter name="topic_name"> child under each <Client>. Ignored
+   * for <Number> (custom parameters only work with Twilio Client).
+   */
+  topicName?: string | null;
 }
 
 const XML_ESCAPES: Record<string, string> = {
@@ -75,6 +82,40 @@ function renderNumber(phone: string, whisperUrl: string | null): string {
     return `<Number url="${xmlEscape(whisperUrl)}">${xmlEscape(phone)}</Number>`;
   }
   return `<Number>${xmlEscape(phone)}</Number>`;
+}
+
+/**
+ * Phase 3.3 — render <Client> child. Same whisper hook as <Number>
+ * (Twilio applies the url= to both leg types identically). Custom
+ * <Parameter> children are surfaced to the SDK as CustomParameters on
+ * the incoming call event, letting the softphone UI show topic context.
+ */
+function renderClient(
+  identity: string,
+  whisperUrl: string | null,
+  topicName: string | null | undefined,
+): string {
+  const attrs = whisperUrl ? ` url="${xmlEscape(whisperUrl)}"` : "";
+  const params = topicName
+    ? `<Parameter name="topic_name" value="${xmlEscape(topicName)}"/>`
+    : "";
+  return `<Client${attrs}><Identity>${xmlEscape(identity)}</Identity>${params}</Client>`;
+}
+
+/**
+ * Phase 3.3 — walk one candidate. Emits <Client>, <Number>, or BOTH
+ * depending on which fields are populated. Empty when neither is set
+ * (caller should have filtered at the query layer, but defensive).
+ */
+function renderCandidate(
+  c: StaffCandidate,
+  whisperUrl: string | null,
+  topicName: string | null | undefined,
+): string {
+  const parts: string[] = [];
+  if (c.clientIdentity) parts.push(renderClient(c.clientIdentity, whisperUrl, topicName));
+  if (c.callbackRingNumber) parts.push(renderNumber(c.callbackRingNumber, whisperUrl));
+  return parts.join("");
 }
 
 /**
@@ -113,17 +154,25 @@ export function buildDialTwiml(
   decision: RoutingDecision,
   opts: DialBuilderOptions,
 ): string {
-  let numbers: string[];
+  let children: string[];
   switch (decision.path) {
     case "topic_match":
-    case "any_on_duty":
-      if (decision.staffPhones.length === 0) {
+    case "any_on_duty": {
+      // Phase 3.3: candidates can contribute <Client>, <Number>, or
+      // both. Pre-3.3 code required a non-null callbackRingNumber for
+      // every candidate — now a candidate with only a live device is
+      // valid too. Reject only when NOTHING resolves.
+      const rendered = decision.staffCandidates
+        .map((c) => renderCandidate(c, opts.whisperUrl, opts.topicName ?? null))
+        .filter((s) => s.length > 0);
+      if (rendered.length === 0) {
         throw new Error(
-          `buildDialTwiml: path=${decision.path} but staffPhones is empty`,
+          `buildDialTwiml: path=${decision.path} but no dialable candidates (client + number both empty)`,
         );
       }
-      numbers = decision.staffPhones.map((p) => renderNumber(p, opts.whisperUrl));
+      children = rendered;
       break;
+    }
     case "legacy_transfer":
       if (!decision.legacyPhone) {
         throw new Error(
@@ -132,7 +181,7 @@ export function buildDialTwiml(
       }
       // Whisper still applies to legacy — the phone-number owner is
       // still a human answerer who benefits from context.
-      numbers = [renderNumber(decision.legacyPhone, opts.whisperUrl)];
+      children = [renderNumber(decision.legacyPhone, opts.whisperUrl)];
       break;
     case "after_hours_callback":
     case "graceful_hangup":
@@ -146,7 +195,7 @@ export function buildDialTwiml(
   }
 
   const attrs = renderDialAttrs(opts);
-  return `<?xml version="1.0" encoding="UTF-8"?><Response><Dial ${attrs}>${numbers.join("")}</Dial></Response>`;
+  return `<?xml version="1.0" encoding="UTF-8"?><Response><Dial ${attrs}>${children.join("")}</Dial></Response>`;
 }
 
 /**

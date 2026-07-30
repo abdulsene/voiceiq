@@ -20,6 +20,10 @@
 import { useEffect, useMemo, useState } from "react";
 import { Link } from "wouter";
 import { useTranslation } from "react-i18next";
+// Phase 3.3: click-to-call via the WebRTC softphone. Falls back to
+// tel: link when the softphone isn't registered so no capability
+// regression on staff who haven't opted in.
+import { useSoftphone } from "../../components/Softphone";
 import {
   AlertTriangle,
   ArrowUpRight,
@@ -134,6 +138,7 @@ function channelIcon(channel: string | null) {
 export default function LeadsListPage() {
   const apiBase = "business";
   const { t } = useTranslation();
+  const softphone = useSoftphone();
   // Initial tab from ?tab= query param. When unset, `tab` stays null until
   // the counts fetch resolves so smartDefault() can pick the most useful
   // bucket — avoids the "1 lead invisible on landing because owner is
@@ -388,7 +393,18 @@ export default function LeadsListPage() {
                         {lead.contact_phone && (
                           <a
                             href={`tel:${lead.contact_phone}`}
-                            onClick={(e) => e.stopPropagation()}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              // Phase 3.3: if the WebRTC softphone is
+                              // registered, place the call in-browser
+                              // instead of handing off to the OS tel:
+                              // handler. Non-registered users fall
+                              // through to the native handler.
+                              if (softphone.status === "registered" && lead.contact_phone) {
+                                e.preventDefault();
+                                void softphone.callNumber(lead.contact_phone);
+                              }
+                            }}
                             className="text-xs text-[#2E75B6] hover:underline font-mono"
                           >
                             {lead.contact_phone}

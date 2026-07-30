@@ -68,6 +68,11 @@ import EmailVerificationScreen from "./components/EmailVerificationScreen";
 // via its own useLocation() check (see ChatWidget.tsx HIDE_EXACT /
 // HIDE_PREFIX).
 import ChatWidget from "./components/ChatWidget";
+// Phase 3.3: WebRTC softphone provider. Mounted inside AuthGuard so
+// the Twilio Device only boots for authenticated users; renders a
+// bottom-right dock + top-center incoming/active call banners. Exposes
+// useSoftphone() for click-to-call from leads/calls pages.
+import { SoftphoneProvider } from "./components/Softphone";
 // GDPR cookie consent (CookieYes). Renders nothing — only toggles a
 // CSS class on <html> based on route so the CookieYes banner UI is
 // suppressed on auth/contact forms and inside the authenticated
@@ -611,6 +616,7 @@ function DashboardLayout() {
   return (
     <AuthGuard>
       <LocationProvider>
+       <SoftphoneProvider>
         <div className="flex min-h-screen bg-[#f0f2f5]">
           <Sidebar />
           <main className="flex-1 min-w-0 md:ml-[220px] overflow-y-auto min-h-screen">
@@ -708,6 +714,7 @@ function DashboardLayout() {
             dashboard wrapper so toasts only render on authenticated
             routes, not on marketing/auth pages. */}
         <SonnerToaster position="bottom-right" richColors />
+       </SoftphoneProvider>
       </LocationProvider>
     </AuthGuard>
   );

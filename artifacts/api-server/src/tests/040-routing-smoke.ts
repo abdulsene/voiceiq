@@ -46,6 +46,19 @@
  *   T32 buildRouteToTopicTool: uses dynamic_variable for system__call_sid
  *   T33 renderPromptFromHelpers: DEPARTMENTS section renders topics correctly
  *
+ *   3.3 additions (in-app calling — WebRTC softphone):
+ *   T38 <Client>-only TwiML shape (identity + topic_name Parameter, no <Number>)
+ *   T39 mixed Client+Number simultaneous ring (3 staff → 2 <Client> + 2 <Number>)
+ *   T40 client:<identity> handled_by resolution + answered_via=browser + no phone lookup
+ *   T41 false-match regression: client:<uuid> never resolves via phone matching
+ *   T42 twilio_call_sid persisted on routing UPSERT (distinct from calls.call_sid)
+ *   T43 stale heartbeat drops in-app-only candidate from routing
+ *   T44 token endpoint identity derived server-side (client-supplied ignored)
+ *   T45 parseClientTo / parseClientFrom: shape parsing + rejections
+ *   T46 outbound TwiML shape: callerId + answerOnBridge + <Number> + XML escape
+ *   T47 resolveBusinessForClient: identity → (business_id, twilio_phone_number)
+ *   T48 mintVoiceAccessToken: JWT payload has identity + VoiceGrant
+ *
  * Run: pnpm --filter @workspace/api-server exec tsx \
  *        src/tests/040-routing-smoke.ts
  */
@@ -68,8 +81,17 @@ import {
   parseRouteBody,
   normalizePhone,
   promoteHandoffReasonOnAnswer,
+  parseClientTo,
   type TwilioCallControl,
 } from "../routes/routing";
+// Phase 3.3
+import {
+  parseClientFrom,
+  resolveClientIdentityForUser,
+  resolveBusinessForClient,
+  buildOutboundDialTwiml,
+  mintVoiceAccessToken,
+} from "../routes/voice";
 import { buildRouteToTopicTool } from "../agents";
 import { renderPromptFromHelpers } from "../lib/prompt-renderer";
 
@@ -1307,6 +1329,431 @@ async function T37_zero_match_upsert_creates_row() {
   record("T37 UPSERT bootstraps row when post-call webhook hasn't fired", failures.length === 0, failures.join("; ") || "upsert with complete payload + onConflict=call_sid — Blocker 1 fix");
 }
 
+// ── Phase 3.3: in-app calling (WebRTC softphone) ────────────────────
+
+const CLIENT_A = "user_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const CLIENT_B = "user_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const FRESH_HB = () => new Date().toISOString();
+const STALE_HB = () => new Date(Date.now() - 5 * 60_000).toISOString();
+
+/**
+ * Phase 3.3 T38 — <Client> TwiML shape: a candidate with
+ * in_app_calling_enabled + fresh heartbeat renders as
+ * <Client><Identity>...</Identity><Parameter name="topic_name" .../></Client>
+ * with no <Number> child.
+ */
+async function T38_client_only_twiml_shape() {
+  const fake = new FakeSupabaseClient();
+  stubDefaultBusiness(fake);
+  stubStaffTopics(fake, [{ user_id: USER_A, topic_slug: TOPIC_ROADSIDE }]);
+  fake.on(
+    (c) => c.op === "select" && c.table === "user_businesses",
+    {
+      data: [
+        {
+          user_id: USER_A,
+          callback_ring_number: null,
+          client_identity: CLIENT_A,
+          in_app_calling_enabled: true,
+          voice_device_last_seen_at: FRESH_HB(),
+        },
+      ],
+    },
+  );
+
+  const result = await handleRouteToTopic(asClient(fake), baseBody);
+  const failures: string[] = [];
+  if (!result.ok) failures.push(`not ok: ${(result as any).error}`);
+  else {
+    const twiml = result.result.twiml || "";
+    if (!/<Client(\s|>)/.test(twiml)) failures.push("<Client> element missing");
+    if (!twiml.includes(`<Identity>${CLIENT_A}</Identity>`)) failures.push("identity missing from <Identity>");
+    if (!/<Parameter name="topic_name"/.test(twiml)) failures.push("topic_name Parameter missing");
+    // Must NOT have <Number> — candidate has no callback_ring_number.
+    if (/<Number/.test(twiml)) failures.push("unexpected <Number> for client-only candidate");
+    if (result.result.decision.staffCandidates[0]?.clientIdentity !== CLIENT_A) {
+      failures.push("staffCandidates[0].clientIdentity != CLIENT_A");
+    }
+  }
+  record("T38 <Client>-only TwiML: identity + topic_name Parameter, no <Number>", failures.length === 0, failures.join("; ") || "in-app-only staff renders <Client><Identity><Parameter>...</Client>");
+}
+
+/**
+ * Phase 3.3 T39 — mixed Client + Number simulring: one staff with both,
+ * another with only cell, another with only client — TwiML contains all
+ * three legs so browser + PSTN ring in parallel.
+ */
+async function T39_mixed_client_number_simulring() {
+  const fake = new FakeSupabaseClient();
+  stubDefaultBusiness(fake);
+  stubStaffTopics(fake, [
+    { user_id: USER_A, topic_slug: TOPIC_ROADSIDE },
+    { user_id: USER_B, topic_slug: TOPIC_ROADSIDE },
+    { user_id: USER_C, topic_slug: TOPIC_ROADSIDE },
+  ]);
+  fake.on(
+    (c) => c.op === "select" && c.table === "user_businesses",
+    {
+      data: [
+        // A: both — expect <Client> AND <Number>
+        {
+          user_id: USER_A,
+          callback_ring_number: PHONE_A,
+          client_identity: CLIENT_A,
+          in_app_calling_enabled: true,
+          voice_device_last_seen_at: FRESH_HB(),
+        },
+        // B: cell only — expect <Number> only
+        {
+          user_id: USER_B,
+          callback_ring_number: PHONE_B,
+          client_identity: CLIENT_B,
+          in_app_calling_enabled: false,
+          voice_device_last_seen_at: null,
+        },
+        // C: client only — expect <Client> only
+        {
+          user_id: USER_C,
+          callback_ring_number: null,
+          client_identity: "user_cccccccccccccccccccccccccccccccc",
+          in_app_calling_enabled: true,
+          voice_device_last_seen_at: FRESH_HB(),
+        },
+      ],
+    },
+  );
+
+  const result = await handleRouteToTopic(asClient(fake), baseBody);
+  const failures: string[] = [];
+  if (!result.ok) failures.push(`not ok: ${(result as any).error}`);
+  else {
+    const twiml = result.result.twiml || "";
+    const clientCount = (twiml.match(/<Client(\s|>)/g) || []).length;
+    const numberCount = (twiml.match(/<Number/g) || []).length;
+    if (clientCount !== 2) failures.push(`<Client> count=${clientCount} (expected 2 — A and C)`);
+    if (numberCount !== 2) failures.push(`<Number> count=${numberCount} (expected 2 — A and B)`);
+    if (!twiml.includes(CLIENT_A)) failures.push("A's client identity missing");
+    if (!twiml.includes(PHONE_A)) failures.push("A's phone missing");
+    if (!twiml.includes(PHONE_B)) failures.push("B's phone missing");
+  }
+  record("T39 mixed Client+Number simulring: 3 staff yield 2 <Client> + 2 <Number>", failures.length === 0, failures.join("; ") || "browser + cell ring in parallel per staff config");
+}
+
+/**
+ * Phase 3.3 T40 — client:<identity> handled_by resolution. Answered
+ * `To=client:user_xxx` must resolve to the auth.users.id via
+ * user_businesses.client_identity, and calls.answered_via='browser'.
+ */
+async function T40_client_identity_handled_by() {
+  const fake = new FakeSupabaseClient();
+  // Lookup by client_identity (Phase 3.3 code path). No rung_user_ids
+  // read, no callback_ring_number lookup — pure identity match.
+  fake.on(
+    (c) =>
+      c.op === "select" &&
+      c.table === "user_businesses" &&
+      c.eqFilters.some((f) => f.column === "client_identity"),
+    { data: { user_id: USER_A } },
+  );
+  fake.on((c) => c.op === "update" && c.table === "calls", { data: { id: CALL_ID } });
+  // Handoff-reason select for _ringing → _answered promotion.
+  fake.on(
+    (c) => c.op === "select" && c.table === "calls" && c.selectColumns === "handoff_reason",
+    { data: { handoff_reason: "topic_match_ringing" } },
+  );
+
+  const result = await handleDialStatus(asClient(fake), {
+    business_id: BIZ,
+    conversation_id: CONV,
+    DialCallStatus: "completed",
+    To: `client:${CLIENT_A}`,
+  });
+  const failures: string[] = [];
+  if (!result.ok) failures.push(`not ok: ${(result as any).error}`);
+  else if (result.handledByUserId !== USER_A) failures.push(`handled_by=${result.handledByUserId}`);
+  const update = fake.calls.find((c) => c.op === "update" && c.table === "calls");
+  if (update?.payload?.handled_by_user_id !== USER_A) failures.push(`update handled_by=${update?.payload?.handled_by_user_id}`);
+  if (update?.payload?.answered_via !== "browser") failures.push(`update answered_via=${update?.payload?.answered_via} (expected browser)`);
+  // Ensure NO phone-based rung_user_ids lookup happened — client: path
+  // must skip that entirely.
+  const rungLookup = fake.calls.find((c) => c.op === "select" && c.table === "calls" && c.selectColumns === "rung_user_ids");
+  if (rungLookup) failures.push("rung_user_ids lookup fired on client: path (should be short-circuited)");
+  record("T40 client:<identity> resolves via client_identity + answered_via=browser + skips phone lookup", failures.length === 0, failures.join("; ") || "browser leg resolves without phone-normalization");
+}
+
+/**
+ * Phase 3.3 T41 — false-match regression. A client:<uuid> To must NOT
+ * resolve via last-10-digits phone comparison. Pre-3.3 code stripped
+ * non-digits from `client:user_abc123def456...` and could match a
+ * staff cell ending in "123456". Verify that pathway is now dead.
+ */
+async function T41_false_match_regression() {
+  const fake = new FakeSupabaseClient();
+  // Craft a client identity whose last 10 digits look like a phone
+  // number (would false-match if the code ran normalizePhone on it).
+  const evilClientId = "user_ab4155551234cd";
+  // NO row for this identity — client_identity lookup returns nothing.
+  fake.on(
+    (c) =>
+      c.op === "select" &&
+      c.table === "user_businesses" &&
+      c.eqFilters.some((f) => f.column === "client_identity"),
+    { data: null },
+  );
+  // Populate rung_user_ids + user_businesses with USER_B whose phone
+  // ends in 4155551234. If the buggy pre-3.3 path ran, this would
+  // false-match B.
+  fake.on(
+    (c) => c.op === "select" && c.table === "calls" && c.selectColumns === "rung_user_ids",
+    { data: { rung_user_ids: [USER_B] } },
+  );
+  fake.on(
+    (c) => c.op === "select" && c.table === "user_businesses" && c.inFilters.some((f) => f.column === "user_id"),
+    { data: [{ user_id: USER_B, callback_ring_number: "+14155551234" }] },
+  );
+  fake.on(
+    (c) => c.op === "select" && c.table === "calls" && c.selectColumns === "handoff_reason",
+    { data: { handoff_reason: "topic_match_ringing" } },
+  );
+  fake.on((c) => c.op === "update" && c.table === "calls", { data: { id: CALL_ID } });
+
+  const result = await handleDialStatus(asClient(fake), {
+    business_id: BIZ,
+    conversation_id: CONV,
+    DialCallStatus: "completed",
+    To: `client:${evilClientId}`,
+  });
+  const failures: string[] = [];
+  if (!result.ok) failures.push(`not ok: ${(result as any).error}`);
+  else if (result.handledByUserId === USER_B) failures.push(`false-match: resolved to USER_B via phone normalization of a client: uri`);
+  const update = fake.calls.find((c) => c.op === "update" && c.table === "calls");
+  if (update?.payload?.handled_by_user_id === USER_B) failures.push("update wrote USER_B handled_by from evil client: (regression)");
+  // answered_via should still be browser (we saw a client: prefix even
+  // if we couldn't map it to a user).
+  if (update?.payload?.answered_via !== "browser") failures.push(`update answered_via=${update?.payload?.answered_via} (expected browser)`);
+  record("T41 false-match regression: client:<uuid> never resolves via phone matching", failures.length === 0, failures.join("; ") || "client: bypasses normalizePhone entirely");
+}
+
+/**
+ * Phase 3.3 T42 — twilio_call_sid persisted on the routing UPSERT so
+ * failed-redirect forensics don't require Sentry↔Twilio-console
+ * hand-correlation.
+ */
+async function T42_twilio_call_sid_upsert() {
+  const fake = new FakeSupabaseClient();
+  stubDefaultBusiness(fake);
+  stubStaffTopics(fake, [{ user_id: USER_A, topic_slug: TOPIC_ROADSIDE }]);
+  stubUserBusinessesOnDuty(fake, [{ user_id: USER_A, callback_ring_number: PHONE_A }]);
+
+  const result = await handleRouteToTopic(asClient(fake), {
+    ...baseBody,
+    call_sid: "CA_twilio_test_42",
+  });
+  const failures: string[] = [];
+  if (!result.ok) failures.push(`not ok: ${(result as any).error}`);
+  const upsert = fake.calls.find((c) => c.op === "upsert" && c.table === "calls");
+  if (upsert?.payload?.twilio_call_sid !== "CA_twilio_test_42") {
+    failures.push(`payload twilio_call_sid=${upsert?.payload?.twilio_call_sid} (expected CA_twilio_test_42)`);
+  }
+  // call_sid remains the conversation_id (per migration 041 historical alias).
+  if (upsert?.payload?.call_sid !== CONV) failures.push(`payload call_sid=${upsert?.payload?.call_sid} (should still be conversation_id)`);
+  record("T42 twilio_call_sid written on UPSERT (distinct from calls.call_sid)", failures.length === 0, failures.join("; ") || "both columns coexist without conflation");
+}
+
+/**
+ * Phase 3.3 T43 — device freshness gate. A staff member with
+ * in_app_calling_enabled=true but a STALE heartbeat (>90s ago) AND no
+ * callback_ring_number is dropped from the candidate list — otherwise
+ * routing would ring a dead <Client>.
+ */
+async function T43_stale_heartbeat_drops_candidate() {
+  const fake = new FakeSupabaseClient();
+  stubDefaultBusiness(fake);
+  stubStaffTopics(fake, [
+    { user_id: USER_A, topic_slug: TOPIC_ROADSIDE },
+    { user_id: USER_B, topic_slug: TOPIC_ROADSIDE },
+  ]);
+  fake.on(
+    (c) => c.op === "select" && c.table === "user_businesses",
+    {
+      data: [
+        // A: stale heartbeat + no callback → dropped
+        {
+          user_id: USER_A,
+          callback_ring_number: null,
+          client_identity: CLIENT_A,
+          in_app_calling_enabled: true,
+          voice_device_last_seen_at: STALE_HB(),
+        },
+        // B: fresh heartbeat → kept
+        {
+          user_id: USER_B,
+          callback_ring_number: null,
+          client_identity: CLIENT_B,
+          in_app_calling_enabled: true,
+          voice_device_last_seen_at: FRESH_HB(),
+        },
+      ],
+    },
+  );
+
+  const result = await handleRouteToTopic(asClient(fake), baseBody);
+  const failures: string[] = [];
+  if (!result.ok) failures.push(`not ok: ${(result as any).error}`);
+  else {
+    const cands = result.result.decision.staffCandidates;
+    if (cands.length !== 1) failures.push(`candidate count=${cands.length} (expected 1 — A dropped for stale HB)`);
+    else if (cands[0].userId !== USER_B) failures.push(`kept wrong user: ${cands[0].userId}`);
+  }
+  record("T43 stale heartbeat drops in-app-only candidate", failures.length === 0, failures.join("; ") || "unregistered device is unavailable in routing candidate query");
+}
+
+/**
+ * Phase 3.3 T44 — token endpoint identity is derived server-side from
+ * the JWT session, NEVER from the request. Assert
+ * resolveClientIdentityForUser returns the row's client_identity
+ * regardless of what the client sent.
+ */
+async function T44_token_identity_ignores_client_supplied() {
+  const fake = new FakeSupabaseClient();
+  fake.on(
+    (c) => c.op === "select" && c.table === "user_businesses",
+    { data: { client_identity: CLIENT_A, business_id: BIZ } },
+  );
+  const identity = await resolveClientIdentityForUser(asClient(fake), USER_A, BIZ);
+  const failures: string[] = [];
+  if (identity !== CLIENT_A) failures.push(`identity=${identity}`);
+  // Sanity: the query MUST be filtered by user_id (the authenticated
+  // caller), not by anything the caller could have influenced.
+  const q = fake.calls.find((c) => c.op === "select" && c.table === "user_businesses");
+  if (!q?.eqFilters.some((f) => f.column === "user_id" && f.value === USER_A)) {
+    failures.push("resolver did not filter by user_id (server-side JWT identity)");
+  }
+  record("T44 token endpoint identity derived server-side (client-supplied ignored)", failures.length === 0, failures.join("; ") || "resolveClientIdentityForUser scopes by userId from JWT");
+}
+
+/**
+ * Phase 3.3 T45 — parseClientTo / parseClientFrom shape parsing.
+ * Round-trips valid client: URIs; rejects everything else.
+ */
+async function T45_parse_client_uris() {
+  const failures: string[] = [];
+  const toCases: Array<{ input: any; want: string | null; label: string }> = [
+    { input: "client:user_abc", want: "user_abc", label: "basic" },
+    { input: "  client:user_xyz  ", want: "user_xyz", label: "trim outer" },
+    { input: "CLIENT:user_upper", want: "user_upper", label: "case-insensitive prefix" },
+    { input: "+14155551234", want: null, label: "E.164 → null" },
+    { input: "client:", want: null, label: "empty identity → null" },
+    { input: "", want: null, label: "empty" },
+    { input: null, want: null, label: "null" },
+    { input: undefined, want: null, label: "undefined" },
+    { input: 12345, want: null, label: "non-string" },
+  ];
+  for (const c of toCases) {
+    const got = parseClientTo(c.input as any);
+    if (got !== c.want) failures.push(`parseClientTo[${c.label}] got=${JSON.stringify(got)} want=${JSON.stringify(c.want)}`);
+    // parseClientFrom is stricter than parseClientTo — Twilio's outbound
+    // TwiML app always sends a cleanly-formatted `From` (lowercase
+    // `client:` prefix, no outer whitespace). Skip the lenient variants
+    // that don't apply to the real request shape.
+    if (c.label === "case-insensitive prefix" || c.label === "trim outer") continue;
+    const gotFrom = parseClientFrom(c.input as any);
+    if (gotFrom !== c.want) {
+      failures.push(`parseClientFrom[${c.label}] got=${JSON.stringify(gotFrom)} want=${JSON.stringify(c.want)}`);
+    }
+  }
+  record("T45 parseClientTo / parseClientFrom: shape parsing + rejections", failures.length === 0, failures.join("; ") || "client: uris parsed, others null");
+}
+
+/**
+ * Phase 3.3 T46 — outbound TwiML shape: buildOutboundDialTwiml renders
+ * <Dial callerId="..."><Number>To</Number></Dial>. Regression guard on
+ * XML escaping too.
+ */
+async function T46_outbound_twiml_shape() {
+  const failures: string[] = [];
+  const t = buildOutboundDialTwiml("+18005551234", "+14155559999");
+  if (!/<Dial callerId="\+18005551234"/.test(t)) failures.push("missing callerId attr");
+  if (!/answerOnBridge="true"/.test(t)) failures.push("missing answerOnBridge");
+  if (!/<Number>\+14155559999<\/Number>/.test(t)) failures.push("missing <Number> child");
+  // XML escape check.
+  const t2 = buildOutboundDialTwiml("+18005551234", "+1&<test>");
+  if (!/&amp;&lt;test&gt;/.test(t2)) failures.push("XML escaping broken");
+  record("T46 outbound TwiML shape + XML escape", failures.length === 0, failures.join("; ") || "callerId + answerOnBridge + <Number> + escape");
+}
+
+/**
+ * Phase 3.3 T47 — outbound caller ID must match business's provisioned
+ * number. resolveBusinessForClient returns the business + phone; the
+ * webhook rejects mismatched callerId inside the handler. This test
+ * asserts the resolver contract.
+ */
+async function T47_outbound_business_resolver() {
+  const fake = new FakeSupabaseClient();
+  fake.on(
+    (c) =>
+      c.op === "select" &&
+      c.table === "user_businesses" &&
+      c.eqFilters.some((f) => f.column === "client_identity"),
+    { data: [{ business_id: BIZ }] },
+  );
+  fake.on(
+    (c) => c.op === "select" && c.table === "business_configs",
+    { data: { twilio_phone_number: "+18005551234", phone_number: null } },
+  );
+  const biz = await resolveBusinessForClient(asClient(fake), CLIENT_A);
+  const failures: string[] = [];
+  if (!biz) failures.push("resolver returned null");
+  else {
+    if (biz.businessId !== BIZ) failures.push(`businessId=${biz.businessId}`);
+    if (biz.twilioPhoneNumber !== "+18005551234") failures.push(`twilioNumber=${biz.twilioPhoneNumber}`);
+  }
+  record("T47 resolveBusinessForClient returns business + phone", failures.length === 0, failures.join("; ") || "identity → (business_id, twilio_phone_number)");
+}
+
+/**
+ * Phase 3.3 T48 — mintVoiceAccessToken produces a valid JWT with the
+ * identity claim. Requires env vars; skipped when not set (won't fail
+ * CI in stripped-down envs).
+ */
+async function T48_mint_access_token() {
+  const failures: string[] = [];
+  if (
+    !process.env.TWILIO_ACCOUNT_SID ||
+    !process.env.TWILIO_API_KEY_SID ||
+    !process.env.TWILIO_API_KEY_SECRET ||
+    !process.env.TWILIO_TWIML_APP_SID
+  ) {
+    // Inject test-only env for the minter — real values not needed
+    // since we only decode the JWT payload locally.
+    process.env.TWILIO_ACCOUNT_SID = "ACtest";
+    process.env.TWILIO_API_KEY_SID = "SKtest";
+    process.env.TWILIO_API_KEY_SECRET = "secret_test_1234567890";
+    process.env.TWILIO_TWIML_APP_SID = "APtest";
+  }
+  try {
+    const { jwt, expiresAt } = mintVoiceAccessToken(CLIENT_A);
+    if (typeof jwt !== "string" || jwt.split(".").length !== 3) {
+      failures.push(`jwt shape wrong: ${jwt?.slice(0, 30)}`);
+    }
+    // Decode payload (middle segment, base64url) — twilio SDK uses HS256.
+    const payloadJson = Buffer.from(jwt.split(".")[1], "base64url").toString("utf8");
+    const payload = JSON.parse(payloadJson);
+    if (payload.grants?.identity !== CLIENT_A) {
+      failures.push(`identity in payload=${payload.grants?.identity}`);
+    }
+    if (!payload.grants?.voice) failures.push("voice grant missing");
+    if (payload.grants?.voice?.incoming?.allow !== true) failures.push("incomingAllow not set");
+    if (payload.grants?.voice?.outgoing?.application_sid !== "APtest") {
+      failures.push(`outgoingAppSid=${payload.grants?.voice?.outgoing?.application_sid}`);
+    }
+    if (expiresAt.getTime() <= Date.now()) failures.push("expiresAt in the past");
+  } catch (e) {
+    failures.push(`threw: ${(e as Error).message}`);
+  }
+  record("T48 mintVoiceAccessToken: JWT w/ identity + VoiceGrant", failures.length === 0, failures.join("; ") || "identity + voice grant + expiry all present");
+}
+
 // ── Bonus: whisper composition and TwiML ────────────────────────────
 
 async function whisper_composition() {
@@ -1368,6 +1815,18 @@ async function main() {
   await T35_normalize_phone();
   await T36_promote_handoff_reason();
   await T37_zero_match_upsert_creates_row();
+  // Phase 3.3 — in-app calling (WebRTC softphone)
+  await T38_client_only_twiml_shape();
+  await T39_mixed_client_number_simulring();
+  await T40_client_identity_handled_by();
+  await T41_false_match_regression();
+  await T42_twilio_call_sid_upsert();
+  await T43_stale_heartbeat_drops_candidate();
+  await T44_token_identity_ignores_client_supplied();
+  await T45_parse_client_uris();
+  await T46_outbound_twiml_shape();
+  await T47_outbound_business_resolver();
+  await T48_mint_access_token();
   await whisper_composition();
 
   const fails = results.filter((r) => !r.pass);

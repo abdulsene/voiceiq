@@ -177,6 +177,11 @@ const AUTH_BYPASS_PATTERNS = [
   // callback wired in 3.2b. Bypass now so the URL is claimable when the
   // handler ships. Signature verification happens inside the handler.
   /^\/api\/routing\/dial-status$/,
+  // Phase 3.3: /api/voice/outbound is the TwiML App webhook Twilio hits
+  // when the browser Device places an outbound call. Signature verified
+  // inside the handler. /api/voice/token and /api/voice/heartbeat are
+  // requireAuth-guarded and NOT bypass-listed.
+  /^\/api\/voice\/outbound$/,
   // Slice 3A pillar 3: customer trust portal. GET /api/public/lead/:token
   // and POST /api/public/lead/:token/action. Token IS the credential
   // (HS256-signed by lib/trust-portal-token.ts). Tight regex so future
