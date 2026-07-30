@@ -77,6 +77,10 @@ import {
 } from "../lib/routing/dial-builder";
 import { handleHoursNow } from "./hours";
 import { verifyTwilioSignature } from "../lib/twilio-signature";
+// Phase 3.3a — moved to lib/ so both this router and routes/voice.ts
+// can import the same value (was previously duplicated locally as
+// DEVICE_FRESHNESS_SECS_ROUTING).
+import { DEVICE_FRESHNESS_SECS } from "../lib/routing/constants";
 
 const router = Router();
 
@@ -248,14 +252,6 @@ async function loadBusinessContext(
   };
 }
 
-/**
- * Phase 3.3 — device presence freshness in seconds. Mirrors the value
- * in routes/voice.ts (DEVICE_FRESHNESS_SECS = 90). Duplicated here as a
- * local constant to keep the routing engine from cross-importing a
- * route file (would create a dependency cycle).
- */
-const DEVICE_FRESHNESS_SECS_ROUTING = 90;
-
 interface UserBusinessRow {
   user_id: string;
   callback_ring_number: string | null;
@@ -276,7 +272,7 @@ function liveClientIdentity(row: UserBusinessRow, now: Date = new Date()): strin
   const last = row.voice_device_last_seen_at ? Date.parse(row.voice_device_last_seen_at) : NaN;
   if (Number.isNaN(last)) return null;
   const ageMs = now.getTime() - last;
-  if (ageMs > DEVICE_FRESHNESS_SECS_ROUTING * 1000) return null;
+  if (ageMs > DEVICE_FRESHNESS_SECS * 1000) return null;
   return row.client_identity;
 }
 

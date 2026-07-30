@@ -41,16 +41,15 @@ import twilio from "twilio";
 
 import { requireAuth } from "../middlewares/auth";
 import { verifyTwilioSignature } from "../lib/twilio-signature";
+import { buildClientIdentity } from "../lib/voice/client-identity";
+// Phase 3.3a — shared with routes/routing.ts (lives in lib/ to avoid
+// route → route imports). Previously duplicated as
+// DEVICE_FRESHNESS_SECS_ROUTING; that duplicate is gone.
+export { DEVICE_FRESHNESS_SECS } from "../lib/routing/constants";
 
 const router = Router();
 
 const ACCESS_TOKEN_TTL_SECS = 3600;
-
-// Heartbeat freshness window. A staff member with in_app_calling_enabled=true
-// counts as "device present" only if their last heartbeat is within this
-// many seconds. 90s is 3x the frontend's ~30s ping cadence — one dropped
-// ping keeps them online; two in a row marks them unavailable.
-export const DEVICE_FRESHNESS_SECS = 90;
 
 // Prereq guard. If any of the three Voice-SDK envs are missing at boot,
 // crash loudly. The whole in-app-calling feature is broken without them
@@ -86,12 +85,20 @@ export interface TokenResponse {
 }
 
 /**
- * Resolve a user's Twilio Client identity from user_businesses. Prefers
- * the row for the caller's ACTIVE business (already selected by
- * requireAuth via x-active-business header). Falls back to the first
- * membership. Returns null if the user has no memberships or the row
- * lacks a backfilled client_identity (should not happen post-migration
- * 042 — but the code stays defensive).
+ * Resolve a user's Twilio Client identity for the given active
+ * business.
+ *
+ * Phase 3.3a — the identity is derived from the (user_id, business_id)
+ * pair via buildClientIdentity(). We still round-trip through the DB
+ * to VERIFY the caller actually has a membership for the requested
+ * business (an attacker could otherwise forge an x-active-business
+ * header for a tenant they don't belong to). If the membership row
+ * exists we return the deterministic identity computed by the helper;
+ * we don't just echo the stored value, which would let a stale/
+ * mis-shaped row in the DB silently override the canonical formula.
+ *
+ * Returns null if the user has no membership for the requested
+ * business AND no fallback membership at all.
  */
 export async function resolveClientIdentityForUser(
   supabase: SupabaseClient,
@@ -100,23 +107,30 @@ export async function resolveClientIdentityForUser(
 ): Promise<string | null> {
   let query = supabase
     .from("user_businesses")
-    .select("client_identity, business_id")
+    .select("business_id")
     .eq("user_id", userId);
   if (businessId) query = query.eq("business_id", businessId);
   const { data, error } = await query.maybeSingle();
-  if (error || !data) {
+  const row = data as { business_id?: string } | null;
+
+  if (error || !row) {
     if (!businessId) return null;
-    // Fallback: caller has an active biz but the row lookup failed. Try
-    // ANY membership so token issuance doesn't 500 for an edge-case row.
+    // Fallback: requested business membership missing — fall back to
+    // ANY membership so token issuance doesn't 500 for an edge-case
+    // row. Not ideal (caller sees a token for a tenant they didn't
+    // ask for) but preserves availability; auth already established
+    // that the user IS someone with memberships.
     const { data: any } = await supabase
       .from("user_businesses")
-      .select("client_identity")
+      .select("business_id")
       .eq("user_id", userId)
       .limit(1)
       .maybeSingle();
-    return (any as { client_identity?: string } | null)?.client_identity || null;
+    const fallbackBiz = (any as { business_id?: string } | null)?.business_id;
+    return fallbackBiz ? buildClientIdentity(userId, fallbackBiz) : null;
   }
-  return (data as { client_identity?: string }).client_identity || null;
+
+  return row.business_id ? buildClientIdentity(userId, row.business_id) : null;
 }
 
 /**
@@ -347,6 +361,154 @@ router.post(
     res.status(200).type("text/xml").send(twiml);
   },
 );
+
+// ── Heartbeat ───────────────────────────────────────────────────────
+
+// ── Preferences ─────────────────────────────────────────────────────
+
+/**
+ * Phase 3.3a — the softphone dock's opt-in was previously localStorage-
+ * only, while routing gates on user_businesses.in_app_calling_enabled.
+ * A user could see a green "registered" pill in the UI and be
+ * permanently unreachable to routing.
+ *
+ * These endpoints make the server the authority: dock reads initial
+ * state via GET, writes via PATCH. localStorage may still cache but is
+ * no longer the source of truth.
+ *
+ * Auth model: requireAuth. PATCH writes are scoped to the caller's own
+ * (user_id, business_id) row — the endpoint does NOT accept a
+ * user_id argument, so an attacker cannot toggle another user's
+ * preference by forging a body.
+ */
+
+interface VoicePreferences {
+  in_app_calling_enabled: boolean;
+}
+
+router.get(
+  "/voice/preferences",
+  requireAuth,
+  async (req: Request, res: Response): Promise<void> => {
+    const userId = req.userId;
+    const businessId = req.businessId;
+    if (!userId || !businessId) {
+      res.status(401).json({ error: "Authentication required" });
+      return;
+    }
+    const supabase = getSupabase();
+    if (!supabase) {
+      res.status(500).json({ error: "Database not configured" });
+      return;
+    }
+    const { data } = await supabase
+      .from("user_businesses")
+      .select("in_app_calling_enabled")
+      .eq("user_id", userId)
+      .eq("business_id", businessId)
+      .maybeSingle();
+    const enabled = !!(data as { in_app_calling_enabled?: boolean } | null)
+      ?.in_app_calling_enabled;
+    const payload: VoicePreferences = { in_app_calling_enabled: enabled };
+    res.json(payload);
+  },
+);
+
+router.patch(
+  "/voice/preferences",
+  requireAuth,
+  async (req: Request, res: Response): Promise<void> => {
+    const userId = req.userId;
+    const businessId = req.businessId;
+    if (!userId || !businessId) {
+      res.status(401).json({ error: "Authentication required" });
+      return;
+    }
+    const supabase = getSupabase();
+    if (!supabase) {
+      res.status(500).json({ error: "Database not configured" });
+      return;
+    }
+    // Scope: caller's OWN membership only. We deliberately ignore any
+    // user_id / business_id fields the client might have sent — no
+    // path exists here to write another user's row.
+    const body = (req.body || {}) as Record<string, unknown>;
+    if (typeof body.in_app_calling_enabled !== "boolean") {
+      res.status(400).json({ error: "in_app_calling_enabled must be boolean" });
+      return;
+    }
+    const enabled = body.in_app_calling_enabled;
+
+    try {
+      const { data, error } = await supabase
+        .from("user_businesses")
+        .update({ in_app_calling_enabled: enabled })
+        .eq("user_id", userId)
+        .eq("business_id", businessId)
+        .select("in_app_calling_enabled")
+        .maybeSingle();
+      if (error) {
+        Sentry.captureException(error, { extra: { where: "voice.preferences.patch", userId, businessId } });
+        res.status(500).json({ error: "Failed to update preference" });
+        return;
+      }
+      if (!data) {
+        // No matching (user, biz) row — the caller isn't a member of
+        // their own claimed active business. Should not happen if
+        // requireAuth is honest; return 404 rather than silently
+        // writing 0 rows.
+        res.status(404).json({ error: "Membership not found" });
+        return;
+      }
+      const payload: VoicePreferences = {
+        in_app_calling_enabled: !!(data as { in_app_calling_enabled?: boolean })
+          .in_app_calling_enabled,
+      };
+      res.json(payload);
+    } catch (err: any) {
+      Sentry.captureException(err, { extra: { where: "voice.preferences.patch.throw", userId } });
+      res.status(500).json({ error: "Failed to update preference" });
+    }
+  },
+);
+
+/**
+ * Exported handler shape for the smoke test — lets us assert the
+ * "reject writing another user's membership" case without booting
+ * Express. The endpoint only ever touches (req.userId, req.businessId)
+ * from auth middleware; a body-supplied user_id is dropped on the
+ * floor. This helper embodies the same contract for tests.
+ */
+export async function updatePreferenceForCaller(
+  supabase: SupabaseClient,
+  callerUserId: string,
+  callerBusinessId: string,
+  body: unknown,
+): Promise<
+  | { ok: true; preferences: VoicePreferences }
+  | { ok: false; status: number; error: string }
+> {
+  const b = (body || {}) as Record<string, unknown>;
+  if (typeof b.in_app_calling_enabled !== "boolean") {
+    return { ok: false, status: 400, error: "in_app_calling_enabled must be boolean" };
+  }
+  const { data, error } = await supabase
+    .from("user_businesses")
+    .update({ in_app_calling_enabled: b.in_app_calling_enabled })
+    .eq("user_id", callerUserId)
+    .eq("business_id", callerBusinessId)
+    .select("in_app_calling_enabled")
+    .maybeSingle();
+  if (error) return { ok: false, status: 500, error: error.message };
+  if (!data) return { ok: false, status: 404, error: "Membership not found" };
+  return {
+    ok: true,
+    preferences: {
+      in_app_calling_enabled: !!(data as { in_app_calling_enabled?: boolean })
+        .in_app_calling_enabled,
+    },
+  };
+}
 
 // ── Heartbeat ───────────────────────────────────────────────────────
 

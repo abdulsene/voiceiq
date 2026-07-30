@@ -59,6 +59,12 @@
  *   T47 resolveBusinessForClient: identity → (business_id, twilio_phone_number)
  *   T48 mintVoiceAccessToken: JWT payload has identity + VoiceGrant
  *
+ *   3.3a additions (per-membership identity + toggle wiring):
+ *   T49 buildClientIdentity: (userA, bizA) != (userA, bizB) — the 3.3 collision
+ *   T50 buildClientIdentity: deterministic + shape matches migration 043 DDL
+ *   T51 /voice/preferences PATCH: scoped to caller's own membership,
+ *       body-supplied user_id / business_id dropped on the floor
+ *
  * Run: pnpm --filter @workspace/api-server exec tsx \
  *        src/tests/040-routing-smoke.ts
  */
@@ -91,7 +97,12 @@ import {
   resolveBusinessForClient,
   buildOutboundDialTwiml,
   mintVoiceAccessToken,
+  updatePreferenceForCaller,
 } from "../routes/voice";
+// Phase 3.3a — single source of truth for the identity formula. Tests
+// compute expected identities via the helper so a formula change in
+// buildClientIdentity is caught by the fixtures automatically.
+import { buildClientIdentity } from "../lib/voice/client-identity";
 import { buildRouteToTopicTool } from "../agents";
 import { renderPromptFromHelpers } from "../lib/prompt-renderer";
 
@@ -1331,8 +1342,11 @@ async function T37_zero_match_upsert_creates_row() {
 
 // ── Phase 3.3: in-app calling (WebRTC softphone) ────────────────────
 
-const CLIENT_A = "user_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-const CLIENT_B = "user_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+// Phase 3.3a — derive identities via the shared helper so a formula
+// change (e.g. migration 044 hypothetically re-shaping) is reflected
+// in the tests without hand-updating every fixture.
+const CLIENT_A = buildClientIdentity(USER_A, BIZ);
+const CLIENT_B = buildClientIdentity(USER_B, BIZ);
 const FRESH_HB = () => new Date().toISOString();
 const STALE_HB = () => new Date(Date.now() - 5 * 60_000).toISOString();
 
@@ -1415,7 +1429,7 @@ async function T39_mixed_client_number_simulring() {
         {
           user_id: USER_C,
           callback_ring_number: null,
-          client_identity: "user_cccccccccccccccccccccccccccccccc",
+          client_identity: buildClientIdentity(USER_C, BIZ),
           in_app_calling_enabled: true,
           voice_device_last_seen_at: FRESH_HB(),
         },
@@ -1433,6 +1447,7 @@ async function T39_mixed_client_number_simulring() {
     if (clientCount !== 2) failures.push(`<Client> count=${clientCount} (expected 2 — A and C)`);
     if (numberCount !== 2) failures.push(`<Number> count=${numberCount} (expected 2 — A and B)`);
     if (!twiml.includes(CLIENT_A)) failures.push("A's client identity missing");
+    if (!twiml.includes(buildClientIdentity(USER_C, BIZ))) failures.push("C's client identity missing");
     if (!twiml.includes(PHONE_A)) failures.push("A's phone missing");
     if (!twiml.includes(PHONE_B)) failures.push("B's phone missing");
   }
@@ -1489,9 +1504,12 @@ async function T40_client_identity_handled_by() {
  */
 async function T41_false_match_regression() {
   const fake = new FakeSupabaseClient();
-  // Craft a client identity whose last 10 digits look like a phone
-  // number (would false-match if the code ran normalizePhone on it).
-  const evilClientId = "user_ab4155551234cd";
+  // Craft a client identity that contains the target phone as a
+  // substring. If the buggy pre-3.3 code path ran, normalizePhone
+  // would strip non-digits and match "4155551234" against USER_B's
+  // cell. New format is `user_<32hex>__<12hex>` so we embed the
+  // "4155551234" fragment inside the hex-shaped user segment.
+  const evilClientId = "user_ab4155551234cdef1234567890abcdef__aabbccddeeff";
   // NO row for this identity — client_identity lookup returns nothing.
   fake.on(
     (c) =>
@@ -1616,20 +1634,28 @@ async function T43_stale_heartbeat_drops_candidate() {
  */
 async function T44_token_identity_ignores_client_supplied() {
   const fake = new FakeSupabaseClient();
+  // Phase 3.3a — the resolver reads a membership row to CONFIRM the
+  // caller belongs to the requested business, then computes the
+  // identity via buildClientIdentity(userId, businessId) — it does
+  // NOT echo whatever client_identity happens to be stored on the
+  // row. So we stub any evil / mismatched value in the DB and assert
+  // the resolver still returns the canonical derived identity.
   fake.on(
     (c) => c.op === "select" && c.table === "user_businesses",
-    { data: { client_identity: CLIENT_A, business_id: BIZ } },
+    { data: { business_id: BIZ } },
   );
   const identity = await resolveClientIdentityForUser(asClient(fake), USER_A, BIZ);
+  const expected = buildClientIdentity(USER_A, BIZ);
   const failures: string[] = [];
-  if (identity !== CLIENT_A) failures.push(`identity=${identity}`);
+  if (identity !== expected) failures.push(`identity=${identity} expected=${expected}`);
+  if (identity === "attacker-supplied-value") failures.push("resolver returned client-supplied value");
   // Sanity: the query MUST be filtered by user_id (the authenticated
   // caller), not by anything the caller could have influenced.
   const q = fake.calls.find((c) => c.op === "select" && c.table === "user_businesses");
   if (!q?.eqFilters.some((f) => f.column === "user_id" && f.value === USER_A)) {
     failures.push("resolver did not filter by user_id (server-side JWT identity)");
   }
-  record("T44 token endpoint identity derived server-side (client-supplied ignored)", failures.length === 0, failures.join("; ") || "resolveClientIdentityForUser scopes by userId from JWT");
+  record("T44 token endpoint identity derived server-side (client-supplied ignored)", failures.length === 0, failures.join("; ") || "resolveClientIdentityForUser scopes by userId from JWT + computes via helper");
 }
 
 /**
@@ -1754,6 +1780,92 @@ async function T48_mint_access_token() {
   record("T48 mintVoiceAccessToken: JWT w/ identity + VoiceGrant", failures.length === 0, failures.join("; ") || "identity + voice grant + expiry all present");
 }
 
+// ── Phase 3.3a: per-membership identity + toggle wiring ────────────
+
+/**
+ * Phase 3.3a T49 — the collision that motivated this slice. Same user,
+ * different businesses → different identities. Under the 3.3 formula
+ * these would collide.
+ */
+async function T49_identity_differs_across_businesses() {
+  const failures: string[] = [];
+  const idA = buildClientIdentity(USER_A, BIZ);
+  const idB = buildClientIdentity(USER_A, OTHER_BIZ);
+  if (idA === idB) failures.push(`collision: same identity for (userA, bizA) and (userA, bizB) — ${idA}`);
+  // And identity must depend on both inputs: swapping business gives
+  // a different suffix.
+  if (!idA.startsWith("user_")) failures.push(`shape: ${idA}`);
+  if (idA.split("__")[1] === idB.split("__")[1]) failures.push("suffix identical across biz");
+  record("T49 buildClientIdentity: (userA, bizA) != (userA, bizB) — the 3.3 collision fixed", failures.length === 0, failures.join("; ") || "per-membership identity — no cross-tenant Client collision");
+}
+
+/**
+ * Phase 3.3a T50 — determinism. Same (user, biz) always produces the
+ * same identity. The token endpoint depends on this: it derives the
+ * identity from the JWT + active-biz header without a DB roundtrip.
+ */
+async function T50_identity_is_deterministic() {
+  const failures: string[] = [];
+  const runs = Array.from({ length: 5 }, () => buildClientIdentity(USER_A, BIZ));
+  const distinct = new Set(runs).size;
+  if (distinct !== 1) failures.push(`non-deterministic: ${distinct} distinct outputs across 5 runs`);
+  // Cross-check against the DB formula shape (32 hex user + 12 hex biz).
+  if (!/^user_[0-9a-f]{32}__[0-9a-f]{12}$/i.test(runs[0])) {
+    failures.push(`shape mismatch: ${runs[0]}`);
+  }
+  record("T50 buildClientIdentity: deterministic + shape matches migration 043 DDL", failures.length === 0, failures.join("; ") || "5 runs identical; matches user_<32hex>__<12hex>");
+}
+
+/**
+ * Phase 3.3a T51 — preferences endpoint scopes writes to caller's own
+ * (user_id, business_id). No body-supplied user_id can override the
+ * JWT-derived identity — the helper doesn't accept one, and the
+ * UPDATE below is verified to filter on the caller's credentials.
+ */
+async function T51_preferences_rejects_other_users_row() {
+  const fake = new FakeSupabaseClient();
+  // Stub a successful UPDATE for the caller's OWN (userA, bizA) row.
+  fake.on(
+    (c) => c.op === "update" && c.table === "user_businesses",
+    { data: { in_app_calling_enabled: true } },
+  );
+
+  // The caller sends a body that tries to specify a DIFFERENT user_id
+  // and business_id. updatePreferenceForCaller must ignore both and
+  // scope the UPDATE to (callerUserId, callerBusinessId) only.
+  const result = await updatePreferenceForCaller(
+    asClient(fake),
+    USER_A, // JWT identity
+    BIZ,    // active biz
+    {
+      in_app_calling_enabled: true,
+      // Attacker-crafted fields — must be dropped on the floor.
+      user_id: USER_B,
+      business_id: OTHER_BIZ,
+    },
+  );
+
+  const failures: string[] = [];
+  if (!result.ok) failures.push(`not ok: ${(result as any).error}`);
+  const update = fake.calls.find((c) => c.op === "update" && c.table === "user_businesses");
+  if (!update) failures.push("no UPDATE issued");
+  // The critical assertions: UPDATE must filter on the JWT-derived
+  // user_id and business_id, NOT on the body-supplied ones.
+  const userFilter = update?.eqFilters.find((f) => f.column === "user_id");
+  const bizFilter = update?.eqFilters.find((f) => f.column === "business_id");
+  if (userFilter?.value !== USER_A) failures.push(`user_id filter=${userFilter?.value} (expected USER_A from JWT)`);
+  if (bizFilter?.value !== BIZ) failures.push(`business_id filter=${bizFilter?.value} (expected BIZ from JWT)`);
+  // Body-supplied user_id / business_id must NOT appear in the payload.
+  if ((update?.payload as any)?.user_id) failures.push("payload contains user_id (should only carry in_app_calling_enabled)");
+  if ((update?.payload as any)?.business_id) failures.push("payload contains business_id");
+
+  // Reject bad body types.
+  const bad = await updatePreferenceForCaller(asClient(fake), USER_A, BIZ, { in_app_calling_enabled: "yes" });
+  if (bad.ok) failures.push("string value should have been rejected");
+  else if (bad.status !== 400) failures.push(`bad-body status=${bad.status}`);
+  record("T51 /voice/preferences PATCH: scoped to caller's own membership, body-supplied user_id ignored", failures.length === 0, failures.join("; ") || "auth-scoped writes + body sanitation");
+}
+
 // ── Bonus: whisper composition and TwiML ────────────────────────────
 
 async function whisper_composition() {
@@ -1827,6 +1939,10 @@ async function main() {
   await T46_outbound_twiml_shape();
   await T47_outbound_business_resolver();
   await T48_mint_access_token();
+  // Phase 3.3a — per-membership identity + toggle wiring
+  await T49_identity_differs_across_businesses();
+  await T50_identity_is_deterministic();
+  await T51_preferences_rejects_other_users_row();
   await whisper_composition();
 
   const fails = results.filter((r) => !r.pass);

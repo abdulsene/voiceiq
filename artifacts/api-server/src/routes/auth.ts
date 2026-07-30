@@ -17,6 +17,10 @@ import {
   TwilioProvisioningError,
 } from "../lib/twilio-provisioning";
 import { extractAreaCodeFromPhoneNumber } from "../lib/phone-utils";
+// Phase 3.3a — every user_businesses INSERT must set client_identity
+// via the shared helper so the UNIQUE constraint holds and the
+// Phase 3.3 softphone can register.
+import { buildClientIdentity } from "../lib/voice/client-identity";
 
 // Sprint 2 STEP 4 / BUG-18 Part 5: per-user resend rate limit. Simple
 // in-memory map of userId -> last-sent epoch ms. Lost on process restart
@@ -138,6 +142,7 @@ router.post("/auth/signup", validate(authSignupSchema), async (req: Request, res
       business_id: businessId,
       role: "owner",
       created_at: new Date().toISOString(),
+      client_identity: buildClientIdentity(userId, businessId),
     });
 
     await auditLog({

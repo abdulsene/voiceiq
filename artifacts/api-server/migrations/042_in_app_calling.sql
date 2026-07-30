@@ -7,11 +7,29 @@
 --
 -- Columns:
 --
---   user_businesses.client_identity TEXT   [NOT enforced UNIQUE — see note]
+--   user_businesses.client_identity TEXT
+--
+--     ⚠️ SUPERSEDED by migration 043 (Phase 3.3a). The per-USER formula
+--     `user_ || replace(user_id::text, '-', '')` shipped here was
+--     WRONG — Twilio's <Client><Identity>X</Identity></Client> has no
+--     tenant scoping, so a user with memberships in two businesses
+--     would receive calls for BOTH, with the wrong tenant's topic
+--     name in the incoming banner. Cross-tenant UI-level data leak.
+--     Migration 043 recomputes every row using a per-MEMBERSHIP
+--     formula and restores the UNIQUE constraint we could not add
+--     here.
+--
+--     The reasoning below is preserved for context (it explains WHY
+--     we did not add UNIQUE at the time — the original formula
+--     genuinely collided). Read this alongside migration 043 and
+--     lib/voice/client-identity.ts:buildClientIdentity for the
+--     current authoritative behaviour.
+--
+--     [Original 042 rationale — CORRECTED by 043]:
 --     Deterministic Twilio Client identity: 'user_' || replace(user_id, '-', '').
 --     Baked at row-creation time; backfilled here for existing rows.
 --
---     ⚠️ Not a UNIQUE constraint at the ROW level. Under Phase 3e
+--     Not a UNIQUE constraint at the ROW level. Under Phase 3e
 --     multi-tenancy (see auth.ts:"a single user can belong to multiple
 --     tenants"), a single user_id has multiple user_businesses rows, all
 --     of which share the same deterministic identity. UNIQUE would fail

@@ -29,13 +29,17 @@ import { Phone, PhoneOff, Mic, MicOff, X, PhoneCall, PhoneIncoming, AlertCircle 
 import { useTwilioDevice, type SoftphoneStatus } from "../hooks/useTwilioDevice";
 import { getAuthHeaders } from "../lib/api";
 
-const ENABLED_KEY = "neverr_softphone_enabled";
+// Phase 3.3a — the server (user_businesses.in_app_calling_enabled) is
+// authoritative for whether routing will ring this device. localStorage
+// only caches the last-known value so the dock has something to render
+// before the initial GET /voice/preferences resolves.
+const ENABLED_CACHE_KEY = "neverr_softphone_enabled";
 
 interface SoftphoneContextValue {
   enabled: boolean;
   status: SoftphoneStatus;
   identity: string | null;
-  setEnabled: (v: boolean) => void;
+  setEnabled: (v: boolean) => Promise<void> | void;
   /**
    * Place an outbound call to the given E.164 number. Returns true if
    * the call was initiated, false if the device isn't registered.
@@ -100,8 +104,22 @@ function CallTimer({ startedAt }: CallTimerProps) {
   return <span className="tabular-nums text-sm text-neutral-600">{mm}:{ss}</span>;
 }
 
-function StatusPill({ status }: { status: SoftphoneStatus }) {
-  const map: Record<SoftphoneStatus, { label: string; color: string }> = {
+/**
+ * Phase 3.3a — the pill is a joint function of Device.status AND the
+ * server-side in_app_calling_enabled preference. A device that has
+ * successfully registered locally but whose server preference is OFF
+ * MUST NOT show a green "Ready" — routing will not ring it. Show
+ * "Enabled locally, not receiving" (amber) instead so the user knows
+ * to click Save / retry.
+ */
+function StatusPill({
+  status,
+  serverEnabled,
+}: {
+  status: SoftphoneStatus;
+  serverEnabled: boolean | null;
+}) {
+  const baseMap: Record<SoftphoneStatus, { label: string; color: string }> = {
     idle: { label: "Off", color: "bg-neutral-200 text-neutral-700" },
     "requesting-permission": { label: "Mic prompt…", color: "bg-amber-100 text-amber-800" },
     "permission-denied": { label: "Mic blocked", color: "bg-red-100 text-red-800" },
@@ -110,7 +128,13 @@ function StatusPill({ status }: { status: SoftphoneStatus }) {
     unregistered: { label: "Offline", color: "bg-red-100 text-red-800" },
     error: { label: "Error", color: "bg-red-100 text-red-800" },
   };
-  const { label, color } = map[status];
+  let label = baseMap[status].label;
+  let color = baseMap[status].color;
+  // The critical override — never a green light on an unreachable device.
+  if (status === "registered" && serverEnabled !== true) {
+    label = "Not receiving";
+    color = "bg-amber-100 text-amber-800";
+  }
   return (
     <span className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-xs font-medium ${color}`}>
       <span className="h-1.5 w-1.5 rounded-full bg-current opacity-80" />
@@ -120,19 +144,78 @@ function StatusPill({ status }: { status: SoftphoneStatus }) {
 }
 
 export function SoftphoneProvider({ children }: { children: ReactNode }) {
+  // Optimistic initial state from the last-known cached value; the GET
+  // below reconciles against the server. Never trust localStorage
+  // exclusively — routing gates on the server-side flag.
   const [enabled, setEnabledRaw] = useState<boolean>(() => {
     try {
-      return localStorage.getItem(ENABLED_KEY) === "1";
+      return localStorage.getItem(ENABLED_CACHE_KEY) === "1";
     } catch {
       return false;
     }
   });
-  const setEnabled = useCallback((v: boolean) => {
-    setEnabledRaw(v);
-    try {
-      localStorage.setItem(ENABLED_KEY, v ? "1" : "0");
-    } catch {}
+  // serverEnabled = the source of truth (last successful GET/PATCH
+  // response). enabled = the local UI intent while a PATCH is in
+  // flight. On mount serverEnabled starts null (unknown) and we treat
+  // the device as OFF until the GET resolves — no green "Ready" pill
+  // for a device the server hasn't confirmed is enabled.
+  const [serverEnabled, setServerEnabled] = useState<boolean | null>(null);
+  const [preferenceError, setPreferenceError] = useState<string | null>(null);
+
+  // Initial reconciliation.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch("/api/voice/preferences", {
+          headers: { "Content-Type": "application/json", ...getAuthHeaders() },
+        });
+        if (!res.ok) throw new Error(`GET /voice/preferences ${res.status}`);
+        const data = (await res.json()) as { in_app_calling_enabled?: boolean };
+        if (cancelled) return;
+        const truth = !!data.in_app_calling_enabled;
+        setServerEnabled(truth);
+        setEnabledRaw(truth);
+        try {
+          localStorage.setItem(ENABLED_CACHE_KEY, truth ? "1" : "0");
+        } catch {}
+      } catch (e) {
+        if (!cancelled) setPreferenceError((e as Error).message);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
   }, []);
+
+  const setEnabled = useCallback(async (v: boolean) => {
+    // Optimistic UI. If the PATCH fails we roll back and surface an
+    // error — otherwise the pill would show Ready while the server
+    // still routes to the user's cell only.
+    const previous = enabled;
+    setEnabledRaw(v);
+    setPreferenceError(null);
+    try {
+      const res = await fetch("/api/voice/preferences", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json", ...getAuthHeaders() },
+        body: JSON.stringify({ in_app_calling_enabled: v }),
+      });
+      if (!res.ok) throw new Error(`PATCH /voice/preferences ${res.status}`);
+      const data = (await res.json()) as { in_app_calling_enabled?: boolean };
+      const truth = !!data.in_app_calling_enabled;
+      setServerEnabled(truth);
+      setEnabledRaw(truth);
+      try {
+        localStorage.setItem(ENABLED_CACHE_KEY, truth ? "1" : "0");
+      } catch {}
+    } catch (e) {
+      setEnabledRaw(previous);
+      setPreferenceError(
+        `Could not save preference — routing will not ring your browser. ${(e as Error).message}`,
+      );
+    }
+  }, [enabled]);
 
   const device = useTwilioDevice({ enabled });
   const [callerId, setCallerId] = useState<CallerId | null>(null);
@@ -268,7 +351,7 @@ export function SoftphoneProvider({ children }: { children: ReactNode }) {
               <div className="flex items-center gap-2">
                 <PhoneCall className="h-4 w-4 text-neutral-600" />
                 <span className="text-sm font-medium">Softphone</span>
-                <StatusPill status={device.status} />
+                <StatusPill status={device.status} serverEnabled={serverEnabled} />
               </div>
               <button
                 type="button"
@@ -284,7 +367,9 @@ export function SoftphoneProvider({ children }: { children: ReactNode }) {
               <input
                 type="checkbox"
                 checked={enabled}
-                onChange={(e) => setEnabled(e.target.checked)}
+                onChange={(e) => {
+                  void setEnabled(e.target.checked);
+                }}
               />
               <span>Take in-app calls</span>
             </label>
@@ -293,6 +378,18 @@ export function SoftphoneProvider({ children }: { children: ReactNode }) {
               <div className="mt-2 flex items-start gap-1 rounded-md bg-red-50 p-2 text-xs text-red-800">
                 <AlertCircle className="h-3.5 w-3.5 mt-0.5 shrink-0" />
                 <span>{device.error}</span>
+              </div>
+            ) : null}
+            {preferenceError ? (
+              <div className="mt-2 flex items-start gap-1 rounded-md bg-red-50 p-2 text-xs text-red-800">
+                <AlertCircle className="h-3.5 w-3.5 mt-0.5 shrink-0" />
+                <span>{preferenceError}</span>
+              </div>
+            ) : null}
+            {enabled && device.status === "registered" && serverEnabled === false ? (
+              <div className="mt-2 rounded-md bg-amber-50 p-2 text-xs text-amber-800">
+                Enabled locally but the server hasn't recorded it — routing
+                will not ring your browser until the preference saves.
               </div>
             ) : null}
             {enabled && device.status === "unregistered" ? (
@@ -346,7 +443,7 @@ export function SoftphoneProvider({ children }: { children: ReactNode }) {
             className="rounded-full bg-white shadow-lg border border-neutral-200 px-3 py-2 flex items-center gap-2 hover:bg-neutral-50"
           >
             <PhoneCall className="h-4 w-4 text-neutral-700" />
-            <StatusPill status={device.status} />
+            <StatusPill status={device.status} serverEnabled={serverEnabled} />
           </button>
         )}
       </div>

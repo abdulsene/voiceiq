@@ -49,6 +49,10 @@ export const buildSystemPrompt = renderPromptFromHelpers;
 export type { IndustryTemplate };
 import { CULTURAL_PROFILES, detectCulturalProfile, buildCulturalPrompt, getProfileCount, getLanguageCount, getAllProfileNames } from "../culturalProfiles";
 import { scrapeWebsite, type ScrapedData } from "../scraping";
+// Phase 3.3a — populate client_identity on every new user_businesses row
+// so the UNIQUE constraint (migration 043) holds and the softphone can
+// register post-signup / post-demo-link / post-add-business.
+import { buildClientIdentity } from "../lib/voice/client-identity";
 
 const isProduction = process.env.NODE_ENV === "production";
 function safeError(err: any): string {
@@ -1827,6 +1831,7 @@ router.post("/onboard", costlyLimiter, requireAuth, async (req: Request, res: Re
         business_id: businessId,
         role: "owner",
         created_at: new Date().toISOString(),
+        client_identity: buildClientIdentity(userId, businessId),
       });
       if (ubErr) {
         console.warn("[Onboard] user_businesses link insert failed for", businessId, "user", userId, ":", ubErr.message);
@@ -6436,6 +6441,7 @@ router.post("/admin/setup-demo-users", requireAuth, async (req: Request, res: Re
             business_id: businessId,
             role: "demo",
             created_at: new Date().toISOString(),
+            client_identity: buildClientIdentity(userId, businessId),
           });
         }
 
@@ -9993,6 +9999,7 @@ router.post("/business/create-additional", requireAuth, async (req: Request, res
     user_id: userId,
     business_id: newBusinessId,
     role: "owner",
+    client_identity: buildClientIdentity(userId, newBusinessId),
   });
 
   if (memErr) {

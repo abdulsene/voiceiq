@@ -40,6 +40,10 @@ import { timingSafeEqual } from "node:crypto";
 import { fetchIndustryTemplate, buildSystemPrompt } from "./api.js";
 import { createAgentForBusiness, deleteAgent } from "../agents.js";
 import { scrapeWebsite } from "../scraping.js";
+// Phase 3.3a — team-invite creates user_businesses rows; each must
+// carry the deterministic per-membership client_identity so the
+// UNIQUE constraint holds and the softphone can register post-accept.
+import { buildClientIdentity } from "../lib/voice/client-identity.js";
 
 const router: IRouter = Router();
 
@@ -6025,6 +6029,7 @@ router.post(
           user_id: authUserId,
           business_id: req.businessId,
           role,
+          client_identity: buildClientIdentity(authUserId, req.businessId),
         });
         membershipErr = mErr;
       }
