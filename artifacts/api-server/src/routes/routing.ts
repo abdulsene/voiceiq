@@ -7,10 +7,20 @@
  *     Invoked by Alex's `route_to_topic` ElevenLabs tool mid-conversation.
  *
  *   GET  /api/routing/whisper
+ *   POST /api/routing/whisper
  *     PUBLIC (bypass-listed in app.ts). Twilio hits this URL when a rung
  *     staff member answers — the TwiML we return plays a <Say> to the
  *     staff only (customer hears silence) before Twilio bridges the two
  *     legs. `text` query param is the pre-composed whisper string.
+ *
+ *     Phase 3.6: registered for BOTH verbs. Twilio's `<Number url=...>`
+ *     and `<Client url=...>` default to method="POST"; the pre-3.6
+ *     GET-only registration 404'd every whisper in production since 3.2a
+ *     (Twilio error 11200, confirmed via Request Inspector 2026-07-30).
+ *     dial-builder now also emits an explicit method="GET" on the url
+ *     attribute so the contract is stated rather than inherited, but
+ *     accepting POST is the belt-and-braces guarantee against the same
+ *     latent bug recurring anywhere else that ever hits this route.
  *
  *   POST /api/routing/dial-status
  *     PUBLIC (bypass-listed) but Twilio-signature-verified. Called by
@@ -1062,45 +1072,54 @@ export async function writeWhisperAttribution(
   }
 }
 
-router.get(
-  "/routing/whisper",
-  async (req: Request, res: Response): Promise<void> => {
-    // Compose the response FIRST — every path below must send 200
-    // valid TwiML no matter what fails. Attribution write is fire-
-    // and-forget after the response.
-    let ctx: WhisperHandlerContext;
-    try {
-      ctx = parseWhisperQuery(req.query as Record<string, unknown>);
-    } catch (err: any) {
-      Sentry.captureException(err, { extra: { where: "whisper.parseQuery" } });
-      res
-        .status(200)
-        .type("text/xml")
-        .send('<?xml version="1.0" encoding="UTF-8"?><Response/>');
-      return;
-    }
+/**
+ * Phase 3.6 — extracted so both GET and POST registrations share ONE
+ * implementation. Twilio POSTs the whisper URL by default (see
+ * <Number url> / <Client url> attribute docs); pre-3.6 we only
+ * registered GET and every whisper 404'd for months.
+ */
+async function whisperHandler(req: Request, res: Response): Promise<void> {
+  // Compose the response FIRST — every path below must send 200
+  // valid TwiML no matter what fails. Attribution write is fire-
+  // and-forget after the response.
+  let ctx: WhisperHandlerContext;
+  try {
+    ctx = parseWhisperQuery(req.query as Record<string, unknown>);
+  } catch (err: any) {
+    Sentry.captureException(err, { extra: { where: "whisper.parseQuery" } });
+    res
+      .status(200)
+      .type("text/xml")
+      .send('<?xml version="1.0" encoding="UTF-8"?><Response/>');
+    return;
+  }
 
-    const speak = ctx.text || "Incoming call. Connecting now.";
-    let twimlOut: string;
-    try {
-      twimlOut = buildWhisperTwiml(speak);
-    } catch (err: any) {
-      Sentry.captureException(err, { extra: { where: "whisper.buildTwiml" } });
-      twimlOut = '<?xml version="1.0" encoding="UTF-8"?><Response/>';
-    }
-    res.status(200).type("text/xml").send(twimlOut);
+  const speak = ctx.text || "Incoming call. Connecting now.";
+  let twimlOut: string;
+  try {
+    twimlOut = buildWhisperTwiml(speak);
+  } catch (err: any) {
+    Sentry.captureException(err, { extra: { where: "whisper.buildTwiml" } });
+    twimlOut = '<?xml version="1.0" encoding="UTF-8"?><Response/>';
+  }
+  res.status(200).type("text/xml").send(twimlOut);
 
-    // Attribution write — after the TwiML response so a slow DB
-    // never delays Twilio's bridge. Errors are captured to Sentry
-    // and swallowed.
-    const supabase = getSupabase();
-    if (supabase) {
-      void writeWhisperAttribution(supabase, ctx).catch((err) => {
-        Sentry.captureException(err, { extra: { where: "whisper.writeAttribution.reject" } });
-      });
-    }
-  },
-);
+  // Attribution write — after the TwiML response so a slow DB
+  // never delays Twilio's bridge. Errors are captured to Sentry
+  // and swallowed.
+  const supabase = getSupabase();
+  if (supabase) {
+    void writeWhisperAttribution(supabase, ctx).catch((err) => {
+      Sentry.captureException(err, { extra: { where: "whisper.writeAttribution.reject" } });
+    });
+  }
+}
+
+// Phase 3.6 — accept BOTH GET and POST. Twilio's <Number url> /
+// <Client url> default to POST; historical registration was GET-only,
+// causing 11200 404 on every whisper. router.route(...).get().post()
+// binds the same handler to both verbs; query params arrive on both.
+router.route("/routing/whisper").get(whisperHandler).post(whisperHandler);
 
 router.post(
   "/routing/dial-status",

@@ -135,6 +135,14 @@ function whisperUrlFor(
 
 /**
  * Render <Number> child. Includes url= only when whisperUrl is set.
+ *
+ * Phase 3.6 — explicit method="GET" on the url attribute. Twilio's
+ * documented default for <Number url> / <Client url> is POST; every
+ * whisper fetch since Phase 3.2a was routed as POST → GET-only
+ * handler → 404 → customer-audible "application error." The route
+ * now accepts both verbs (routes/routing.ts) but stating GET here
+ * removes the reliance on Twilio-default behaviour and prevents
+ * accidental server-side re-registration ambiguity.
  */
 function renderNumber(
   phone: string,
@@ -143,7 +151,7 @@ function renderNumber(
 ): string {
   const url = whisperUrlFor(whisperUrl, ctx);
   if (url) {
-    return `<Number url="${xmlEscape(url)}">${xmlEscape(phone)}</Number>`;
+    return `<Number url="${xmlEscape(url)}" method="GET">${xmlEscape(phone)}</Number>`;
   }
   return `<Number>${xmlEscape(phone)}</Number>`;
 }
@@ -153,6 +161,9 @@ function renderNumber(
  * (Twilio applies the url= to both leg types identically). Custom
  * <Parameter> children are surfaced to the SDK as CustomParameters on
  * the incoming call event, letting the softphone UI show topic context.
+ *
+ * Phase 3.6 — explicit method="GET" on the url attribute. See
+ * renderNumber's comment.
  */
 function renderClient(
   identity: string,
@@ -161,7 +172,7 @@ function renderClient(
   ctx: { leg: WhisperLeg; userId?: string | null },
 ): string {
   const url = whisperUrlFor(whisperUrl, ctx);
-  const attrs = url ? ` url="${xmlEscape(url)}"` : "";
+  const attrs = url ? ` url="${xmlEscape(url)}" method="GET"` : "";
   const params = topicName
     ? `<Parameter name="topic_name" value="${xmlEscape(topicName)}"/>`
     : "";

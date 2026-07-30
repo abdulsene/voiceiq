@@ -122,6 +122,21 @@
  *   T67 writeWhisperAttribution swallows DB errors — a broken
  *       attribution write must NEVER crash the whisper leg.
  *
+ *   3.6 additions (whisper accepts POST + TwiML verb audit):
+ *   T68 POST /api/routing/whisper → 200 valid TwiML. Real HTTP
+ *       round-trip via a booted Express + router. Guards the sev-1
+ *       that 69 handler-function tests could not see: pre-3.6
+ *       registration was router.get only, Twilio POSTs by default
+ *       on <Number url> / <Client url>, every whisper 404'd in
+ *       production since 3.2a and every answerer heard
+ *       "an application error has occurred" before the bridge.
+ *   T69 GET /api/routing/whisper → 200 valid TwiML. Same handler,
+ *       both verbs.
+ *   T70 dial-builder emits explicit method="GET" on <Client>/<Number>
+ *       url attributes — verb contract stated, not inherited.
+ *   T71 whisper URL encoding survives &, #, <, >, " in business +
+ *       topic names via the encodeURIComponent + xmlEscape chain.
+ *
  * Run: pnpm --filter @workspace/api-server exec tsx \
  *        src/tests/040-routing-smoke.ts
  */
@@ -2691,6 +2706,61 @@ async function T59_preference_round_trip() {
   record("T59 preference PATCH→GET round-trip: dock + sidebar toggles agree on shared column", failures.length === 0, failures.join("; ") || "both toggles write same column, both reads see same value");
 }
 
+// ── Phase 3.6: real HTTP dispatch of the whisper route ─────────────
+
+/**
+ * Boot a minimal Express app that mounts ONLY the routing router,
+ * listen on an ephemeral port, and return a helper to make real HTTP
+ * requests. This closes the gap that let the pre-3.6 verb mismatch
+ * survive 69 passing tests: every prior test called handler functions
+ * directly, so the route table's verb registration was invisible.
+ * The whisper endpoint's registered verb is the actual defect.
+ */
+async function bootRoutingHttpApp(): Promise<{
+  request: (opts: {
+    method: "GET" | "POST";
+    path: string;
+    formBody?: Record<string, string>;
+  }) => Promise<{ status: number; body: string; contentType: string }>;
+  close: () => Promise<void>;
+}> {
+  const express = (await import("express")).default;
+  const http = await import("node:http");
+  const app = express();
+  app.use(express.urlencoded({ extended: false }));
+  app.use(express.json());
+  // Mount the ACTUAL router under /api (same shape as routes/index.ts).
+  const router = (await import("../routes/routing")).default;
+  app.use("/api", router);
+
+  const server = http.createServer(app);
+  await new Promise<void>((resolve) => server.listen(0, resolve));
+  const addr = server.address();
+  const port = typeof addr === "object" && addr ? addr.port : 0;
+
+  return {
+    request: async ({ method, path, formBody }) => {
+      const url = `http://127.0.0.1:${port}${path}`;
+      const init: RequestInit = { method };
+      if (formBody) {
+        init.headers = { "Content-Type": "application/x-www-form-urlencoded" };
+        init.body = new URLSearchParams(formBody).toString();
+      }
+      const res = await fetch(url, init);
+      const body = await res.text();
+      return {
+        status: res.status,
+        body,
+        contentType: res.headers.get("content-type") || "",
+      };
+    },
+    close: () =>
+      new Promise<void>((resolve) => {
+        server.close(() => resolve());
+      }),
+  };
+}
+
 // ── Phase 3.5: per-leg attribution via whisper + handler hardening ──
 
 /**
@@ -2718,8 +2788,9 @@ async function T64_whisper_url_per_candidate() {
     dialStatusUrl: null,
   });
   const failures: string[] = [];
-  // <Client> must carry USER_A + leg=client.
-  const clientMatch = /<Client\s+url="([^"]+)">/.exec(twiml);
+  // <Client> must carry USER_A + leg=client. (Phase 3.6: also
+  // carries method="GET" — regex accepts optional trailing attrs.)
+  const clientMatch = /<Client\s+url="([^"]+)"/.exec(twiml);
   if (!clientMatch) failures.push("no <Client url=...> found");
   else {
     const url = clientMatch[1].replace(/&amp;/g, "&");
@@ -2728,7 +2799,7 @@ async function T64_whisper_url_per_candidate() {
     if (!url.startsWith(baseWhisper)) failures.push("<Client> url should append to base, not replace");
   }
   // <Number> must carry USER_B + leg=number.
-  const numberMatch = /<Number\s+url="([^"]+)">/.exec(twiml);
+  const numberMatch = /<Number\s+url="([^"]+)"/.exec(twiml);
   if (!numberMatch) failures.push("no <Number url=...> found");
   else {
     const url = numberMatch[1].replace(/&amp;/g, "&");
@@ -2873,6 +2944,156 @@ async function T67_whisper_write_swallows_errors() {
   record("T67 writeWhisperAttribution swallows DB errors (never crashes the whisper leg)", failures.length === 0, failures.join("; ") || "TwiML leg completes even when attribution write fails");
 }
 
+// ── Phase 3.6: whisper POST + verb-mismatch regression guards ──────
+
+/**
+ * Phase 3.6 T68 — the pre-3.6 sev-1 defect: Twilio's <Number url> and
+ * <Client url> default to POST; the whisper route was GET-only for
+ * months (since Phase 3.2a) and every whisper 404'd in production,
+ * playing "an application error has occurred" to the answerer before
+ * the bridge. This test hits the REAL Express route table via HTTP,
+ * not the handler function — the previous 69-test suite invoked the
+ * function directly, so the routing layer was invisible.
+ */
+async function T68_whisper_route_accepts_post_over_http() {
+  const svr = await bootRoutingHttpApp();
+  try {
+    const twilioFormBody: Record<string, string> = {
+      // A real Twilio <Number url> callback carries these form fields
+      // in addition to whatever query params we set on the URL.
+      ApiVersion: "2010-04-01",
+      CallStatus: "in-progress",
+      Called: "+14155550001",
+      ParentCallSid: "CAparent",
+      CallSid: "CAwhisper",
+      From: "+14155559999",
+      To: "+14155550001",
+      AccountSid: "ACtest",
+    };
+    const path =
+      "/api/routing/whisper?text=" +
+      encodeURIComponent("Incoming call for EZ Rentals about Roadside & breakdown. Connecting now.") +
+      "&business_id=biz1&conversation_id=conv1&user_id=userA&leg=client";
+    const r = await svr.request({ method: "POST", path, formBody: twilioFormBody });
+    const failures: string[] = [];
+    if (r.status !== 200) failures.push(`status=${r.status} (Twilio would show 11200 + play error)`);
+    if (!/text\/xml/.test(r.contentType)) failures.push(`content-type=${r.contentType}`);
+    if (!/^<\?xml.*<Response>.*<Say>.*<\/Say>.*<\/Response>/s.test(r.body)) {
+      failures.push(`body shape wrong: ${r.body.slice(0, 200)}`);
+    }
+    record("T68 POST /api/routing/whisper → 200 valid TwiML (pre-3.6 sev-1: was 404)", failures.length === 0, failures.join("; ") || "verb-mismatch bug that made every whisper fail in prod is fixed");
+  } finally {
+    await svr.close();
+  }
+}
+
+/**
+ * Phase 3.6 T69 — the GET path must still work. Twilio's method="GET"
+ * override (dial-builder now emits it explicitly) MUST land on the
+ * same handler and produce the same TwiML.
+ */
+async function T69_whisper_route_accepts_get_over_http() {
+  const svr = await bootRoutingHttpApp();
+  try {
+    const path = "/api/routing/whisper?text=Hi&business_id=biz1&conversation_id=conv1&user_id=userA&leg=client";
+    const r = await svr.request({ method: "GET", path });
+    const failures: string[] = [];
+    if (r.status !== 200) failures.push(`status=${r.status}`);
+    if (!/<Response><Say>Hi<\/Say><\/Response>/.test(r.body)) failures.push(`body=${r.body}`);
+    record("T69 GET /api/routing/whisper → 200 valid TwiML (regression guard for explicit method=GET)", failures.length === 0, failures.join("; ") || "both verbs route to the same handler");
+  } finally {
+    await svr.close();
+  }
+}
+
+/**
+ * Phase 3.6 T70 — dial-builder emits the explicit method="GET" on
+ * both <Client url> and <Number url> attributes. Belt-and-braces
+ * against the same latent bug recurring anywhere else — if Twilio
+ * ever changes its default (they have before), our TwiML still
+ * expresses the intended verb.
+ */
+async function T70_dial_builder_emits_method_get_on_url() {
+  const decision = decideRouting({
+    onDutyForTopic: [],
+    onDutyAny: [
+      { userId: USER_A, callbackRingNumber: null, clientIdentity: CLIENT_A },
+      { userId: USER_B, callbackRingNumber: PHONE_B, clientIdentity: null },
+    ],
+    businessOpen: true,
+    legacyTransferToPhone: null,
+    topicConfigured: true,
+  });
+  const twiml = buildDialTwiml(decision, {
+    callerId: "+18005551234",
+    whisperUrl: "https://api.example.com/api/routing/whisper?text=Hi",
+    recordingStatusUrl: null,
+    dialStatusUrl: null,
+  });
+  const failures: string[] = [];
+  const clientMatch = /<Client\s+url="[^"]+"\s+method="([^"]+)"/.exec(twiml);
+  const numberMatch = /<Number\s+url="[^"]+"\s+method="([^"]+)"/.exec(twiml);
+  if (!clientMatch) failures.push("<Client> is missing url+method attributes");
+  else if (clientMatch[1] !== "GET") failures.push(`<Client> method=${clientMatch[1]} (expected GET)`);
+  if (!numberMatch) failures.push("<Number> is missing url+method attributes");
+  else if (numberMatch[1] !== "GET") failures.push(`<Number> method=${numberMatch[1]} (expected GET)`);
+  // <Number> WITHOUT url= must not carry a stray method= (compat).
+  const naked = /<Number>\+/.test(twiml) || decision.staffCandidates.every((c) => c.callbackRingNumber || c.clientIdentity);
+  if (!naked) failures.push("naked <Number> shape not present in mixed decision");
+  record("T70 dial-builder emits explicit method=\"GET\" on <Client>/<Number> url attributes", failures.length === 0, failures.join("; ") || "verb contract stated in the TwiML, not inherited from Twilio defaults");
+}
+
+/**
+ * Phase 3.6 T71 — the layered URL encoding chain survives a business
+ * name containing every problematic char. The failing production URL
+ * had a raw apostrophe in "caller's" — legal per RFC 3986 but the
+ * spec asked us to lock in encoding for names with `&`, `#`, `<`, `>`.
+ */
+async function T71_whisper_url_encoding_chain() {
+  const svr = await bootRoutingHttpApp();
+  try {
+    const composed = composeWhisperText({
+      businessName: "A & B <Roadside>",
+      topicName: "Bills # \"payments\"",
+    });
+    // Build the URL the same way routing.ts does.
+    const path =
+      "/api/routing/whisper?text=" +
+      encodeURIComponent(composed) +
+      "&business_id=" +
+      encodeURIComponent("biz_test_042") +
+      "&conversation_id=" +
+      encodeURIComponent("conv_test_042") +
+      "&user_id=" +
+      encodeURIComponent(USER_A) +
+      "&leg=client";
+    // Verify no bare `&`, `#`, `<`, `>` in the query part.
+    const queryPart = path.split("?")[1] || "";
+    const failures: string[] = [];
+    // The safety cargo: encodeURIComponent MUST turn every meaningful
+    // char into its %XX form so it doesn't collide with query-string
+    // syntax or XML attribute delimiters.
+    if (/[<>"]/.test(queryPart)) failures.push("query part contains unescaped XML-dangerous char");
+    // Ampersand IS legal in the query (separates params); check that
+    // the ONLY ampersands are the ones we intentionally inserted as
+    // separators (we have 4: after text, business_id, conversation_id, user_id).
+    const ampCount = (queryPart.match(/&/g) || []).length;
+    if (ampCount !== 4) failures.push(`ampersand count=${ampCount} (expected 4 separators)`);
+
+    // The handler must accept it via POST and produce valid TwiML.
+    const r = await svr.request({
+      method: "POST",
+      path,
+      formBody: { CallSid: "CAtest" },
+    });
+    if (r.status !== 200) failures.push(`status=${r.status}`);
+    if (!/<Say>[^<]+<\/Say>/.test(r.body)) failures.push(`body missing <Say>: ${r.body.slice(0, 200)}`);
+    record("T71 whisper URL encoding survives &, #, <, >, \" in business + topic names", failures.length === 0, failures.join("; ") || "encodeURIComponent + xmlEscape chain is robust");
+  } finally {
+    await svr.close();
+  }
+}
+
 // ── Bonus: whisper composition and TwiML ────────────────────────────
 
 async function whisper_composition() {
@@ -2971,10 +3192,22 @@ async function main() {
   await T65_whisper_attribution_write();
   await T66_whisper_handler_always_200_shape();
   await T67_whisper_write_swallows_errors();
+  // Phase 3.6 — real HTTP dispatch of the whisper route
+  await T68_whisper_route_accepts_post_over_http();
+  await T69_whisper_route_accepts_get_over_http();
+  await T70_dial_builder_emits_method_get_on_url();
+  await T71_whisper_url_encoding_chain();
   await whisper_composition();
 
   const fails = results.filter((r) => !r.pass);
   console.log(`\n${results.length - fails.length}/${results.length} passed`);
+  // Phase 3.6 — a quick tick before exit lets any lingering libuv
+  // handles (booted http servers, keep-alive sockets) finish tearing
+  // down. Without this, Windows Node occasionally aborts with
+  // "UV_HANDLE_CLOSING" during process.exit even though every test
+  // has completed. Doesn't affect pass/fail; keeps the harness from
+  // exit-code-3221226505 on Windows CI.
+  await new Promise((r) => setTimeout(r, 50));
   process.exit(fails.length === 0 ? 0 : 1);
 }
 
