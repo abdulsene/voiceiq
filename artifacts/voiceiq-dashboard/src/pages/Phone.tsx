@@ -34,6 +34,7 @@ import {
 } from "lucide-react";
 import { useSoftphone, StatusPill } from "../components/Softphone";
 import { getAuthHeaders } from "../lib/api";
+import { PhoneOutgoing, PhoneIncoming, PhoneMissed } from "lucide-react";
 
 export default function PhonePage() {
   const sp = useSoftphone();
@@ -337,16 +338,7 @@ export default function PhonePage() {
         )}
       </section>
 
-      <section className="rounded-xl border border-neutral-200 bg-white p-5">
-        <div className="flex items-center gap-2 mb-2">
-          <PhoneCall className="h-4 w-4 text-neutral-500" />
-          <h2 className="text-sm font-semibold text-neutral-900">Recent in-app calls</h2>
-        </div>
-        <div className="text-xs text-neutral-500">
-          A rolling history of calls that landed on this browser device will appear here as
-          they happen. See <Link className="text-blue-600 hover:underline" href="/calls">Calls &amp; Leads</Link> for the full transcript view.
-        </div>
-      </section>
+      <RecentInAppCallsPanel refreshKey={sp.hasActiveCall ? "active" : "idle"} />
 
       {/* Deploy verification footer — Phase 3.3c "was the bundle actually rebuilt?" */}
       <footer className="text-[11px] text-neutral-400 flex items-center gap-2 justify-between border-t border-neutral-200 pt-3">
@@ -363,6 +355,136 @@ export default function PhonePage() {
         ) : null}
       </footer>
     </div>
+  );
+}
+
+interface RecentCall {
+  id: string;
+  twilio_call_sid: string | null;
+  direction: string | null;
+  caller_number: string | null;
+  answered_via: string | null;
+  status: string | null;
+  call_outcome: string | null;
+  duration_seconds: number | null;
+  start_time: string | null;
+  end_time: string | null;
+  created_at: string | null;
+}
+
+/**
+ * Phase 3.8 — reads GET /api/voice/recent-calls (browser-only calls
+ * for the current user's active business). Auto-refreshes when the
+ * softphone transitions from active back to idle so a just-completed
+ * call appears without a manual reload.
+ */
+function RecentInAppCallsPanel({ refreshKey }: { refreshKey: string }) {
+  const [calls, setCalls] = useState<RecentCall[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+
+  const load = async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const res = await fetch("/api/voice/recent-calls?limit=20", {
+        headers: { "Content-Type": "application/json", ...getAuthHeaders() },
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = (await res.json()) as { calls?: RecentCall[] };
+      setCalls(data.calls ?? []);
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    void load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [refreshKey]);
+
+  return (
+    <section className="rounded-xl border border-neutral-200 bg-white p-5">
+      <div className="flex items-center justify-between mb-2">
+        <div className="flex items-center gap-2">
+          <PhoneCall className="h-4 w-4 text-neutral-500" />
+          <h2 className="text-sm font-semibold text-neutral-900">Recent in-app calls</h2>
+        </div>
+        <button
+          type="button"
+          onClick={() => void load()}
+          disabled={loading}
+          className="text-xs text-blue-600 hover:underline disabled:opacity-50"
+        >
+          {loading ? "Loading…" : "Refresh"}
+        </button>
+      </div>
+
+      {error ? (
+        <div className="text-xs text-red-700 rounded-md bg-red-50 p-2">
+          Couldn't load recent calls: {error}
+        </div>
+      ) : calls === null ? (
+        <div className="text-xs text-neutral-500">Loading…</div>
+      ) : calls.length === 0 ? (
+        <div className="text-xs text-neutral-500">
+          No calls yet. Answered inbound calls + calls you place from the dialpad above will
+          appear here. See{" "}
+          <Link className="text-blue-600 hover:underline" href="/calls">
+            Calls &amp; Leads
+          </Link>{" "}
+          for the full transcript view.
+        </div>
+      ) : (
+        <ul className="divide-y divide-neutral-100">
+          {calls.map((c) => (
+            <RecentCallRow key={c.id} call={c} />
+          ))}
+        </ul>
+      )}
+    </section>
+  );
+}
+
+function RecentCallRow({ call }: { call: RecentCall }) {
+  const outbound = call.direction === "outbound";
+  const answered =
+    call.call_outcome === "answered" || call.status === "answered" || call.status === "completed";
+  const Icon = outbound ? PhoneOutgoing : answered ? PhoneIncoming : PhoneMissed;
+  const iconColor = outbound
+    ? "text-blue-600"
+    : answered
+    ? "text-emerald-600"
+    : "text-neutral-400";
+  const when = call.created_at
+    ? new Date(call.created_at).toLocaleString(undefined, {
+        dateStyle: "short",
+        timeStyle: "short",
+      })
+    : "";
+  const duration =
+    typeof call.duration_seconds === "number" && call.duration_seconds >= 0
+      ? `${Math.floor(call.duration_seconds / 60)}:${String(call.duration_seconds % 60).padStart(2, "0")}`
+      : null;
+  const outcomeLabel =
+    call.call_outcome ||
+    (call.status && call.status !== "initiated" ? call.status : "in progress");
+  return (
+    <li className="flex items-center gap-3 py-2.5">
+      <Icon className={`h-4 w-4 shrink-0 ${iconColor}`} />
+      <div className="flex-1 min-w-0">
+        <div className="text-sm font-medium text-neutral-900 truncate">
+          {call.caller_number || "(unknown)"}
+        </div>
+        <div className="text-xs text-neutral-500">
+          {outbound ? "Outbound" : "Inbound"} · {outcomeLabel}
+          {duration ? ` · ${duration}` : ""}
+        </div>
+      </div>
+      <div className="text-xs text-neutral-400 shrink-0">{when}</div>
+    </li>
   );
 }
 

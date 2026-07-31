@@ -182,6 +182,12 @@ const AUTH_BYPASS_PATTERNS = [
   // inside the handler. /api/voice/token and /api/voice/heartbeat are
   // requireAuth-guarded and NOT bypass-listed.
   /^\/api\/voice\/outbound$/,
+  // Phase 3.8: /api/voice/outbound-status is the <Dial action> callback
+  // Twilio POSTs when a softphone-initiated outbound call terminates.
+  // Signature verified inside the handler + 200-always discipline
+  // (Phase 3.4) so an internal auth failure never becomes a
+  // customer-audible error.
+  /^\/api\/voice\/outbound-status$/,
   // Slice 3A pillar 3: customer trust portal. GET /api/public/lead/:token
   // and POST /api/public/lead/:token/action. Token IS the credential
   // (HS256-signed by lib/trust-portal-token.ts). Tight regex so future

@@ -42,6 +42,10 @@ import twilio from "twilio";
 import { requireAuth } from "../middlewares/auth";
 import { verifyTwilioSignature } from "../lib/twilio-signature";
 import { buildClientIdentity } from "../lib/voice/client-identity";
+// Phase 3.8 — outbound status callback URL. Same single-source-of-
+// truth helper used by the whisper + dial-status URLs so a PUBLIC_URL
+// vs PUBLIC_API_URL drift can't recreate the Phase 3.4 sev-1.
+import { getPublicApiBase } from "../lib/public-url";
 // Phase 3.3a — shared with routes/routing.ts (lives in lib/ to avoid
 // route → route imports). Previously duplicated as
 // DEVICE_FRESHNESS_SECS_ROUTING; that duplicate is gone. Imported for
@@ -417,11 +421,30 @@ function twimlHangup(reason: string): string {
   return `<?xml version="1.0" encoding="UTF-8"?><Response><Say>${xmlEscape(reason)}</Say><Hangup/></Response>`;
 }
 
-export function buildOutboundDialTwiml(callerId: string, to: string): string {
+export interface BuildOutboundDialTwimlOptions {
+  /**
+   * Phase 3.8 — optional <Dial action> URL. When provided, Twilio
+   * POSTs to it (default POST, we set method="POST" explicitly to
+   * document the contract) when the child leg terminates, carrying
+   * DialCallStatus + DialCallDuration + DialCallSid. Feeds
+   * handleOutboundStatus which stamps duration + status onto the
+   * calls row inserted at /voice/outbound time.
+   */
+  statusCallbackUrl?: string | null;
+}
+
+export function buildOutboundDialTwiml(
+  callerId: string,
+  to: string,
+  opts: BuildOutboundDialTwimlOptions = {},
+): string {
+  const actionAttrs = opts.statusCallbackUrl
+    ? ` action="${xmlEscape(opts.statusCallbackUrl)}" method="POST"`
+    : "";
   return (
     `<?xml version="1.0" encoding="UTF-8"?>` +
     `<Response>` +
-    `<Dial callerId="${xmlEscape(callerId)}" answerOnBridge="true">` +
+    `<Dial callerId="${xmlEscape(callerId)}" answerOnBridge="true"${actionAttrs}>` +
     `<Number>${xmlEscape(to)}</Number>` +
     `</Dial>` +
     `</Response>`
@@ -508,8 +531,356 @@ router.post(
       return;
     }
 
-    const twiml = buildOutboundDialTwiml(biz.twilioPhoneNumber, to);
+    // Phase 3.8 — log the outbound call. Insert a `calls` row keyed
+    // on Twilio's parent CallSid so the <Dial action> status callback
+    // can find + update it. Business is scoped SERVER-SIDE from the
+    // resolved client identity — never from body.businessId (the
+    // browser could try to forge it, and even honest attempts would
+    // hit the cross-tenant spoof guard above).
+    //
+    // Parent CallSid comes from Twilio in the outbound TwiML app body
+    // as `CallSid`. That's the browser leg's SID; the child leg's SID
+    // (`DialCallSid`) arrives later on the status callback. We key on
+    // the parent so both this insert and the callback update touch
+    // the same row.
+    const parentCallSid = body.CallSid || null;
+    const staffUserId = await resolveStaffUserIdForClient(supabase, identity);
+    const outboundCallRowId = await insertOutboundCallRow(supabase, {
+      businessId: biz.businessId,
+      twilioCallSid: parentCallSid,
+      customerNumber: to,
+      staffUserId,
+    });
+    // Fire-and-forget: link to a matching lead if one exists for
+    // this business. Best-effort — never blocks the TwiML response.
+    if (staffUserId && outboundCallRowId) {
+      void linkOutboundCallToLeadIfMatch(supabase, {
+        businessId: biz.businessId,
+        customerPhone: to,
+        callsRowId: outboundCallRowId,
+        twilioCallSid: parentCallSid,
+        staffUserId,
+      }).catch((err) => {
+        Sentry.captureException(err, {
+          extra: { where: "voice.outbound.linkLead", businessId: biz.businessId },
+        });
+      });
+    }
+
+    const statusCallbackUrl = `${getPublicApiBase()}/api/voice/outbound-status`;
+    const twiml = buildOutboundDialTwiml(biz.twilioPhoneNumber, to, {
+      statusCallbackUrl,
+    });
     res.status(200).type("text/xml").send(twiml);
+  },
+);
+
+// ── Outbound call logging + outcome callback ────────────────────────
+
+/**
+ * Phase 3.8 — resolve staff user_id from the calling client identity.
+ * The identity encodes (user_id, business_id) per Phase 3.3a so we
+ * pull the user_id straight from the DB row. If we can't (edge case:
+ * identity not on file), returns null and the calls row is inserted
+ * without staff attribution — better than dropping the row entirely.
+ */
+export async function resolveStaffUserIdForClient(
+  supabase: SupabaseClient,
+  clientIdentity: string,
+): Promise<string | null> {
+  try {
+    const { data } = await supabase
+      .from("user_businesses")
+      .select("user_id")
+      .eq("client_identity", clientIdentity)
+      .limit(1)
+      .maybeSingle();
+    return (data as { user_id?: string } | null)?.user_id ?? null;
+  } catch {
+    return null;
+  }
+}
+
+export interface InsertOutboundCallInput {
+  businessId: string;
+  twilioCallSid: string | null;
+  customerNumber: string;
+  staffUserId: string | null;
+}
+
+/**
+ * Insert a `calls` row at dial-time. Returns the row's UUID so the
+ * caller can pass it to lead-linkage. Failure is logged but does not
+ * throw — the TwiML response must not depend on this.
+ */
+export async function insertOutboundCallRow(
+  supabase: SupabaseClient,
+  input: InsertOutboundCallInput,
+): Promise<string | null> {
+  const now = new Date().toISOString();
+  const payload: Record<string, unknown> = {
+    business_id: input.businessId,
+    caller_number: input.customerNumber, // "the other party" — same shape as inbound
+    direction: "outbound",
+    // Softphone origin: answered_via distinguishes from PSTN transfers.
+    answered_via: "browser",
+    handled_by_user_id: input.staffUserId,
+    handled_at: now, // outbound: "who initiated" doubles as "when placed"
+    status: "initiated",
+    start_time: now,
+    created_at: now,
+  };
+  if (input.twilioCallSid) payload.twilio_call_sid = input.twilioCallSid;
+  try {
+    const { data, error } = await supabase
+      .from("calls")
+      .insert(payload)
+      .select("id")
+      .single();
+    if (error) {
+      Sentry.captureMessage("voice_outbound_insert_failed", {
+        level: "error",
+        extra: { businessId: input.businessId, error: error.message },
+      });
+      return null;
+    }
+    return (data as { id?: string } | null)?.id ?? null;
+  } catch (err: any) {
+    Sentry.captureException(err, { extra: { where: "insertOutboundCallRow" } });
+    return null;
+  }
+}
+
+/**
+ * Best-effort lead linkage. If the dialed number matches a lead in
+ * the SAME business, insert a `lead_activities` timeline row so the
+ * outbound call shows on the customer's timeline instead of floating
+ * unattached.
+ *
+ * MUST scope by business_id — no cross-tenant matching allowed
+ * (dialing a number that happens to belong to another tenant's lead
+ * must not populate their timeline).
+ */
+export async function linkOutboundCallToLeadIfMatch(
+  supabase: SupabaseClient,
+  input: {
+    businessId: string;
+    customerPhone: string;
+    callsRowId: string;
+    twilioCallSid: string | null;
+    staffUserId: string;
+  },
+): Promise<{ leadId: string | null }> {
+  // Normalise for match: last 10 digits, same rule the routing engine
+  // uses in normalizePhone (routing.ts). Compare in JS so we don't
+  // need an index-hostile LIKE query.
+  const digits = String(input.customerPhone).replace(/\D+/g, "");
+  const last10 = digits.length >= 10 ? digits.slice(-10) : digits;
+  if (!last10) return { leadId: null };
+
+  const { data: candidates } = await supabase
+    .from("leads")
+    .select("id, contact_phone")
+    .eq("business_id", input.businessId)
+    .limit(200);
+  const list = (candidates as Array<{ id: string; contact_phone: string | null }> | null) ?? [];
+  const match = list.find((l) => {
+    const ld = String(l.contact_phone ?? "").replace(/\D+/g, "");
+    return ld.length >= 10 && ld.slice(-10) === last10;
+  });
+  if (!match) return { leadId: null };
+
+  try {
+    await supabase.from("lead_activities").insert({
+      lead_id: match.id,
+      actor_id: input.staffUserId,
+      actor_type: "staff",
+      action: "outbound_call_placed",
+      metadata: {
+        source: "softphone",
+        calls_row_id: input.callsRowId,
+        twilio_call_sid: input.twilioCallSid,
+        customer_phone: input.customerPhone,
+      },
+    });
+  } catch (err: any) {
+    Sentry.captureException(err, {
+      extra: { where: "linkOutboundCallToLeadIfMatch", leadId: match.id },
+    });
+  }
+  return { leadId: match.id };
+}
+
+/**
+ * Phase 3.8 — <Dial action> callback for outbound softphone calls.
+ * Twilio POSTs when the child leg terminates carrying DialCallStatus
+ * + DialCallDuration + DialCallSid. We update the `calls` row that
+ * was inserted at /voice/outbound time (keyed on parent Twilio SID).
+ *
+ * MUST return 200 under every failure mode — mid-call TwiML callback
+ * discipline from Phase 3.4. Signature verified inside, 401 downgraded
+ * to Sentry-logged 200.
+ */
+export interface OutboundStatusBody {
+  CallSid?: string; // parent — the browser leg's SID (our row key)
+  DialCallSid?: string; // child — the customer-leg SID
+  DialCallStatus?: string; // completed|no-answer|busy|failed|canceled
+  DialCallDuration?: string; // seconds, string on the wire
+}
+
+export interface OutboundStatusResult {
+  ok: boolean;
+  updatedCallsRow: boolean;
+  matchedByParentSid: boolean;
+}
+
+export async function handleOutboundStatus(
+  supabase: SupabaseClient,
+  body: OutboundStatusBody,
+  now: Date = new Date(),
+): Promise<OutboundStatusResult> {
+  const parentSid = typeof body.CallSid === "string" ? body.CallSid : "";
+  if (!parentSid) {
+    return { ok: true, updatedCallsRow: false, matchedByParentSid: false };
+  }
+  const rawStatus = typeof body.DialCallStatus === "string" ? body.DialCallStatus : "";
+  const duration = Number.parseInt(String(body.DialCallDuration ?? ""), 10);
+  const patch: Record<string, unknown> = {
+    status: rawStatus || "completed",
+    end_time: now.toISOString(),
+  };
+  if (Number.isFinite(duration) && duration >= 0) patch.duration_seconds = duration;
+  // Only set call_outcome when we know the final Twilio disposition —
+  // 'completed' is Twilio-speak for "the customer answered and hung
+  // up cleanly." For unanswered / busy / failed we set an equivalent
+  // string so ops can filter later without joining Twilio's console.
+  if (rawStatus === "completed") patch.call_outcome = "answered";
+  else if (rawStatus === "no-answer") patch.call_outcome = "no_answer";
+  else if (rawStatus === "busy") patch.call_outcome = "busy";
+  else if (rawStatus === "failed") patch.call_outcome = "failed";
+  else if (rawStatus === "canceled") patch.call_outcome = "canceled";
+
+  try {
+    const { data, error } = await supabase
+      .from("calls")
+      .update(patch)
+      .eq("twilio_call_sid", parentSid)
+      .select("id")
+      .maybeSingle();
+    if (error) {
+      Sentry.captureMessage("voice_outbound_status_update_failed", {
+        level: "warning",
+        extra: { parentSid, error: error.message },
+      });
+      return { ok: true, updatedCallsRow: false, matchedByParentSid: false };
+    }
+    return {
+      ok: true,
+      updatedCallsRow: !!data,
+      matchedByParentSid: !!data,
+    };
+  } catch (err: any) {
+    Sentry.captureException(err, {
+      extra: { where: "handleOutboundStatus", parentSid },
+    });
+    return { ok: true, updatedCallsRow: false, matchedByParentSid: false };
+  }
+}
+
+router.post(
+  "/voice/outbound-status",
+  async (req: Request, res: Response): Promise<void> => {
+    // Same 200-always discipline as dial-status: mid-call TwiML
+    // callbacks must never surface non-2xx to Twilio, or the answerer
+    // (already in-call) hears "an application error has occurred."
+    if (!verifyTwilioSignature(req)) {
+      Sentry.captureMessage("voice_outbound_status_signature_rejected", {
+        level: "error",
+        extra: { path: req.originalUrl },
+      });
+      res.status(200).type("text/xml").send('<?xml version="1.0" encoding="UTF-8"?><Response/>');
+      return;
+    }
+    const supabase = getSupabase();
+    if (!supabase) {
+      res.status(200).type("text/xml").send('<?xml version="1.0" encoding="UTF-8"?><Response/>');
+      return;
+    }
+    await handleOutboundStatus(supabase, (req.body || {}) as OutboundStatusBody);
+    res.status(200).type("text/xml").send('<?xml version="1.0" encoding="UTF-8"?><Response/>');
+  },
+);
+
+// ── Recent in-app calls (Phone page panel) ──────────────────────────
+
+export interface RecentCallRow {
+  id: string;
+  twilio_call_sid: string | null;
+  direction: string | null;
+  caller_number: string | null;
+  answered_via: string | null;
+  status: string | null;
+  call_outcome: string | null;
+  duration_seconds: number | null;
+  start_time: string | null;
+  end_time: string | null;
+  created_at: string | null;
+}
+
+export interface RecentCallsResponse {
+  calls: RecentCallRow[];
+}
+
+export async function listRecentInAppCallsForUser(
+  supabase: SupabaseClient,
+  userId: string,
+  businessId: string,
+  limit: number = 20,
+): Promise<
+  | { ok: true; body: RecentCallsResponse }
+  | { ok: false; status: number; error: string }
+> {
+  const { data, error } = await supabase
+    .from("calls")
+    .select(
+      "id, twilio_call_sid, direction, caller_number, answered_via, status, call_outcome, duration_seconds, start_time, end_time, created_at",
+    )
+    .eq("business_id", businessId)
+    .eq("handled_by_user_id", userId)
+    .eq("answered_via", "browser")
+    .order("created_at", { ascending: false })
+    .limit(Math.min(Math.max(limit, 1), 100));
+  if (error) return { ok: false, status: 500, error: error.message };
+  return { ok: true, body: { calls: (data as RecentCallRow[] | null) ?? [] } };
+}
+
+router.get(
+  "/voice/recent-calls",
+  requireAuth,
+  async (req: Request, res: Response): Promise<void> => {
+    const userId = req.userId;
+    const businessId = req.businessId;
+    if (!userId || !businessId) {
+      res.status(401).json({ error: "Authentication required" });
+      return;
+    }
+    const supabase = getSupabase();
+    if (!supabase) {
+      res.status(500).json({ error: "Database not configured" });
+      return;
+    }
+    const parsedLimit = Number.parseInt(String(req.query.limit || "20"), 10);
+    const result = await listRecentInAppCallsForUser(
+      supabase,
+      userId,
+      businessId,
+      Number.isFinite(parsedLimit) ? parsedLimit : 20,
+    );
+    if (!result.ok) {
+      res.status(result.status).json({ error: result.error });
+      return;
+    }
+    res.json(result.body);
   },
 );
 
