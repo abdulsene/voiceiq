@@ -472,6 +472,21 @@ export function SoftphoneProvider({ children }: { children: ReactNode }) {
   // /voice/calls/by-twilio-sid endpoint and surface a modal. Skips
   // calls that never connected (staff hangup while ringing, etc.)
   // — those already have accurate inferred outcomes.
+  //
+  // Phase 3.13 — SDK accessor bugs fixed. Evidence for the fix:
+  //  1. `Call.direction` is a GETTER (call.d.ts:32), NOT a method.
+  //     Calling it as `direction?.()` throws / returns undefined, so
+  //     the isOutbound guard always fell through.
+  //  2. `Call.parameters` is populated by Twilio only for incoming
+  //     calls (call.d.ts:52 JSDoc). For outbound, `parameters` is
+  //     `{}` UNTIL `_setCallSid` writes `parameters.CallSid` on the
+  //     answer signalling flow (call.js:1284). There is never a
+  //     `parameters.Direction` key on outbound.
+  //  3. `outboundConnectionId` is a locally-generated *temporary*
+  //     SID ("TJS...", call.js:577) — it does NOT match the
+  //     `twilio_call_sid` stored server-side (that's the real
+  //     "CA..." SID Twilio sent us at /voice/outbound). We must
+  //     NOT fall back to it for the row lookup.
   const [pendingDisposition, setPendingDisposition] = useState<DispositionCandidate | null>(null);
   const lastConnectedOutboundRef = useRef<{
     twilioCallSid: string;
@@ -480,27 +495,51 @@ export function SoftphoneProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     if (device.callPhase !== "connected") return;
     const active = device.active as any;
-    if (!active) return;
-    const direction = active.parameters?.Direction ?? active.direction?.();
-    // A Client-initiated outbound call has direction 'OUTGOING' in the
-    // Voice SDK. The parameters.To on an outbound call is the dialed
-    // number; on an inbound call it's the business's own inbound
-    // number. Use direction as the primary signal.
-    const isOutbound = String(direction || "").toUpperCase() === "OUTGOING";
-    if (!isOutbound) return;
-    const twilioCallSid = active.parameters?.CallSid;
-    const calleeNumber = active.customParameters?.get?.("To") || active.parameters?.To || "";
-    if (!twilioCallSid) return;
-    lastConnectedOutboundRef.current = {
+    if (!active) {
+      console.debug("[softphone/disposition] connected phase but no active call");
+      return;
+    }
+    // Property access — `direction` is a getter, not a method.
+    const direction = String(active.direction || "").toUpperCase();
+    if (direction !== "OUTGOING") {
+      console.debug("[softphone/disposition] non-outbound; direction=", direction);
+      return;
+    }
+    // `_setCallSid` fires inside `_onAnswer` BEFORE the 'accept'
+    // event is emitted (call.js:224 sequence), and 'accept' is what
+    // promotes callPhase to 'connected' (useTwilioDevice:437). So by
+    // this point, parameters.CallSid is populated with the real
+    // "CA..." SID that matches our server-side row.
+    const twilioCallSid: string | undefined = active.parameters?.CallSid;
+    if (!twilioCallSid || !twilioCallSid.startsWith("CA")) {
+      console.debug(
+        "[softphone/disposition] no real CallSid yet; parameters.CallSid=",
+        twilioCallSid,
+        "outboundConnectionId=",
+        active.outboundConnectionId,
+      );
+      return;
+    }
+    // `customParameters` is the Map of twimlParams we passed to
+    // device.connect({ params: { To, callerId } }) — always set on
+    // outbound.
+    const calleeNumber = active.customParameters?.get?.("To") || "";
+    lastConnectedOutboundRef.current = { twilioCallSid, calleeNumber };
+    console.debug(
+      "[softphone/disposition] captured outbound CallSid=",
       twilioCallSid,
+      "callee=",
       calleeNumber,
-    };
+    );
   }, [device.callPhase, device.active]);
 
   useEffect(() => {
     if (device.callPhase !== "ended") return;
     const lastConnected = lastConnectedOutboundRef.current;
-    if (!lastConnected) return;
+    if (!lastConnected) {
+      console.debug("[softphone/disposition] ended phase; no captured outbound");
+      return;
+    }
     // Consumed — clear the ref so we don't re-fire on stale state.
     lastConnectedOutboundRef.current = null;
     (async () => {
@@ -512,20 +551,36 @@ export function SoftphoneProvider({ children }: { children: ReactNode }) {
           `/api/voice/calls/by-twilio-sid/${encodeURIComponent(lastConnected.twilioCallSid)}`,
           { headers: { "Content-Type": "application/json", ...getAuthHeaders() } },
         );
-        if (!res.ok) return; // silent — modal is opt-in UX, not a failure surface
+        if (!res.ok) {
+          console.debug(
+            "[softphone/disposition] lookup failed status=",
+            res.status,
+            "sid=",
+            lastConnected.twilioCallSid,
+          );
+          return; // silent — modal is opt-in UX, not a failure surface
+        }
         const body = (await res.json()) as {
           call?: { id: string; disposition: string | null; caller_number: string | null };
         };
-        if (!body.call || !body.call.id) return;
+        if (!body.call || !body.call.id) {
+          console.debug("[softphone/disposition] lookup returned no call");
+          return;
+        }
         // If the row is already dispositioned (rare — modal was already
         // shown and written), don't reopen.
-        if (body.call.disposition) return;
+        if (body.call.disposition) {
+          console.debug("[softphone/disposition] already dispositioned=", body.call.disposition);
+          return;
+        }
+        console.debug("[softphone/disposition] opening modal for call id=", body.call.id);
         setPendingDisposition({
           callRowId: body.call.id,
           twilioCallSid: lastConnected.twilioCallSid,
           calleeNumber: body.call.caller_number || lastConnected.calleeNumber,
         });
-      } catch {
+      } catch (err) {
+        console.debug("[softphone/disposition] lookup threw", err);
         // Non-fatal; the modal is a UX assist, not a required flow.
       }
     })();
