@@ -188,6 +188,25 @@
  *       200 valid TwiML + voicemail outcome + raw values stored.
  *   T87 server-side outbound normalization: 10/11/formatted → +E.164.
  *
+ *   3.10 additions (amdStatusCallback wiring + ordering-safe merge):
+ *   T88 buildOutboundDialTwiml emits amdStatusCallback +
+ *       amdStatusCallbackMethod="POST" on <Number>. Phase 3.9 assumed
+ *       AnsweredBy would arrive on the <Dial action> callback body;
+ *       it doesn't — Twilio only sends AMD results to a dedicated
+ *       amdStatusCallback URL. Without it, machineDetection ran and
+ *       the result was silently dropped, misclassifying every
+ *       voicemail as answered_human.
+ *   T89 AMD arrives FIRST → row stamped voicemail; Dial-action arrives
+ *       SECOND WITHOUT clobbering. Merge in handleOutboundStatus reads
+ *       existing answered_by so a delayed Dial-action carrying no
+ *       AnsweredBy doesn't remap back to answered_human.
+ *   T90 Dial-action FIRST → answered_human; AMD SECOND → UPGRADES
+ *       to voicemail. status + duration written by Dial-action stay.
+ *   T91 AMD does NOT downgrade terminal outcomes (no_answer / busy /
+ *       failed). Raw answered_by still stored for diagnosability.
+ *   T92 POST /api/voice/amd-status route-layer HTTP smoke — 200 valid
+ *       TwiML + row upgraded to voicemail end-to-end.
+ *
  * Run: pnpm --filter @workspace/api-server exec tsx \
  *        src/tests/040-routing-smoke.ts
  */
@@ -240,6 +259,8 @@ import {
   normalizeUsPhoneToE164,
   resolveOutboundAmdMode,
   type OutboundOutcome,
+  // Phase 3.10 — amdStatusCallback wiring + ordering-safe merge.
+  handleAmdStatus,
 } from "../routes/voice";
 // Phase 3.3c — agent resync + tool inspector.
 import { fetchRegisteredToolNames } from "../routes/agent-sync";
@@ -3951,6 +3972,278 @@ async function T87_normalize_10_digit_dials_e164() {
   record("T87 outbound server-side normalization: 10/11/formatted → +E.164 pre-dial", failures.length === 0, failures.join("; ") || "browser normalization is UX; server normalization is the truth");
 }
 
+// ── Phase 3.10: amdStatusCallback wiring + ordering-safe merge ─────
+
+/**
+ * Phase 3.10 T88 — buildOutboundDialTwiml emits amdStatusCallback +
+ * amdStatusCallbackMethod on the <Number> when the URL is provided
+ * alongside machineDetection. Direct assertion — Phase 3.9's assumption
+ * that AnsweredBy folds into <Dial action> was wrong and every
+ * voicemail was misclassified until this callback landed.
+ */
+async function T88_amd_status_callback_emitted() {
+  const failures: string[] = [];
+
+  // Default AMD mode + explicit callback URL.
+  const t1 = buildOutboundDialTwiml("+14433314649", "+12025732022", {
+    statusCallbackUrl: "https://x/y",
+    amdStatusCallbackUrl: "https://x/api/voice/amd-status",
+  });
+  if (!/machineDetection="Enable"/.test(t1)) failures.push("machineDetection missing");
+  if (!/amdStatusCallback="https:\/\/x\/api\/voice\/amd-status"/.test(t1)) {
+    failures.push("amdStatusCallback URL missing on <Number>");
+  }
+  if (!/amdStatusCallbackMethod="POST"/.test(t1)) {
+    failures.push("amdStatusCallbackMethod=POST missing (Twilio would default GET otherwise)");
+  }
+  // Ordering: both AMD attrs must be on <Number>, not <Dial>.
+  const numberOpen = /<Number\s+([^>]+)>/.exec(t1)?.[1] || "";
+  if (!numberOpen.includes("amdStatusCallback")) failures.push("amdStatusCallback not on <Number>");
+
+  // AMD disabled → no callback URL emitted even if provided (Twilio
+  // wouldn't fire it anyway; better to keep TwiML tidy).
+  const t2 = buildOutboundDialTwiml("+18005551234", "+12025550001", {
+    amdMode: null,
+    amdStatusCallbackUrl: "https://x/api/voice/amd-status",
+  });
+  if (/amdStatusCallback=/.test(t2)) failures.push("callback emitted with AMD disabled");
+
+  record("T88 amdStatusCallback + method=POST emitted on <Number> alongside machineDetection", failures.length === 0, failures.join("; ") || "Phase 3.10 fix: AMD result actually has somewhere to go");
+}
+
+/**
+ * Phase 3.10 T89 — AMD-first ordering. Voicemail systems typically
+ * trigger AMD before the Dial leg terminates. The AMD callback lands
+ * first, then the Dial-action callback. The row must end up with
+ * call_outcome='voicemail' after BOTH have landed.
+ */
+async function T89_amd_first_then_dial_action() {
+  const fake = new FakeSupabaseClient();
+  // AMD-first: row has no status yet (or just 'initiated'), no
+  // call_outcome. AMD reads it, sees an empty status, but STILL
+  // stamps call_outcome='voicemail' because machine_* is a
+  // meaningful classification independent of DialCallStatus.
+  //
+  // FakeSupabaseClient dispatches every .select on `calls` to the
+  // same stub — we mutate the returned row across calls to simulate
+  // sequential state.
+  let currentRow: any = {
+    call_outcome: null,
+    status: null,
+    duration_seconds: null,
+    answered_by: null,
+  };
+  fake.on(
+    (c) => c.op === "select" && c.table === "calls",
+    { data: null }, // overridden by resolveCall below
+  );
+  const origResolve = fake.resolveCall.bind(fake);
+  fake.resolveCall = async function (call: any) {
+    if (call.op === "select" && call.table === "calls") {
+      return { data: currentRow, error: null };
+    }
+    if (call.op === "update" && call.table === "calls") {
+      // Merge payload into currentRow so the second callback reads
+      // what the first wrote.
+      currentRow = { ...currentRow, ...call.payload };
+      return { data: { id: "call_row_1" }, error: null };
+    }
+    return origResolve(call);
+  };
+
+  // 1. AMD lands first — voicemail machine detected.
+  const amdRes = await handleAmdStatus(asClient(fake), {
+    CallSid: "CAvoicemail",
+    AnsweredBy: "machine_start",
+  });
+  const failures: string[] = [];
+  if (!amdRes.ok) failures.push("AMD not ok");
+  if (amdRes.outcome !== "voicemail") failures.push(`AMD-first outcome=${amdRes.outcome} (expected voicemail)`);
+  if (currentRow.answered_by !== "machine_start") failures.push(`answered_by after AMD=${currentRow.answered_by}`);
+  if (currentRow.call_outcome !== "voicemail") failures.push(`call_outcome after AMD=${currentRow.call_outcome}`);
+
+  // 2. Dial-action lands second — Twilio reports completed with no
+  // AnsweredBy (it never carries AnsweredBy). The merge MUST use the
+  // row's existing answered_by and preserve voicemail.
+  const dialRes = await handleOutboundStatus(asClient(fake), {
+    CallSid: "CAvoicemail",
+    DialCallStatus: "completed",
+    DialCallDuration: "8",
+  });
+  if (!dialRes.ok) failures.push("Dial-action not ok");
+  if (dialRes.outcome !== "voicemail") failures.push(`Dial-action outcome=${dialRes.outcome} (must preserve voicemail)`);
+  if (currentRow.call_outcome !== "voicemail") failures.push(`final call_outcome=${currentRow.call_outcome} (voicemail preserved)`);
+  if (currentRow.answered_by !== "machine_start") failures.push(`answered_by not preserved: ${currentRow.answered_by}`);
+  if (currentRow.status !== "completed") failures.push(`status=${currentRow.status}`);
+  if (currentRow.duration_seconds !== 8) failures.push(`duration=${currentRow.duration_seconds}`);
+
+  record("T89 AMD arrives FIRST → voicemail; Dial-action arrives second WITHOUT clobbering", failures.length === 0, failures.join("; ") || "AMD-first ordering: voicemail sticks through subsequent Dial-action");
+}
+
+/**
+ * Phase 3.10 T90 — Dial-action-first ordering. The Dial leg
+ * terminates before AMD finishes (rare in practice but possible for
+ * short voicemails / brute-force machine detection). The row is
+ * stamped answered_human first; when AMD lands, it must UPGRADE to
+ * voicemail.
+ */
+async function T90_dial_action_first_then_amd() {
+  const fake = new FakeSupabaseClient();
+  let currentRow: any = {
+    call_outcome: null,
+    status: null,
+    duration_seconds: null,
+    answered_by: null,
+  };
+  const origResolve = fake.resolveCall.bind(fake);
+  fake.resolveCall = async function (call: any) {
+    if (call.op === "select" && call.table === "calls") {
+      return { data: currentRow, error: null };
+    }
+    if (call.op === "update" && call.table === "calls") {
+      currentRow = { ...currentRow, ...call.payload };
+      return { data: { id: "row" }, error: null };
+    }
+    return origResolve(call);
+  };
+
+  // 1. Dial-action lands first — no AMD result yet.
+  const dialRes = await handleOutboundStatus(asClient(fake), {
+    CallSid: "CAup1",
+    DialCallStatus: "completed",
+    DialCallDuration: "12",
+  });
+  const failures: string[] = [];
+  if (!dialRes.ok) failures.push("Dial-action not ok");
+  if (dialRes.outcome !== "answered_human") failures.push(`Dial-first outcome=${dialRes.outcome} (expected answered_human — AMD off/unknown default)`);
+  if (currentRow.call_outcome !== "answered_human") failures.push(`row outcome after Dial-first=${currentRow.call_outcome}`);
+
+  // 2. AMD lands second — machine detected. Must UPGRADE the row's
+  // call_outcome from answered_human to voicemail.
+  const amdRes = await handleAmdStatus(asClient(fake), {
+    CallSid: "CAup1",
+    AnsweredBy: "machine_end_beep",
+  });
+  if (!amdRes.ok) failures.push("AMD not ok");
+  if (amdRes.outcome !== "voicemail") failures.push(`AMD-upgrade outcome=${amdRes.outcome}`);
+  if (currentRow.call_outcome !== "voicemail") failures.push(`row outcome after AMD upgrade=${currentRow.call_outcome}`);
+  if (currentRow.answered_by !== "machine_end_beep") failures.push(`answered_by after AMD=${currentRow.answered_by}`);
+  // Status and duration stay from the earlier Dial-action write.
+  if (currentRow.status !== "completed") failures.push(`status clobbered=${currentRow.status}`);
+  if (currentRow.duration_seconds !== 12) failures.push(`duration clobbered=${currentRow.duration_seconds}`);
+
+  record("T90 Dial-action FIRST → answered_human; AMD SECOND → upgrades to voicemail", failures.length === 0, failures.join("; ") || "AMD upgrade replaces answered_human when it arrives late");
+}
+
+/**
+ * Phase 3.10 T91 — TERMINAL-outcome guard. If Dial-action stamped
+ * no_answer / busy / failed, an AMD signal is meaningless (the call
+ * never actually connected to a machine to analyze). Row's outcome
+ * must stay as-is; raw answered_by can still be stored for forensics.
+ */
+async function T91_amd_never_downgrades_terminal_outcome() {
+  const failures: string[] = [];
+  for (const terminal of ["no_answer", "busy", "failed"] as const) {
+    const fake = new FakeSupabaseClient();
+    let currentRow: any = {
+      call_outcome: terminal,
+      status: terminal === "no_answer" ? "no-answer" : terminal,
+      duration_seconds: 0,
+      answered_by: null,
+    };
+    const origResolve = fake.resolveCall.bind(fake);
+    fake.resolveCall = async function (call: any) {
+      if (call.op === "select" && call.table === "calls") {
+        return { data: currentRow, error: null };
+      }
+      if (call.op === "update" && call.table === "calls") {
+        currentRow = { ...currentRow, ...call.payload };
+        return { data: { id: "row" }, error: null };
+      }
+      return origResolve(call);
+    };
+
+    const r = await handleAmdStatus(asClient(fake), {
+      CallSid: "CAterminal",
+      AnsweredBy: "machine_start",
+    });
+    if (!r.preservedTerminalOutcome) {
+      failures.push(`[${terminal}] preservedTerminalOutcome=false`);
+    }
+    if (currentRow.call_outcome !== terminal) {
+      failures.push(`[${terminal}] call_outcome overwritten to ${currentRow.call_outcome}`);
+    }
+    // answered_by should still be stored for diagnosability.
+    if (currentRow.answered_by !== "machine_start") {
+      failures.push(`[${terminal}] answered_by not stored: ${currentRow.answered_by}`);
+    }
+  }
+  record("T91 AMD does NOT downgrade terminal outcomes (no_answer / busy / failed)", failures.length === 0, failures.join("; ") || "spurious AMD signals on non-answered calls don't corrupt outcomes");
+}
+
+/**
+ * Phase 3.10 T92 — route-layer HTTP smoke for /voice/amd-status.
+ * Same discipline as Phase 3.6 whisper: verb registration + shape
+ * verified end-to-end. Twilio POSTs with form-urlencoded body.
+ */
+async function T92_amd_status_route_http() {
+  const express = (await import("express")).default;
+  const http = await import("node:http");
+  const app = express();
+  app.use(express.urlencoded({ extended: false }));
+  app.use(express.json());
+
+  const fake = new FakeSupabaseClient();
+  let currentRow: any = {
+    call_outcome: "answered_human",
+    status: "completed",
+    duration_seconds: 5,
+    answered_by: null,
+  };
+  const origResolve = fake.resolveCall.bind(fake);
+  fake.resolveCall = async function (call: any) {
+    if (call.op === "select" && call.table === "calls") {
+      return { data: currentRow, error: null };
+    }
+    if (call.op === "update" && call.table === "calls") {
+      currentRow = { ...currentRow, ...call.payload };
+      return { data: { id: "row" }, error: null };
+    }
+    return origResolve(call);
+  };
+  app.post("/api/voice/amd-status", async (req, res) => {
+    await handleAmdStatus(asClient(fake), (req.body || {}) as any);
+    res.status(200).type("text/xml").send('<?xml version="1.0" encoding="UTF-8"?><Response/>');
+  });
+
+  const server = http.createServer(app);
+  await new Promise<void>((resolve) => server.listen(0, resolve));
+  const addr = server.address();
+  const port = typeof addr === "object" && addr ? addr.port : 0;
+  const failures: string[] = [];
+  try {
+    const body = new URLSearchParams({
+      CallSid: "CAhttptest",
+      AnsweredBy: "machine_end_silence",
+    }).toString();
+    const res = await fetch(`http://127.0.0.1:${port}/api/voice/amd-status`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body,
+    });
+    if (res.status !== 200) failures.push(`status=${res.status}`);
+    const twiml = await res.text();
+    if (!/^<\?xml.*<Response\/>/s.test(twiml)) failures.push(`twiml=${twiml.slice(0, 80)}`);
+    // The handler must have upgraded call_outcome from answered_human
+    // to voicemail based on the AMD result.
+    if (currentRow.call_outcome !== "voicemail") failures.push(`call_outcome=${currentRow.call_outcome}`);
+    if (currentRow.answered_by !== "machine_end_silence") failures.push(`answered_by=${currentRow.answered_by}`);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+  record("T92 POST /api/voice/amd-status → 200 TwiML + row upgraded to voicemail", failures.length === 0, failures.join("; ") || "route-layer verb + shape locked; the sev-1 that motivated 3.10 can't recur silently");
+}
+
 // ── Bonus: whisper composition and TwiML ────────────────────────────
 
 async function whisper_composition() {
@@ -4073,6 +4366,12 @@ async function main() {
   await T85_normalize_us_phone_matrix();
   await T86_outbound_status_amd_route_http();
   await T87_normalize_10_digit_dials_e164();
+  // Phase 3.10 — amdStatusCallback wiring + ordering-safe merge
+  await T88_amd_status_callback_emitted();
+  await T89_amd_first_then_dial_action();
+  await T90_dial_action_first_then_amd();
+  await T91_amd_never_downgrades_terminal_outcome();
+  await T92_amd_status_route_http();
   await whisper_composition();
 
   const fails = results.filter((r) => !r.pass);

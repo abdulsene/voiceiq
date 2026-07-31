@@ -188,6 +188,14 @@ const AUTH_BYPASS_PATTERNS = [
   // (Phase 3.4) so an internal auth failure never becomes a
   // customer-audible error.
   /^\/api\/voice\/outbound-status$/,
+  // Phase 3.10: /api/voice/amd-status is the dedicated AMD result
+  // callback (Twilio POSTs AnsweredBy here). Separate from the
+  // <Dial action> callback because AnsweredBy is NOT included in
+  // that callback body — a mistake Phase 3.9 made that caused
+  // every voicemail to be misclassified as answered_human until
+  // this route landed. Same 200-always + signature-verify-inside
+  // posture as /outbound-status.
+  /^\/api\/voice\/amd-status$/,
   // Slice 3A pillar 3: customer trust portal. GET /api/public/lead/:token
   // and POST /api/public/lead/:token/action. Token IS the credential
   // (HS256-signed by lib/trust-portal-token.ts). Tight regex so future

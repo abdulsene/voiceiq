@@ -451,6 +451,17 @@ export interface BuildOutboundDialTwimlOptions {
    * 3.4. Defaults to 'us'; pass null to opt out.
    */
   ringTone?: string | null;
+  /**
+   * Phase 3.10 — URL Twilio POSTs the AMD result to. REQUIRED when
+   * amdMode is set; without it, Twilio runs machineDetection and
+   * silently drops the result (verified live 2026-07-31: TwiML
+   * emitted machineDetection="Enable" but no amdStatusCallback, so
+   * every voicemail was misclassified as answered_human because
+   * AnsweredBy never arrived anywhere). The <Dial action> callback
+   * does NOT carry AnsweredBy — that was the Phase 3.9 assumption
+   * that turned out to be wrong.
+   */
+  amdStatusCallbackUrl?: string | null;
 }
 
 export function buildOutboundDialTwiml(
@@ -464,17 +475,28 @@ export function buildOutboundDialTwiml(
   // Phase 3.9 — ringTone defaults to 'us'; explicit null suppresses.
   const ringTone = opts.ringTone === undefined ? "us" : opts.ringTone;
   const ringToneAttr = ringTone ? ` ringTone="${xmlEscape(ringTone)}"` : "";
-  // Phase 3.9 — machineDetection on the <Number> child. Twilio's docs
-  // for <Number>: attaching machineDetection here folds AnsweredBy
-  // into the <Dial action> callback body. No separate async callback
-  // needed — the same /voice/outbound-status handler receives it.
+  // Phase 3.9 — machineDetection on the <Number> child.
+  // Phase 3.10 — CORRECTION to the 3.9 comment: AnsweredBy does NOT
+  // fold into the <Dial action> callback. Twilio POSTs it to the
+  // amdStatusCallback URL only. Without amdStatusCallback the AMD
+  // result is silently discarded. Emit BOTH: the attribute that
+  // triggers detection, and the URL that receives the result.
   const amdMode = opts.amdMode === undefined ? "Enable" : opts.amdMode;
   const amdAttr = amdMode ? ` machineDetection="${xmlEscape(amdMode)}"` : "";
+  // amdStatusCallback only makes sense when detection is enabled.
+  // If a caller passes the URL without a mode, we still emit the URL
+  // — Twilio will just never call it. If a caller passes the mode
+  // without a URL, we log a warning-adjacent shape (the callback
+  // never fires). Neither is common in practice.
+  const amdCallbackAttrs =
+    amdMode && opts.amdStatusCallbackUrl
+      ? ` amdStatusCallback="${xmlEscape(opts.amdStatusCallbackUrl)}" amdStatusCallbackMethod="POST"`
+      : "";
   return (
     `<?xml version="1.0" encoding="UTF-8"?>` +
     `<Response>` +
     `<Dial callerId="${xmlEscape(callerId)}" answerOnBridge="true"${ringToneAttr}${actionAttrs}>` +
-    `<Number${amdAttr}>${xmlEscape(to)}</Number>` +
+    `<Number${amdAttr}${amdCallbackAttrs}>${xmlEscape(to)}</Number>` +
     `</Dial>` +
     `</Response>`
   );
@@ -607,6 +629,10 @@ router.post(
     }
 
     const statusCallbackUrl = `${getPublicApiBase()}/api/voice/outbound-status`;
+    // Phase 3.10 — dedicated AMD result URL. Twilio POSTs AnsweredBy
+    // here after machineDetection completes; without it the AMD
+    // analysis silently discards the result.
+    const amdStatusCallbackUrl = `${getPublicApiBase()}/api/voice/amd-status`;
     // Phase 3.9 — NEVERR_OUTBOUND_AMD_MODE env override. Accepts
     // 'Enable' (default, ~4s AMD delay), 'DetectMessageEnd' (slower,
     // more accurate), or 'false'/'off' to disable AMD entirely.
@@ -614,6 +640,7 @@ router.post(
     const twiml = buildOutboundDialTwiml(biz.twilioPhoneNumber, to, {
       statusCallbackUrl,
       amdMode: resolveOutboundAmdMode(),
+      amdStatusCallbackUrl,
     });
     res.status(200).type("text/xml").send(twiml);
   },
@@ -865,17 +892,20 @@ export function mapDialOutcome(
     ? durationSecs
     : null;
 
+  // Phase 3.10 — AMD verdict is authoritative for voicemail
+  // classification. Check it BEFORE dial status so the AMD-first
+  // ordering (row has no status yet) still yields the correct
+  // 'voicemail' outcome. Only machine_* / fax route here — human /
+  // unknown fall through to the status-based mapping below since
+  // those don't OVERRIDE what the call disposition says.
+  if (answer.startsWith("machine") || answer === "fax") {
+    return "voicemail";
+  }
+
   if (status === "completed" || status === "answered") {
-    // AMD result decides whether this was a human or a voicemail.
-    if (answer.startsWith("machine")) return "voicemail";
-    if (answer === "fax") return "voicemail"; // fax tones treated as
-                                              // "not a human" for
-                                              // conversion metrics
-    if (answer === "human") return "answered_human";
-    // AMD off / result unknown → conservative default: treat as human.
-    // Same behavior as Phase 3.8; only voicemails with AMD *on* get
-    // reclassified. This avoids false-positive voicemail labels when
-    // machineDetection is disabled per-tenant.
+    // AMD says human — or AMD off / result unknown, which we treat
+    // conservatively as human so we don't mis-mark real answers as
+    // voicemail when machineDetection is disabled per-tenant.
     return "answered_human";
   }
   if (status === "no-answer") return "no_answer";
@@ -910,18 +940,60 @@ export async function handleOutboundStatus(
   const duration = Number.parseInt(String(body.DialCallDuration ?? ""), 10);
   const durationSecs = Number.isFinite(duration) && duration >= 0 ? duration : null;
 
-  const outcome = mapDialOutcome(rawStatus, rawAnsweredBy, durationSecs);
+  // Phase 3.10 — merge with any AMD result that arrived first. The
+  // AMD callback and this Dial-action callback are INDEPENDENT and
+  // can arrive in either order. If AMD landed first it wrote
+  // answered_by='machine_*' and set call_outcome='voicemail'. We
+  // must preserve that classification — DialCallStatus=completed
+  // without body.AnsweredBy would otherwise remap to
+  // answered_human and clobber the AMD result. Read the row first;
+  // prefer body.AnsweredBy when present, else use whatever the row
+  // already has.
+  let existingAnsweredBy: string | null = null;
+  let existingOutcome: string | null = null;
+  try {
+    const { data } = await supabase
+      .from("calls")
+      .select("answered_by, call_outcome")
+      .eq("twilio_call_sid", parentSid)
+      .maybeSingle();
+    const row = data as { answered_by?: string | null; call_outcome?: string | null } | null;
+    existingAnsweredBy = row?.answered_by ?? null;
+    existingOutcome = row?.call_outcome ?? null;
+  } catch (err: any) {
+    // Row read failure isn't fatal — proceed with body-only mapping
+    // and Sentry-log. Loses AMD-first merging but doesn't 500.
+    Sentry.captureMessage("voice_outbound_status_row_read_failed", {
+      level: "warning",
+      extra: { parentSid, error: err?.message },
+    });
+  }
+  const mergedAnsweredBy = rawAnsweredBy || existingAnsweredBy;
+
+  const outcome = mapDialOutcome(rawStatus, mergedAnsweredBy, durationSecs);
+
+  // Phase 3.10 downgrade guard: if AMD ran first and stamped
+  // 'voicemail', don't let a later Dial-action arriving without
+  // AnsweredBy remap back to answered_human. mapDialOutcome above
+  // already handles this by using mergedAnsweredBy, but keep an
+  // explicit guard for the case where existingOutcome is voicemail
+  // and the merge would produce answered_human (shouldn't happen but
+  // defensive).
+  const finalOutcome =
+    existingOutcome === "voicemail" && outcome === "answered_human"
+      ? "voicemail"
+      : outcome;
 
   const patch: Record<string, unknown> = {
     // Phase 3.9 — `status` stores the RAW Twilio DialCallStatus for
     // diagnosability; `call_outcome` stores our mapped taxonomy.
     status: rawStatus || "completed",
-    call_outcome: outcome,
+    call_outcome: finalOutcome,
     end_time: now.toISOString(),
   };
   if (durationSecs !== null) patch.duration_seconds = durationSecs;
-  // Store Twilio's raw AMD result too — a future mapping bug is
-  // debuggable without replaying calls.
+  // Only overwrite answered_by if THIS callback carries a fresh
+  // value. AMD-first path already wrote it; don't null it out.
   if (rawAnsweredBy) patch.answered_by = rawAnsweredBy;
 
   try {
@@ -936,19 +1008,19 @@ export async function handleOutboundStatus(
         level: "warning",
         extra: { parentSid, error: error.message },
       });
-      return { ok: true, updatedCallsRow: false, matchedByParentSid: false, outcome };
+      return { ok: true, updatedCallsRow: false, matchedByParentSid: false, outcome: finalOutcome };
     }
     return {
       ok: true,
       updatedCallsRow: !!data,
       matchedByParentSid: !!data,
-      outcome,
+      outcome: finalOutcome,
     };
   } catch (err: any) {
     Sentry.captureException(err, {
       extra: { where: "handleOutboundStatus", parentSid },
     });
-    return { ok: true, updatedCallsRow: false, matchedByParentSid: false, outcome };
+    return { ok: true, updatedCallsRow: false, matchedByParentSid: false, outcome: finalOutcome };
   }
 }
 
@@ -972,6 +1044,219 @@ router.post(
       return;
     }
     await handleOutboundStatus(supabase, (req.body || {}) as OutboundStatusBody);
+    res.status(200).type("text/xml").send('<?xml version="1.0" encoding="UTF-8"?><Response/>');
+  },
+);
+
+// ── AMD status callback (Phase 3.10) ────────────────────────────────
+
+/**
+ * Twilio POST body for the amdStatusCallback URL declared on
+ * <Number>. Twilio's docs list these fields; we type only the ones
+ * we actually consume so unrelated fields (MachineDetectionDuration,
+ * account SIDs, etc.) can pass through untouched.
+ */
+export interface AmdStatusBody {
+  /** Parent leg CallSid — same value our row is keyed on. */
+  CallSid?: string;
+  /**
+   * Twilio's AMD verdict. Values: human, machine_start,
+   * machine_end_beep, machine_end_silence, machine_end_other, fax,
+   * unknown.
+   */
+  AnsweredBy?: string;
+}
+
+export interface AmdStatusResult {
+  ok: boolean;
+  updatedCallsRow: boolean;
+  outcome: OutboundOutcome | null;
+  /** True when we skipped the outcome overwrite because the row's
+   *  current outcome is a terminal non-answered value (no_answer /
+   *  busy / failed). Raw AnsweredBy is still stored for forensics. */
+  preservedTerminalOutcome: boolean;
+}
+
+/**
+ * Terminal outcomes that dial-action can produce and that AMD MUST
+ * NOT downgrade. If Twilio's dial-action landed first and reported
+ * no-answer / busy / failed, any subsequent AMD signal about the
+ * same call is meaningless (the call never actually connected to a
+ * machine). AMD-first + then no-answer never happens in practice —
+ * AMD needs a media stream to analyze.
+ */
+const TERMINAL_NON_ANSWERED_OUTCOMES: ReadonlySet<string> = new Set([
+  "no_answer",
+  "busy",
+  "failed",
+]);
+
+/**
+ * Phase 3.10 — the AMD result handler.
+ *
+ * Two arrival orderings to handle correctly:
+ *
+ *   1. AMD arrives FIRST (typical when the callee is a voicemail
+ *      system — Twilio detects the greeting and fires this callback
+ *      before the child leg terminates). Row has no status yet or is
+ *      still 'initiated'. We store answered_by and re-map call_outcome
+ *      using whatever the row already has for status + duration
+ *      (usually still empty at this point — mapDialOutcome will fall
+ *      back to 'failed' for empty status; we compensate by ONLY
+ *      writing call_outcome when we can make a meaningful call).
+ *
+ *      Simpler: if AMD says machine_*, write call_outcome='voicemail'
+ *      directly — no status needed because AMD IS the classification.
+ *
+ *   2. AMD arrives SECOND (typical when the callee is a human — the
+ *      Dial-action fires when they hang up, AMD fires when analysis
+ *      completes if it was running). Row already has status +
+ *      call_outcome. We upgrade answered_human → voicemail; but
+ *      preserve no_answer / busy / failed as-is.
+ *
+ * Always returns 200 valid TwiML (Phase 3.4 discipline).
+ */
+export async function handleAmdStatus(
+  supabase: SupabaseClient,
+  body: AmdStatusBody,
+): Promise<AmdStatusResult> {
+  const parentSid = typeof body.CallSid === "string" ? body.CallSid : "";
+  const answeredBy = typeof body.AnsweredBy === "string" ? body.AnsweredBy : "";
+  if (!parentSid || !answeredBy) {
+    return { ok: true, updatedCallsRow: false, outcome: null, preservedTerminalOutcome: false };
+  }
+
+  let existingOutcome: string | null = null;
+  let existingStatus: string | null = null;
+  let existingDuration: number | null = null;
+  try {
+    const { data } = await supabase
+      .from("calls")
+      .select("call_outcome, status, duration_seconds")
+      .eq("twilio_call_sid", parentSid)
+      .maybeSingle();
+    const row = data as
+      | { call_outcome?: string | null; status?: string | null; duration_seconds?: number | null }
+      | null;
+    if (!row) {
+      // Row not found. This can happen if the AMD callback races the
+      // /voice/outbound insert (very short-lived race — insert runs
+      // synchronously before we return the TwiML that starts the
+      // dial). Log and 200 — nothing to do.
+      Sentry.captureMessage("voice_amd_status_row_not_found", {
+        level: "warning",
+        extra: { parentSid, answeredBy },
+      });
+      return { ok: true, updatedCallsRow: false, outcome: null, preservedTerminalOutcome: false };
+    }
+    existingOutcome = row.call_outcome ?? null;
+    existingStatus = row.status ?? null;
+    existingDuration = typeof row.duration_seconds === "number" ? row.duration_seconds : null;
+  } catch (err: any) {
+    Sentry.captureMessage("voice_amd_status_row_read_failed", {
+      level: "warning",
+      extra: { parentSid, error: err?.message },
+    });
+  }
+
+  // Terminal-outcome guard. If Dial-action already stamped no-answer
+  // / busy / failed, an AMD signal here is spurious — store raw
+  // answered_by for forensics but leave call_outcome alone.
+  if (existingOutcome && TERMINAL_NON_ANSWERED_OUTCOMES.has(existingOutcome)) {
+    try {
+      await supabase
+        .from("calls")
+        .update({ answered_by: answeredBy })
+        .eq("twilio_call_sid", parentSid);
+    } catch (err: any) {
+      Sentry.captureException(err, {
+        extra: { where: "handleAmdStatus.preserveTerminal", parentSid },
+      });
+    }
+    return {
+      ok: true,
+      updatedCallsRow: true,
+      outcome: (existingOutcome as OutboundOutcome),
+      preservedTerminalOutcome: true,
+    };
+  }
+
+  // Compute the new outcome. mapDialOutcome checks AMD verdict FIRST
+  // (Phase 3.10), so machine_* / fax always yield 'voicemail' even
+  // when the row has no status yet (AMD-first ordering). For AMD
+  // saying 'human' / 'unknown', mapDialOutcome falls through to
+  // status-based mapping — which is 'answered_human' when status is
+  // completed and 'failed' when status is empty. The empty-status
+  // case only matters if AMD returns human before any Dial-action;
+  // in practice AMD returning 'human' means media was flowing so
+  // Dial-action is imminent and will overwrite.
+  const newOutcome = mapDialOutcome(
+    existingStatus ?? "",
+    answeredBy,
+    existingDuration,
+  );
+
+  // Only skip the outcome overwrite when AMD is inconclusive AND
+  // there's no Dial-action status yet — otherwise a spurious
+  // 'unknown' AMD verdict would stamp 'failed' on a call still in
+  // progress. Voicemail / answered_human always overwrite.
+  const isMeaningful =
+    newOutcome === "voicemail" ||
+    newOutcome === "answered_human" ||
+    existingStatus !== null;
+
+  const patch: Record<string, unknown> = { answered_by: answeredBy };
+  if (isMeaningful) patch.call_outcome = newOutcome;
+
+  try {
+    const { data, error } = await supabase
+      .from("calls")
+      .update(patch)
+      .eq("twilio_call_sid", parentSid)
+      .select("id")
+      .maybeSingle();
+    if (error) {
+      Sentry.captureMessage("voice_amd_status_update_failed", {
+        level: "warning",
+        extra: { parentSid, error: error.message },
+      });
+      return { ok: true, updatedCallsRow: false, outcome: newOutcome, preservedTerminalOutcome: false };
+    }
+    return {
+      ok: true,
+      updatedCallsRow: !!data,
+      outcome: isMeaningful ? newOutcome : (existingOutcome as OutboundOutcome | null),
+      preservedTerminalOutcome: false,
+    };
+  } catch (err: any) {
+    Sentry.captureException(err, { extra: { where: "handleAmdStatus", parentSid } });
+    return { ok: true, updatedCallsRow: false, outcome: newOutcome, preservedTerminalOutcome: false };
+  }
+}
+
+router.post(
+  "/voice/amd-status",
+  async (req: Request, res: Response): Promise<void> => {
+    // Same 200-always discipline as /outbound-status. The whole
+    // pipeline is designed so no path here can surface non-2xx.
+    if (!verifyTwilioSignature(req)) {
+      Sentry.captureMessage("voice_amd_status_signature_rejected", {
+        level: "error",
+        extra: { path: req.originalUrl },
+      });
+      res.status(200).type("text/xml").send('<?xml version="1.0" encoding="UTF-8"?><Response/>');
+      return;
+    }
+    const supabase = getSupabase();
+    if (!supabase) {
+      res.status(200).type("text/xml").send('<?xml version="1.0" encoding="UTF-8"?><Response/>');
+      return;
+    }
+    try {
+      await handleAmdStatus(supabase, (req.body || {}) as AmdStatusBody);
+    } catch (err: any) {
+      Sentry.captureException(err, { extra: { where: "voice.amd-status.handler" } });
+    }
     res.status(200).type("text/xml").send('<?xml version="1.0" encoding="UTF-8"?><Response/>');
   },
 );
