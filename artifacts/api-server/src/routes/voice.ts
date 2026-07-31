@@ -426,11 +426,31 @@ export interface BuildOutboundDialTwimlOptions {
    * Phase 3.8 — optional <Dial action> URL. When provided, Twilio
    * POSTs to it (default POST, we set method="POST" explicitly to
    * document the contract) when the child leg terminates, carrying
-   * DialCallStatus + DialCallDuration + DialCallSid. Feeds
-   * handleOutboundStatus which stamps duration + status onto the
-   * calls row inserted at /voice/outbound time.
+   * DialCallStatus + DialCallDuration + DialCallSid + AnsweredBy
+   * (when machineDetection is enabled). Feeds handleOutboundStatus.
    */
   statusCallbackUrl?: string | null;
+  /**
+   * Phase 3.9 — AMD mode. Valid Twilio values on the <Number> verb:
+   *   'Enable'           — ~3-6s delay, ~65-85% accuracy
+   *   'DetectMessageEnd' — waits for greeting to end, 15-30s delay
+   *   null               — disabled
+   *
+   * Defaults to 'Enable' via NEVERR_OUTBOUND_AMD_MODE env
+   * (set env='false' or override here with null to disable).
+   * Chose Enable over DetectMessageEnd because the whole point of
+   * the softphone is fast staff-driven outbound; a 20s delay per
+   * human answer is unacceptable UX. Voicemail misclassification is
+   * annoying but recoverable via redial.
+   */
+  amdMode?: "Enable" | "DetectMessageEnd" | null;
+  /**
+   * Phase 3.9 — ringback tone for the CALLER. answerOnBridge="true"
+   * without ringTone means the caller hears silence until the child
+   * answers. Same class as the inbound caller-silence bug fixed in
+   * 3.4. Defaults to 'us'; pass null to opt out.
+   */
+  ringTone?: string | null;
 }
 
 export function buildOutboundDialTwiml(
@@ -441,11 +461,20 @@ export function buildOutboundDialTwiml(
   const actionAttrs = opts.statusCallbackUrl
     ? ` action="${xmlEscape(opts.statusCallbackUrl)}" method="POST"`
     : "";
+  // Phase 3.9 — ringTone defaults to 'us'; explicit null suppresses.
+  const ringTone = opts.ringTone === undefined ? "us" : opts.ringTone;
+  const ringToneAttr = ringTone ? ` ringTone="${xmlEscape(ringTone)}"` : "";
+  // Phase 3.9 — machineDetection on the <Number> child. Twilio's docs
+  // for <Number>: attaching machineDetection here folds AnsweredBy
+  // into the <Dial action> callback body. No separate async callback
+  // needed — the same /voice/outbound-status handler receives it.
+  const amdMode = opts.amdMode === undefined ? "Enable" : opts.amdMode;
+  const amdAttr = amdMode ? ` machineDetection="${xmlEscape(amdMode)}"` : "";
   return (
     `<?xml version="1.0" encoding="UTF-8"?>` +
     `<Response>` +
-    `<Dial callerId="${xmlEscape(callerId)}" answerOnBridge="true"${actionAttrs}>` +
-    `<Number>${xmlEscape(to)}</Number>` +
+    `<Dial callerId="${xmlEscape(callerId)}" answerOnBridge="true"${ringToneAttr}${actionAttrs}>` +
+    `<Number${amdAttr}>${xmlEscape(to)}</Number>` +
     `</Dial>` +
     `</Response>`
   );
@@ -486,7 +515,13 @@ router.post(
     }
     const body = (req.body || {}) as Record<string, string>;
     const from = body.From || "";
-    const to = (body.To || "").trim();
+    // Phase 3.9 — normalize the destination number server-side. The
+    // browser now normalizes too, but we NEVER trust the client to
+    // have done it right. Accepts 10-digit US, 11-digit US (leading
+    // 1), and full +E.164; rejects everything else with an audible
+    // hangup message that names the failure mode.
+    const rawTo = (body.To || "").trim();
+    const to = normalizeUsPhoneToE164(rawTo);
     const requestedCallerId = (body.callerId || "").trim();
 
     const identity = parseClientFrom(from);
@@ -498,8 +533,12 @@ router.post(
       res.status(200).type("text/xml").send(twimlHangup("Outbound calls must originate from a registered client."));
       return;
     }
-    if (!to || !/^\+[1-9]\d{6,14}$/.test(to)) {
-      res.status(200).type("text/xml").send(twimlHangup("Invalid destination number."));
+    if (!to) {
+      Sentry.captureMessage("voice_outbound_invalid_destination", {
+        level: "warning",
+        extra: { rawTo },
+      });
+      res.status(200).type("text/xml").send(twimlHangup("Invalid destination number — enter a 10-digit US phone number."));
       return;
     }
 
@@ -568,12 +607,54 @@ router.post(
     }
 
     const statusCallbackUrl = `${getPublicApiBase()}/api/voice/outbound-status`;
+    // Phase 3.9 — NEVERR_OUTBOUND_AMD_MODE env override. Accepts
+    // 'Enable' (default, ~4s AMD delay), 'DetectMessageEnd' (slower,
+    // more accurate), or 'false'/'off' to disable AMD entirely.
+    // Any other value falls back to the built-in default.
     const twiml = buildOutboundDialTwiml(biz.twilioPhoneNumber, to, {
       statusCallbackUrl,
+      amdMode: resolveOutboundAmdMode(),
     });
     res.status(200).type("text/xml").send(twiml);
   },
 );
+
+/**
+ * Phase 3.9 — resolve the AMD mode from env. Isolated so tests can
+ * stub the env cleanly.
+ */
+export function resolveOutboundAmdMode(): "Enable" | "DetectMessageEnd" | null {
+  const raw = (process.env.NEVERR_OUTBOUND_AMD_MODE || "").trim();
+  if (raw === "DetectMessageEnd") return "DetectMessageEnd";
+  if (raw === "false" || raw === "off" || raw === "0") return null;
+  return "Enable"; // includes empty/unset — sane default for the softphone
+}
+
+/**
+ * Phase 3.9 — normalize a US phone number to E.164.
+ *   "4434490863"       → "+14434490863"
+ *   "14434490863"      → "+14434490863"
+ *   "+14434490863"     → "+14434490863"
+ *   "(443) 449-0863"   → "+14434490863"
+ *   "not a phone"      → null
+ *   "+44 20 1234 5678" → null   (non-US rejected for now — US-only)
+ *
+ * Returns null when the input cannot be normalized to a US +1 E.164
+ * number, so the caller can render an inline error rather than firing
+ * a doomed dial. Kept US-only by design — international dialing needs
+ * per-tenant permission + rate/cost guardrails not built yet.
+ */
+export function normalizeUsPhoneToE164(input: string | null | undefined): string | null {
+  if (typeof input !== "string") return null;
+  const trimmed = input.trim();
+  if (!trimmed) return null;
+  // Reject anything explicitly non-US: +country other than 1.
+  if (/^\+/.test(trimmed) && !/^\+1/.test(trimmed)) return null;
+  const digits = trimmed.replace(/\D+/g, "");
+  if (digits.length === 10) return `+1${digits}`;
+  if (digits.length === 11 && digits.startsWith("1")) return `+${digits}`;
+  return null;
+}
 
 // ── Outbound call logging + outcome callback ────────────────────────
 
@@ -726,12 +807,93 @@ export interface OutboundStatusBody {
   DialCallSid?: string; // child — the customer-leg SID
   DialCallStatus?: string; // completed|no-answer|busy|failed|canceled
   DialCallDuration?: string; // seconds, string on the wire
+  AnsweredBy?: string; // Phase 3.9 — Twilio AMD result when
+                       // machineDetection is on the <Number>
 }
 
 export interface OutboundStatusResult {
   ok: boolean;
   updatedCallsRow: boolean;
   matchedByParentSid: boolean;
+  outcome: OutboundOutcome | null;
+}
+
+/**
+ * Phase 3.9 — outcome taxonomy. Live 2026-07-31: voicemail was
+ * recorded as call_outcome='answered' because Twilio reports
+ * DialCallStatus=completed when the voicemail machine picks up. Every
+ * conversion metric built on call_outcome would misread voicemails
+ * as human answers. Fix: map (DialCallStatus, AnsweredBy) together.
+ *
+ * The distinct outcomes downstream reporting can rely on:
+ *
+ *   answered_human               — completed + AnsweredBy=human (or
+ *                                   AMD disabled but connected: legacy
+ *                                   fallback)
+ *   voicemail                    — completed + AnsweredBy=machine_*
+ *                                   or fax
+ *   no_answer                    — no-answer
+ *   busy                         — busy
+ *   failed                       — failed
+ *   canceled                     — canceled with any duration
+ *   caller_hung_up_during_ring   — canceled AND duration=0 AND no
+ *                                   answer signal (the staff hung up
+ *                                   before the callee could answer)
+ */
+export type OutboundOutcome =
+  | "answered_human"
+  | "voicemail"
+  | "no_answer"
+  | "busy"
+  | "failed"
+  | "canceled"
+  | "caller_hung_up_during_ring";
+
+/**
+ * Pure mapping table. Exported for the smoke matrix — the full
+ * DialCallStatus × AnsweredBy grid is asserted directly against
+ * this function.
+ */
+export function mapDialOutcome(
+  dialCallStatus: string | null | undefined,
+  answeredBy: string | null | undefined,
+  durationSecs: number | null | undefined,
+): OutboundOutcome {
+  const status = String(dialCallStatus || "").toLowerCase();
+  const answer = String(answeredBy || "").toLowerCase();
+  const duration = typeof durationSecs === "number" && Number.isFinite(durationSecs)
+    ? durationSecs
+    : null;
+
+  if (status === "completed" || status === "answered") {
+    // AMD result decides whether this was a human or a voicemail.
+    if (answer.startsWith("machine")) return "voicemail";
+    if (answer === "fax") return "voicemail"; // fax tones treated as
+                                              // "not a human" for
+                                              // conversion metrics
+    if (answer === "human") return "answered_human";
+    // AMD off / result unknown → conservative default: treat as human.
+    // Same behavior as Phase 3.8; only voicemails with AMD *on* get
+    // reclassified. This avoids false-positive voicemail labels when
+    // machineDetection is disabled per-tenant.
+    return "answered_human";
+  }
+  if (status === "no-answer") return "no_answer";
+  if (status === "busy") return "busy";
+  if (status === "failed") return "failed";
+  if (status === "canceled") {
+    // Twilio 'canceled' spans two very different cases:
+    //   - Staff hung up while it was still ringing (duration=0, no
+    //     answer signal) — this is caller_hung_up_during_ring.
+    //   - The child leg was terminated after any kind of pickup
+    //     (rare in the softphone flow, but keep the fallback path
+    //     for it distinct).
+    const noPickup = !answer && (duration === null || duration === 0);
+    return noPickup ? "caller_hung_up_during_ring" : "canceled";
+  }
+  // Twilio's undocumented / future values → fall to failed. Never
+  // silently drop into 'answered'.
+  return "failed";
 }
 
 export async function handleOutboundStatus(
@@ -741,24 +903,26 @@ export async function handleOutboundStatus(
 ): Promise<OutboundStatusResult> {
   const parentSid = typeof body.CallSid === "string" ? body.CallSid : "";
   if (!parentSid) {
-    return { ok: true, updatedCallsRow: false, matchedByParentSid: false };
+    return { ok: true, updatedCallsRow: false, matchedByParentSid: false, outcome: null };
   }
   const rawStatus = typeof body.DialCallStatus === "string" ? body.DialCallStatus : "";
+  const rawAnsweredBy = typeof body.AnsweredBy === "string" ? body.AnsweredBy : null;
   const duration = Number.parseInt(String(body.DialCallDuration ?? ""), 10);
+  const durationSecs = Number.isFinite(duration) && duration >= 0 ? duration : null;
+
+  const outcome = mapDialOutcome(rawStatus, rawAnsweredBy, durationSecs);
+
   const patch: Record<string, unknown> = {
+    // Phase 3.9 — `status` stores the RAW Twilio DialCallStatus for
+    // diagnosability; `call_outcome` stores our mapped taxonomy.
     status: rawStatus || "completed",
+    call_outcome: outcome,
     end_time: now.toISOString(),
   };
-  if (Number.isFinite(duration) && duration >= 0) patch.duration_seconds = duration;
-  // Only set call_outcome when we know the final Twilio disposition —
-  // 'completed' is Twilio-speak for "the customer answered and hung
-  // up cleanly." For unanswered / busy / failed we set an equivalent
-  // string so ops can filter later without joining Twilio's console.
-  if (rawStatus === "completed") patch.call_outcome = "answered";
-  else if (rawStatus === "no-answer") patch.call_outcome = "no_answer";
-  else if (rawStatus === "busy") patch.call_outcome = "busy";
-  else if (rawStatus === "failed") patch.call_outcome = "failed";
-  else if (rawStatus === "canceled") patch.call_outcome = "canceled";
+  if (durationSecs !== null) patch.duration_seconds = durationSecs;
+  // Store Twilio's raw AMD result too — a future mapping bug is
+  // debuggable without replaying calls.
+  if (rawAnsweredBy) patch.answered_by = rawAnsweredBy;
 
   try {
     const { data, error } = await supabase
@@ -772,18 +936,19 @@ export async function handleOutboundStatus(
         level: "warning",
         extra: { parentSid, error: error.message },
       });
-      return { ok: true, updatedCallsRow: false, matchedByParentSid: false };
+      return { ok: true, updatedCallsRow: false, matchedByParentSid: false, outcome };
     }
     return {
       ok: true,
       updatedCallsRow: !!data,
       matchedByParentSid: !!data,
+      outcome,
     };
   } catch (err: any) {
     Sentry.captureException(err, {
       extra: { where: "handleOutboundStatus", parentSid },
     });
-    return { ok: true, updatedCallsRow: false, matchedByParentSid: false };
+    return { ok: true, updatedCallsRow: false, matchedByParentSid: false, outcome };
   }
 }
 

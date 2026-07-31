@@ -111,6 +111,54 @@ export function isPhoneE164Valid(raw: string | null | undefined): boolean {
 }
 
 /**
+ * Phase 3.9 — progressive as-you-type formatter for the softphone
+ * dialpad. Reformats whatever the user has typed so far into the
+ * closest NANP-shaped display string, preserving the leading '+' when
+ * present and never dropping in-progress digits.
+ *
+ *   ""              → ""
+ *   "4"             → "(4"          (opens the paren early — matches
+ *                                    iOS Phone.app cadence)
+ *   "44"            → "(44"
+ *   "443"           → "(443)"
+ *   "4434"          → "(443) 4"
+ *   "4434490863"    → "(443) 449-0863"
+ *   "1443"          → "1 (443)"
+ *   "14434490863"   → "1 (443) 449-0863"
+ *   "+14434490863"  → "+1 (443) 449-0863"
+ *   "+44 20"        → "+4420"       (non-NANP passthrough — no US layout)
+ *
+ * Deliberately NOT a full libphonenumber asYouType — bundle weight
+ * isn't worth it for US-only formatting. Rejects nothing (never
+ * returns an "error" string). Validation lives in parsePhoneToE164 /
+ * isPhoneE164Valid.
+ */
+export function formatPhoneAsTyped(raw: string | null | undefined): string {
+  if (!raw) return "";
+  const trimmed = raw.trim();
+  const hadPlus = trimmed.startsWith("+");
+  const digits = trimmed.replace(/\D+/g, "");
+
+  // Non-US (leading + but not +1) → just show plus + digits.
+  if (hadPlus && !digits.startsWith("1")) {
+    return "+" + digits;
+  }
+
+  // NANP layout. If input starts with "1" (10+1 digits) OR the user
+  // typed a bare +1, treat the first digit as the country code.
+  const has1 = hadPlus || (digits.length > 10 && digits.startsWith("1"));
+  const local = has1 && digits.startsWith("1") ? digits.slice(1) : digits;
+  const country = hadPlus ? "+1 " : has1 ? "1 " : "";
+
+  if (local.length === 0) return country.trim();
+  if (local.length <= 3) return `${country}(${local}`;
+  if (local.length <= 6) return `${country}(${local.slice(0, 3)}) ${local.slice(3)}`;
+  // Cap at 10 local digits — extras just get appended (rare, user
+  // pasted something long; parsePhoneToE164 will still reject).
+  return `${country}(${local.slice(0, 3)}) ${local.slice(3, 6)}-${local.slice(6, 10)}${local.slice(10)}`;
+}
+
+/**
  * Compare two phones for "same underlying number" — ignores formatting
  * differences. Used by the loop guard hint client-side so a customer
  * who types "(443) 331-4649" while their Twilio number is stored as

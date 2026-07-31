@@ -35,6 +35,10 @@ import {
 import { useSoftphone, StatusPill } from "../components/Softphone";
 import { getAuthHeaders } from "../lib/api";
 import { PhoneOutgoing, PhoneIncoming, PhoneMissed } from "lucide-react";
+// Phase 3.9 — reuse the phone-input helpers from the transfer-settings
+// UI. Same parse/format contract; server-side re-normalizes so any
+// gap here fails safely with a clear error rather than a doomed dial.
+import { parsePhoneToE164, formatPhoneAsTyped, formatPhoneForDisplay } from "../lib/phone";
 
 export default function PhonePage() {
   const sp = useSoftphone();
@@ -57,11 +61,25 @@ export default function PhonePage() {
     setNotifPermission(p);
   };
 
+  // Phase 3.9 — parse the current input into E.164 iff possible.
+  // Used both by the dial button (disabled until parseable) and the
+  // inline error message. Only surface an error once the user has
+  // typed enough that the input CAN'T be an in-progress phone —
+  // 4+ digits — so a fresh input doesn't flash red.
+  const parsedE164 = parsePhoneToE164(dialpadDigits);
+  const digitCount = dialpadDigits.replace(/\D+/g, "").length;
+  const inputError =
+    digitCount >= 4 && !parsedE164
+      ? digitCount < 10
+        ? "Enter a 10-digit US phone number."
+        : digitCount === 10 || (digitCount === 11 && dialpadDigits.replace(/\D+/g, "").startsWith("1"))
+        ? "Couldn't parse that number."
+        : "US phone numbers only for now (10 digits or +1)."
+      : null;
+
   const dial = async () => {
-    const num = dialpadDigits.trim();
-    if (!num) return;
-    const normalised = num.startsWith("+") ? num : `+${num.replace(/[^0-9]/g, "")}`;
-    const ok = await sp.callNumber(normalised);
+    if (!parsedE164) return;
+    const ok = await sp.callNumber(parsedE164);
     if (ok) setDialpadDigits("");
   };
 
@@ -309,7 +327,10 @@ export default function PhonePage() {
         ) : (
           <div>
             <div className="text-xs text-neutral-500 mb-2">
-              Calling from <span className="font-medium text-neutral-800">{sp.callerIdState.twilioNumber}</span>
+              Calling from{" "}
+              <span className="font-medium text-neutral-800">
+                {formatPhoneForDisplay(sp.callerIdState.twilioNumber) || sp.callerIdState.twilioNumber}
+              </span>
               {sp.callerIdState.sid ? (
                 <span className="ml-2 text-neutral-400">({sp.callerIdState.sid})</span>
               ) : null}
@@ -317,23 +338,45 @@ export default function PhonePage() {
             <div className="flex gap-2">
               <input
                 type="tel"
+                inputMode="tel"
+                autoComplete="tel"
                 value={dialpadDigits}
-                onChange={(e) => setDialpadDigits(e.target.value)}
-                placeholder="+15551234567"
-                className="flex-1 rounded-md border border-neutral-300 px-3 py-2 text-sm"
+                onChange={(e) =>
+                  // Phase 3.9 — format as-typed. formatPhoneAsTyped
+                  // preserves ordering and the leading '+', so the
+                  // caret placement is stable enough for most typing
+                  // patterns. Users pasting a raw string also see the
+                  // formatted result immediately.
+                  setDialpadDigits(formatPhoneAsTyped(e.target.value))
+                }
+                placeholder="(443) 449-0863"
+                className={`flex-1 rounded-md border px-3 py-2 text-sm ${
+                  inputError ? "border-red-300 bg-red-50" : "border-neutral-300"
+                }`}
                 onKeyDown={(e) => {
-                  if (e.key === "Enter") void dial();
+                  if (e.key === "Enter" && parsedE164) void dial();
                 }}
               />
               <button
                 type="button"
                 onClick={() => void dial()}
-                disabled={sp.hasActiveCall}
+                disabled={sp.hasActiveCall || !parsedE164}
                 className="inline-flex items-center gap-2 rounded-md bg-green-600 px-4 py-2 text-sm font-medium text-white disabled:opacity-50 hover:bg-green-700"
               >
                 <PhoneIcon className="h-4 w-4" /> Call
               </button>
             </div>
+            {inputError ? (
+              <div className="mt-1 text-xs text-red-700">{inputError}</div>
+            ) : parsedE164 ? (
+              <div className="mt-1 text-xs text-neutral-500">
+                Will dial <span className="font-mono">{parsedE164}</span>
+              </div>
+            ) : (
+              <div className="mt-1 text-xs text-neutral-400">
+                10-digit US number, or +1XXXXXXXXXX
+              </div>
+            )}
           </div>
         )}
       </section>
@@ -448,15 +491,53 @@ function RecentInAppCallsPanel({ refreshKey }: { refreshKey: string }) {
   );
 }
 
+/**
+ * Phase 3.9 — outcome taxonomy rendering. Pre-3.9 every completed
+ * call read as "answered" even when the row was actually a voicemail
+ * (Twilio reports DialCallStatus=completed for voicemails). The new
+ * mapDialOutcome enum + this display map keep the panel honest.
+ *
+ * Keep in sync with mapDialOutcome in routes/voice.ts. The API stores
+ * the string form; a mapping bug here just shows the raw enum which
+ * is grep-able.
+ */
+const OUTCOME_DISPLAY: Record<string, { label: string; tone: "answered" | "missed" | "neutral" }> = {
+  answered_human: { label: "Answered", tone: "answered" },
+  voicemail: { label: "Voicemail", tone: "missed" },
+  no_answer: { label: "No answer", tone: "missed" },
+  busy: { label: "Busy", tone: "missed" },
+  failed: { label: "Failed", tone: "missed" },
+  canceled: { label: "Canceled", tone: "neutral" },
+  caller_hung_up_during_ring: { label: "You hung up", tone: "neutral" },
+  // Pre-3.9 rows keep their existing values — don't hide them.
+  answered: { label: "Answered", tone: "answered" },
+  completed: { label: "Answered", tone: "answered" },
+};
+
+function displayOutcome(call: RecentCall): { label: string; tone: "answered" | "missed" | "neutral" } {
+  const key = call.call_outcome || call.status || "";
+  return (
+    OUTCOME_DISPLAY[key] ||
+    (key === "initiated"
+      ? { label: "In progress", tone: "neutral" }
+      : { label: key || "unknown", tone: "neutral" })
+  );
+}
+
 function RecentCallRow({ call }: { call: RecentCall }) {
   const outbound = call.direction === "outbound";
-  const answered =
-    call.call_outcome === "answered" || call.status === "answered" || call.status === "completed";
-  const Icon = outbound ? PhoneOutgoing : answered ? PhoneIncoming : PhoneMissed;
+  const outcome = displayOutcome(call);
+  const Icon = outbound
+    ? PhoneOutgoing
+    : outcome.tone === "answered"
+    ? PhoneIncoming
+    : PhoneMissed;
   const iconColor = outbound
     ? "text-blue-600"
-    : answered
+    : outcome.tone === "answered"
     ? "text-emerald-600"
+    : outcome.tone === "missed"
+    ? "text-red-500"
     : "text-neutral-400";
   const when = call.created_at
     ? new Date(call.created_at).toLocaleString(undefined, {
@@ -465,21 +546,18 @@ function RecentCallRow({ call }: { call: RecentCall }) {
       })
     : "";
   const duration =
-    typeof call.duration_seconds === "number" && call.duration_seconds >= 0
+    typeof call.duration_seconds === "number" && call.duration_seconds > 0
       ? `${Math.floor(call.duration_seconds / 60)}:${String(call.duration_seconds % 60).padStart(2, "0")}`
       : null;
-  const outcomeLabel =
-    call.call_outcome ||
-    (call.status && call.status !== "initiated" ? call.status : "in progress");
   return (
     <li className="flex items-center gap-3 py-2.5">
       <Icon className={`h-4 w-4 shrink-0 ${iconColor}`} />
       <div className="flex-1 min-w-0">
         <div className="text-sm font-medium text-neutral-900 truncate">
-          {call.caller_number || "(unknown)"}
+          {formatPhoneForDisplay(call.caller_number) || call.caller_number || "(unknown)"}
         </div>
         <div className="text-xs text-neutral-500">
-          {outbound ? "Outbound" : "Inbound"} · {outcomeLabel}
+          {outbound ? "Outbound" : "Inbound"} · {outcome.label}
           {duration ? ` · ${duration}` : ""}
         </div>
       </div>

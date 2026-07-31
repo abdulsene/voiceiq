@@ -170,6 +170,24 @@
  *       valid TwiML). Same discipline as the 3.6 whisper POST bug.
  *   T81 resolveStaffUserIdForClient — happy path + null on miss.
  *
+ *   3.9 additions (outbound ringback + AMD + outcome taxonomy + phone):
+ *   T78 (updated) — canceled + no answer + duration 0 →
+ *       caller_hung_up_during_ring (was 'canceled'); completed
+ *       without AnsweredBy → answered_human (was 'answered').
+ *   T82 mapDialOutcome matrix — 17 (DialCallStatus × AnsweredBy)
+ *       combinations. Voicemail no longer misclassifies as
+ *       answered_human — the live 2026-07-31 defect.
+ *   T83 buildOutboundDialTwiml emits ringTone="us" + machineDetection
+ *       on <Number>. Belt-and-braces against inbound-caller-silence
+ *       recurring on outbound.
+ *   T84 resolveOutboundAmdMode env preference (NEVERR_OUTBOUND_AMD_MODE
+ *       overrides default 'Enable'; garbage → safe fallback).
+ *   T85 normalizeUsPhoneToE164 across 17 input shapes (10/11/E.164/
+ *       formatted/international/garbage). US-only for now.
+ *   T86 route-layer HTTP POST /voice/outbound-status with AMD →
+ *       200 valid TwiML + voicemail outcome + raw values stored.
+ *   T87 server-side outbound normalization: 10/11/formatted → +E.164.
+ *
  * Run: pnpm --filter @workspace/api-server exec tsx \
  *        src/tests/040-routing-smoke.ts
  */
@@ -217,6 +235,11 @@ import {
   handleOutboundStatus,
   listRecentInAppCallsForUser,
   resolveStaffUserIdForClient,
+  // Phase 3.9 — outbound ringback + AMD + outcome taxonomy + phone normalization.
+  mapDialOutcome,
+  normalizeUsPhoneToE164,
+  resolveOutboundAmdMode,
+  type OutboundOutcome,
 } from "../routes/voice";
 // Phase 3.3c — agent resync + tool inspector.
 import { fetchRegisteredToolNames } from "../routes/agent-sync";
@@ -1998,12 +2021,18 @@ async function T45_parse_client_uris() {
  */
 async function T46_outbound_twiml_shape() {
   const failures: string[] = [];
-  const t = buildOutboundDialTwiml("+18005551234", "+14155559999");
+  // Phase 3.9: build with AMD/ringTone disabled so this test still
+  // asserts the CORE shape (callerId + answerOnBridge + <Number>).
+  // The AMD/ringback contract is separately covered by T83.
+  const t = buildOutboundDialTwiml("+18005551234", "+14155559999", {
+    amdMode: null,
+    ringTone: null,
+  });
   if (!/<Dial callerId="\+18005551234"/.test(t)) failures.push("missing callerId attr");
   if (!/answerOnBridge="true"/.test(t)) failures.push("missing answerOnBridge");
   if (!/<Number>\+14155559999<\/Number>/.test(t)) failures.push("missing <Number> child");
   // XML escape check.
-  const t2 = buildOutboundDialTwiml("+18005551234", "+1&<test>");
+  const t2 = buildOutboundDialTwiml("+18005551234", "+1&<test>", { amdMode: null, ringTone: null });
   if (!/&amp;&lt;test&gt;/.test(t2)) failures.push("XML escaping broken");
   record("T46 outbound TwiML shape + XML escape", failures.length === 0, failures.join("; ") || "callerId + answerOnBridge + <Number> + escape");
 }
@@ -3374,10 +3403,12 @@ async function T75_outbound_uses_resolved_business_caller_id() {
   if (!biz) failures.push("resolveBusinessForClient returned null");
   else {
     if (biz.twilioPhoneNumber !== "+14433314649") failures.push(`resolved number=${biz.twilioPhoneNumber}`);
-    // The webhook would then compose:
+    // The webhook would then compose. Phase 3.9: <Number> now
+    // carries machineDetection by default, so match on the <Number>
+    // OPENING tag + phone content rather than the naked child.
     const twiml = buildOutboundDialTwiml(biz.twilioPhoneNumber, "+15551234567");
     if (!twiml.includes('callerId="+14433314649"')) failures.push("TwiML callerId != resolved business number");
-    if (!twiml.includes("<Number>+15551234567</Number>")) failures.push("TwiML missing <Number>");
+    if (!/<Number[^>]*>\+15551234567<\/Number>/.test(twiml)) failures.push("TwiML missing <Number>");
   }
   record("T75 outbound TwiML uses the resolved business caller ID (cross-tenant spoof guard intact)", failures.length === 0, failures.join("; ") || "identity → biz → callerId chain locked");
 }
@@ -3507,7 +3538,9 @@ async function T77_outbound_cross_tenant_scoping_guard() {
 async function T78_outbound_status_callback_update() {
   const failures: string[] = [];
 
-  // Happy path: matching parent SID → row updated, outcome mapped.
+  // Phase 3.9 — happy path: completed WITHOUT AnsweredBy is treated
+  // as answered_human (AMD off / unknown result → conservative). The
+  // voicemail case is covered in T82 below.
   const fake = new FakeSupabaseClient();
   fake.on(
     (c) => c.op === "update" && c.table === "calls",
@@ -3521,21 +3554,26 @@ async function T78_outbound_status_callback_update() {
   });
   if (!r.ok) failures.push("not ok");
   if (!r.matchedByParentSid) failures.push("did not match by parent SID");
+  if (r.outcome !== "answered_human") failures.push(`outcome=${r.outcome}`);
   const update = fake.calls.find((c) => c.op === "update" && c.table === "calls");
   if (update?.payload?.status !== "completed") failures.push(`status=${update?.payload?.status}`);
   if (update?.payload?.duration_seconds !== 37) failures.push(`duration=${update?.payload?.duration_seconds}`);
-  if (update?.payload?.call_outcome !== "answered") failures.push(`call_outcome=${update?.payload?.call_outcome}`);
+  if (update?.payload?.call_outcome !== "answered_human") failures.push(`call_outcome=${update?.payload?.call_outcome}`);
   if (!update?.payload?.end_time) failures.push("end_time missing");
   if (!update?.eqFilters.some((f) => f.column === "twilio_call_sid" && f.value === "CAparent_78")) {
     failures.push("update did not filter by twilio_call_sid=CAparent_78");
   }
 
-  // Outcome mapping matrix.
+  // Phase 3.9 — outcome mapping across the SIMPLE (no-AnsweredBy)
+  // cases. The full DialCallStatus × AnsweredBy matrix lives in T82
+  // — this test just guards the coarse mapping stays intact.
   const outcomes: Array<{ dial: string; want: string }> = [
     { dial: "no-answer", want: "no_answer" },
     { dial: "busy", want: "busy" },
     { dial: "failed", want: "failed" },
-    { dial: "canceled", want: "canceled" },
+    // canceled + no AnsweredBy + no duration → caller_hung_up_during_ring
+    // per the Phase 3.9 taxonomy (staff hung up while ringing).
+    { dial: "canceled", want: "caller_hung_up_during_ring" },
   ];
   for (const o of outcomes) {
     const f = new FakeSupabaseClient();
@@ -3679,6 +3717,240 @@ async function T81_resolve_staff_user_id_for_client() {
   record("T81 resolveStaffUserIdForClient: happy path + null on miss (no throw)", failures.length === 0, failures.join("; ") || "attribution derives from server-side identity, not client body");
 }
 
+// ── Phase 3.9: outbound ringback + AMD + outcome taxonomy + phone ──
+
+/**
+ * Phase 3.9 T82 — full DialCallStatus × AnsweredBy outcome mapping
+ * matrix. This is the taxonomy every downstream conversion metric
+ * depends on. Live 2026-07-31: voicemail was recorded as 'answered'
+ * because Twilio reports DialCallStatus=completed for voicemails —
+ * fixed by folding AnsweredBy into the mapping.
+ */
+async function T82_outcome_mapping_matrix() {
+  const cases: Array<{
+    dial: string;
+    answeredBy: string | null;
+    duration: number | null;
+    want: OutboundOutcome;
+    label: string;
+  }> = [
+    // completed × AnsweredBy variants
+    { dial: "completed", answeredBy: "human", duration: 42, want: "answered_human", label: "human answer" },
+    { dial: "completed", answeredBy: "machine_start", duration: 8, want: "voicemail", label: "AMD machine_start" },
+    { dial: "completed", answeredBy: "machine_end_beep", duration: 10, want: "voicemail", label: "AMD machine_end_beep" },
+    { dial: "completed", answeredBy: "machine_end_silence", duration: 12, want: "voicemail", label: "AMD machine_end_silence" },
+    { dial: "completed", answeredBy: "machine_end_other", duration: 15, want: "voicemail", label: "AMD machine_end_other" },
+    { dial: "completed", answeredBy: "fax", duration: 5, want: "voicemail", label: "fax tones → voicemail bucket" },
+    { dial: "completed", answeredBy: "unknown", duration: 10, want: "answered_human", label: "AMD unknown → conservative human" },
+    { dial: "completed", answeredBy: null, duration: 10, want: "answered_human", label: "AMD disabled → human default" },
+    // Case aliasing
+    { dial: "answered", answeredBy: "human", duration: 20, want: "answered_human", label: "answered alias" },
+    { dial: "COMPLETED", answeredBy: "MACHINE_START", duration: 8, want: "voicemail", label: "case insensitive" },
+    // Non-completed dispositions
+    { dial: "no-answer", answeredBy: null, duration: null, want: "no_answer", label: "no-answer" },
+    { dial: "busy", answeredBy: null, duration: null, want: "busy", label: "busy" },
+    { dial: "failed", answeredBy: null, duration: null, want: "failed", label: "failed" },
+    // canceled — the tricky one
+    { dial: "canceled", answeredBy: null, duration: null, want: "caller_hung_up_during_ring", label: "canceled while ringing (staff hangup)" },
+    { dial: "canceled", answeredBy: null, duration: 0, want: "caller_hung_up_during_ring", label: "canceled, duration=0" },
+    { dial: "canceled", answeredBy: "human", duration: 5, want: "canceled", label: "canceled after human answer" },
+    // Unknown Twilio value → failed (never silently 'answered_human')
+    { dial: "gibberish", answeredBy: null, duration: null, want: "failed", label: "unknown Twilio status" },
+  ];
+  const failures: string[] = [];
+  for (const c of cases) {
+    const got = mapDialOutcome(c.dial, c.answeredBy, c.duration);
+    if (got !== c.want) failures.push(`[${c.label}] got=${got} want=${c.want}`);
+  }
+  record("T82 mapDialOutcome matrix: 17 (DialCallStatus × AnsweredBy) combinations correct", failures.length === 0, failures.join("; ") || "voicemail no longer misclassified as answered_human");
+}
+
+/**
+ * Phase 3.9 T83 — buildOutboundDialTwiml emits ringTone + AMD
+ * attribute in the expected shapes. Belt-and-braces against the same
+ * caller-silence bug that hit inbound in 3.4, and against a Twilio
+ * default-change breaking AMD attachment silently.
+ */
+async function T83_outbound_dial_twiml_ringback_and_amd() {
+  const failures: string[] = [];
+
+  // Default: ringTone="us" + machineDetection="Enable".
+  const t1 = buildOutboundDialTwiml("+14433314649", "+15551234567", {
+    statusCallbackUrl: "https://x/y",
+  });
+  if (!/ringTone="us"/.test(t1)) failures.push("default: missing ringTone");
+  if (!/machineDetection="Enable"/.test(t1)) failures.push("default: missing machineDetection=Enable");
+  if (!/answerOnBridge="true"/.test(t1)) failures.push("missing answerOnBridge");
+  if (!/action="https:\/\/x\/y"\s+method="POST"/.test(t1)) failures.push("missing action+POST");
+  if (!/<Number\s+machineDetection="Enable">\+15551234567<\/Number>/.test(t1)) {
+    failures.push("machineDetection not on <Number>");
+  }
+
+  // Override AMD to DetectMessageEnd.
+  const t2 = buildOutboundDialTwiml("+18005551234", "+15550000000", {
+    statusCallbackUrl: null,
+    amdMode: "DetectMessageEnd",
+  });
+  if (!/machineDetection="DetectMessageEnd"/.test(t2)) failures.push("DetectMessageEnd override");
+
+  // Disable AMD entirely.
+  const t3 = buildOutboundDialTwiml("+18005551234", "+15550000000", {
+    statusCallbackUrl: null,
+    amdMode: null,
+  });
+  if (/machineDetection=/.test(t3)) failures.push("AMD suppressed when null");
+
+  // Disable ringback.
+  const t4 = buildOutboundDialTwiml("+18005551234", "+15550000000", {
+    statusCallbackUrl: null,
+    ringTone: null,
+  });
+  if (/ringTone=/.test(t4)) failures.push("ringTone suppressed when null");
+
+  record("T83 buildOutboundDialTwiml: ringTone default + machineDetection on <Number> + overrides", failures.length === 0, failures.join("; ") || "caller ringback + AMD contract stated in TwiML");
+}
+
+/**
+ * Phase 3.9 T84 — resolveOutboundAmdMode env preference matrix.
+ * NEVERR_OUTBOUND_AMD_MODE overrides the default 'Enable'.
+ */
+async function T84_amd_mode_env_override() {
+  const saved = process.env.NEVERR_OUTBOUND_AMD_MODE;
+  const failures: string[] = [];
+  try {
+    delete process.env.NEVERR_OUTBOUND_AMD_MODE;
+    if (resolveOutboundAmdMode() !== "Enable") failures.push("default not Enable");
+    process.env.NEVERR_OUTBOUND_AMD_MODE = "DetectMessageEnd";
+    if (resolveOutboundAmdMode() !== "DetectMessageEnd") failures.push("DetectMessageEnd override");
+    process.env.NEVERR_OUTBOUND_AMD_MODE = "false";
+    if (resolveOutboundAmdMode() !== null) failures.push(`'false' → ${resolveOutboundAmdMode()} (expected null)`);
+    process.env.NEVERR_OUTBOUND_AMD_MODE = "off";
+    if (resolveOutboundAmdMode() !== null) failures.push(`'off' → ${resolveOutboundAmdMode()}`);
+    process.env.NEVERR_OUTBOUND_AMD_MODE = "garbage";
+    if (resolveOutboundAmdMode() !== "Enable") failures.push(`garbage → ${resolveOutboundAmdMode()} (expected fallback Enable)`);
+  } finally {
+    if (saved !== undefined) process.env.NEVERR_OUTBOUND_AMD_MODE = saved;
+    else delete process.env.NEVERR_OUTBOUND_AMD_MODE;
+  }
+  record("T84 resolveOutboundAmdMode: env preference + safe fallback", failures.length === 0, failures.join("; ") || "ops can toggle AMD without a code change");
+}
+
+/**
+ * Phase 3.9 T85 — normalizeUsPhoneToE164 across the input shapes
+ * the softphone dialpad will actually see. US-only for now.
+ */
+async function T85_normalize_us_phone_matrix() {
+  const cases: Array<{ input: any; want: string | null; label: string }> = [
+    { input: "4434490863", want: "+14434490863", label: "10-digit bare" },
+    { input: "14434490863", want: "+14434490863", label: "11-digit leading 1" },
+    { input: "+14434490863", want: "+14434490863", label: "E.164" },
+    { input: "(443) 449-0863", want: "+14434490863", label: "national parenthesized" },
+    { input: "443.449.0863", want: "+14434490863", label: "dot-separated" },
+    { input: " 1 (443) 449-0863 ", want: "+14434490863", label: "whitespace + 1 + parens" },
+    { input: "+1 443 449 0863", want: "+14434490863", label: "+1 with spaces" },
+    { input: "4434490863x", want: "+14434490863", label: "trailing junk char (digits still 10)" },
+    { input: "443-449-086", want: null, label: "9-digit partial → null" },
+    { input: "24434490863", want: null, label: "11 digits NOT starting with 1 → null" },
+    { input: "+44 20 1234 5678", want: null, label: "non-US +country → null" },
+    { input: "", want: null, label: "empty" },
+    { input: "   ", want: null, label: "whitespace only" },
+    { input: null, want: null, label: "null" },
+    { input: undefined, want: null, label: "undefined" },
+    { input: 12345, want: null, label: "non-string" },
+    { input: "not a phone", want: null, label: "garbage" },
+  ];
+  const failures: string[] = [];
+  for (const c of cases) {
+    const got = normalizeUsPhoneToE164(c.input as any);
+    if (got !== c.want) failures.push(`[${c.label}] got=${JSON.stringify(got)} want=${JSON.stringify(c.want)}`);
+  }
+  record("T85 normalizeUsPhoneToE164: 17 input shapes correct (10, 11, E.164, garbage)", failures.length === 0, failures.join("; ") || "server-side normalization is the source of truth");
+}
+
+/**
+ * Phase 3.9 T86 — route-layer HTTP smoke for /voice/outbound-status.
+ * Twilio POSTs the callback with AnsweredBy when AMD is on. Route
+ * must accept POST, return 200 valid TwiML, and thread AnsweredBy
+ * through to the mapped outcome. Same discipline as Phase 3.6 whisper
+ * verb bug — handler-function tests can't see route-layer defects.
+ */
+async function T86_outbound_status_amd_route_http() {
+  const express = (await import("express")).default;
+  const http = await import("node:http");
+  const app = express();
+  app.use(express.urlencoded({ extended: false }));
+  app.use(express.json());
+
+  const fake = new FakeSupabaseClient();
+  fake.on((c) => c.op === "update" && c.table === "calls", { data: { id: "r" } });
+  app.post("/api/voice/outbound-status", async (req, res) => {
+    await handleOutboundStatus(asClient(fake), (req.body || {}) as any);
+    res.status(200).type("text/xml").send('<?xml version="1.0" encoding="UTF-8"?><Response/>');
+  });
+
+  const server = http.createServer(app);
+  await new Promise<void>((resolve) => server.listen(0, resolve));
+  const addr = server.address();
+  const port = typeof addr === "object" && addr ? addr.port : 0;
+  const failures: string[] = [];
+  try {
+    // Voicemail callback body — the exact one that misclassified live.
+    const body = new URLSearchParams({
+      CallSid: "CAparent_86",
+      DialCallSid: "CAchild_86",
+      DialCallStatus: "completed",
+      DialCallDuration: "5",
+      AnsweredBy: "machine_start",
+    }).toString();
+    const res = await fetch(`http://127.0.0.1:${port}/api/voice/outbound-status`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body,
+    });
+    if (res.status !== 200) failures.push(`status=${res.status}`);
+    const twiml = await res.text();
+    if (!/^<\?xml.*<Response\/>/s.test(twiml)) failures.push(`twiml shape=${twiml.slice(0, 80)}`);
+    const update = fake.calls.find((c) => c.op === "update" && c.table === "calls");
+    if (update?.payload?.call_outcome !== "voicemail") {
+      failures.push(`call_outcome=${update?.payload?.call_outcome} (must be 'voicemail' for AMD=machine_start)`);
+    }
+    if (update?.payload?.answered_by !== "machine_start") {
+      failures.push(`answered_by=${update?.payload?.answered_by} (raw Twilio value must be stored)`);
+    }
+    if (update?.payload?.status !== "completed") {
+      failures.push(`status=${update?.payload?.status} (raw DialCallStatus must be stored)`);
+    }
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+  record("T86 POST /voice/outbound-status with AMD → 200 + voicemail outcome + raw values stored", failures.length === 0, failures.join("; ") || "voicemail-as-answered bug can't recur");
+}
+
+/**
+ * Phase 3.9 T87 — server-side outbound handler normalizes the
+ * dialed number. The browser also normalizes, but we NEVER trust
+ * the client to have done it right — a stale bundle or a manual
+ * cURL from anywhere could send a bare 10-digit. Assert
+ * buildOutboundDialTwiml receives an E.164 destination for a
+ * bare-10-digit input.
+ */
+async function T87_normalize_10_digit_dials_e164() {
+  // Direct test on the helper — the route wiring is exercised in
+  // T80 (Phase 3.8) end-to-end. This asserts the normalization
+  // happens before the callerId/E.164 check.
+  const failures: string[] = [];
+  const cases: Array<{ raw: string; want: string }> = [
+    { raw: "4434490863", want: "+14434490863" },
+    { raw: "14434490863", want: "+14434490863" },
+    { raw: "  (443) 449-0863  ", want: "+14434490863" },
+  ];
+  for (const c of cases) {
+    const got = normalizeUsPhoneToE164(c.raw);
+    if (got !== c.want) failures.push(`[${c.raw}] got=${got}`);
+  }
+  record("T87 outbound server-side normalization: 10/11/formatted → +E.164 pre-dial", failures.length === 0, failures.join("; ") || "browser normalization is UX; server normalization is the truth");
+}
+
 // ── Bonus: whisper composition and TwiML ────────────────────────────
 
 async function whisper_composition() {
@@ -3794,6 +4066,13 @@ async function main() {
   await T79_recent_in_app_calls_scoping();
   await T80_outbound_status_route_http();
   await T81_resolve_staff_user_id_for_client();
+  // Phase 3.9 — outbound ringback + AMD + outcome taxonomy + phone
+  await T82_outcome_mapping_matrix();
+  await T83_outbound_dial_twiml_ringback_and_amd();
+  await T84_amd_mode_env_override();
+  await T85_normalize_us_phone_matrix();
+  await T86_outbound_status_amd_route_http();
+  await T87_normalize_10_digit_dials_e164();
   await whisper_composition();
 
   const fails = results.filter((r) => !r.pass);

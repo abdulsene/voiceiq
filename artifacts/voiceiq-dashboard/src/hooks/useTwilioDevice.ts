@@ -42,6 +42,22 @@ export type SoftphoneStatus =
   | "unregistered"
   | "error";
 
+/**
+ * Phase 3.9 — explicit lifecycle for the ACTIVE call, independent of
+ * device registration. Audio and UI need to agree: pre-3.9 the UI
+ * jumped from "no call" straight to "connected" the moment `active`
+ * became non-null, so the ringing seconds (up to 30s) rendered as
+ * silence + fake "connected." Now:
+ *   none       — no call in progress
+ *   ringing    — outbound only, Twilio has started ringing the far end
+ *                (via Call 'ringing' event)
+ *   connected  — the far end (or AMD) picked up (Call 'accept' event)
+ *   ended      — the call terminated (Call 'disconnect' event); UI
+ *                stays here for one render cycle before returning to
+ *                'none' so a brief "call ended" state is visible.
+ */
+export type CallPhase = "none" | "ringing" | "connected" | "ended";
+
 interface TokenPayload {
   token: string;
   identity: string;
@@ -98,6 +114,8 @@ export interface UseTwilioDeviceResult {
   identity: string | null;
   incoming: Call | null;
   active: Call | null;
+  /** Phase 3.9 — see CallPhase docs. */
+  callPhase: CallPhase;
   isMuted: boolean;
   error: string | null;
   /**
@@ -184,6 +202,7 @@ export function useTwilioDevice(opts: UseTwilioDeviceOptions): UseTwilioDeviceRe
   const [identity, setIdentity] = useState<string | null>(null);
   const [incoming, setIncoming] = useState<Call | null>(null);
   const [active, setActive] = useState<Call | null>(null);
+  const [callPhase, setCallPhase] = useState<CallPhase>("none");
   const [isMuted, setIsMuted] = useState(false);
   const [error, setError] = useState<string | null>(null);
   // Phase 3.4 — snapshot at mount; the value can't change over the
@@ -302,11 +321,19 @@ export function useTwilioDevice(opts: UseTwilioDeviceOptions): UseTwilioDeviceRe
         // what fixes Firefox one-way audio: setSinkId is Chromium-only,
         // so the SDK's default output routing may not activate. Doing
         // srcObject + play() ourselves is cross-browser.
-        call.on("accept", () => attachRemoteAudio(call));
-        call.on("cancel", () => setIncoming(null));
+        call.on("accept", () => {
+          attachRemoteAudio(call);
+          // Phase 3.9 — inbound accept transitions phase to connected.
+          setCallPhase("connected");
+        });
+        call.on("cancel", () => {
+          setIncoming(null);
+          setCallPhase("ended");
+        });
         call.on("disconnect", () => {
           setIncoming(null);
           setActive(null);
+          setCallPhase("ended");
         });
       });
 
@@ -355,6 +382,7 @@ export function useTwilioDevice(opts: UseTwilioDeviceOptions): UseTwilioDeviceRe
     setActive(incoming);
     setIncoming(null);
     setIsMuted(false);
+    setCallPhase("connected");
   }, [incoming]);
 
   const reject = useCallback(() => {
@@ -399,12 +427,26 @@ export function useTwilioDevice(opts: UseTwilioDeviceOptions): UseTwilioDeviceRe
       });
       setActive(call);
       setIsMuted(false);
-      call.on("accept", () => attachRemoteAudio(call));
+      // Phase 3.9 — explicit lifecycle. Start in ringing on outbound
+      // (Twilio's 'ringing' event may or may not fire depending on
+      // carrier; we default to ringing at connect() time to guarantee
+      // the UI reflects "not yet connected" state immediately). The
+      // 'accept' event promotes to connected; disconnect ends.
+      setCallPhase("ringing");
+      call.on("ringing", () => setCallPhase("ringing"));
+      call.on("accept", () => {
+        attachRemoteAudio(call);
+        setCallPhase("connected");
+      });
       call.on("disconnect", () => {
         setActive(null);
         setIsMuted(false);
+        setCallPhase("ended");
       });
-      call.on("cancel", () => setActive(null));
+      call.on("cancel", () => {
+        setActive(null);
+        setCallPhase("ended");
+      });
       return call;
     },
     [status],
@@ -415,6 +457,7 @@ export function useTwilioDevice(opts: UseTwilioDeviceOptions): UseTwilioDeviceRe
     identity,
     incoming,
     active,
+    callPhase,
     isMuted,
     error,
     outputDeviceSelectionSupported,

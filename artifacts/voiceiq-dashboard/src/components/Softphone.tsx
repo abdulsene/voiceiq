@@ -31,7 +31,7 @@ import {
 } from "react";
 import { Link, useLocation } from "wouter";
 import { Phone, PhoneOff, Mic, MicOff, PhoneIncoming, Volume2, VolumeX } from "lucide-react";
-import { useTwilioDevice, type SoftphoneStatus } from "../hooks/useTwilioDevice";
+import { useTwilioDevice, type SoftphoneStatus, type CallPhase } from "../hooks/useTwilioDevice";
 import { getAuthHeaders } from "../lib/api";
 
 const ENABLED_CACHE_KEY = "neverr_softphone_enabled";
@@ -80,6 +80,8 @@ export interface SoftphoneContextValue {
   active: unknown | null;
   hasActiveCall: boolean;
   hasIncomingCall: boolean;
+  /** Phase 3.9 — ringing → connected → ended lifecycle. */
+  callPhase: CallPhase;
   activeStartedAt: number | null;
   ringtoneMuted: boolean;
   preferenceError: string | null;
@@ -116,6 +118,7 @@ export function useSoftphone(): SoftphoneContextValue {
       active: null,
       hasActiveCall: false,
       hasIncomingCall: false,
+      callPhase: "none",
       activeStartedAt: null,
       ringtoneMuted: false,
       preferenceError: null,
@@ -457,6 +460,7 @@ export function SoftphoneProvider({ children }: { children: ReactNode }) {
       active: device.active,
       hasActiveCall,
       hasIncomingCall,
+      callPhase: device.callPhase,
       activeStartedAt,
       ringtoneMuted,
       preferenceError,
@@ -479,6 +483,7 @@ export function SoftphoneProvider({ children }: { children: ReactNode }) {
       device.hangup,
       device.toggleMute,
       device.outputDeviceSelectionSupported,
+      device.callPhase,
       callerId,
       callerIdState,
       hasActiveCall,
@@ -520,6 +525,7 @@ export function SoftphoneProvider({ children }: { children: ReactNode }) {
           isMuted={device.isMuted}
           toggleMute={device.toggleMute}
           hangup={device.hangup}
+          callPhase={device.callPhase}
         />
       ) : null}
 
@@ -643,30 +649,61 @@ function ActiveCallStrip({
   isMuted,
   toggleMute,
   hangup,
+  callPhase,
 }: {
   label: string;
   startedAt: number;
   isMuted: boolean;
   toggleMute: () => void;
   hangup: () => void;
+  callPhase: CallPhase;
 }) {
+  // Phase 3.9 — audio + UI agree. The staff caller heard silence
+  // pre-3.9 during the ringing window and the strip read as
+  // "connected" the moment device.active became non-null. Now:
+  //   ringing   — amber pulsing icon, "Ringing…" label instead of
+  //               a call timer (which was misleading — the seconds
+  //               shown were pre-answer)
+  //   connected — green icon, running call timer
+  //   ended     — grey, "Call ended"
+  const isRinging = callPhase === "ringing";
+  const isConnected = callPhase === "connected";
+  const isEnded = callPhase === "ended";
+  const iconBg = isConnected
+    ? "bg-green-100"
+    : isRinging
+    ? "bg-amber-100"
+    : "bg-neutral-100";
+  const iconColor = isConnected
+    ? "text-green-700"
+    : isRinging
+    ? "text-amber-700"
+    : "text-neutral-500";
+  const iconAnim = isRinging ? "animate-pulse" : "";
   return (
     <div className="fixed top-4 left-1/2 -translate-x-1/2 z-[100] w-96 max-w-[95vw] rounded-lg border border-neutral-200 bg-white shadow-2xl p-4">
       <div className="flex items-center gap-3">
-        <div className="rounded-full bg-green-100 p-2">
-          <Phone className="h-5 w-5 text-green-700" />
+        <div className={`rounded-full p-2 ${iconBg}`}>
+          <Phone className={`h-5 w-5 ${iconColor} ${iconAnim}`} />
         </div>
         <div className="flex-1 min-w-0">
           <div className="text-sm font-medium text-neutral-900 truncate">{label}</div>
-          <CallTimer startedAt={startedAt} />
+          {isRinging ? (
+            <span className="text-sm text-amber-700">Ringing…</span>
+          ) : isEnded ? (
+            <span className="text-sm text-neutral-500">Call ended</span>
+          ) : (
+            <CallTimer startedAt={startedAt} />
+          )}
         </div>
         <button
           type="button"
           onClick={toggleMute}
           aria-label={isMuted ? "Unmute" : "Mute"}
+          disabled={!isConnected}
           className={`rounded-md p-2 ${
             isMuted ? "bg-amber-100 text-amber-800" : "bg-neutral-100 text-neutral-700"
-          } hover:opacity-80`}
+          } hover:opacity-80 disabled:opacity-40`}
         >
           {isMuted ? <MicOff className="h-4 w-4" /> : <Mic className="h-4 w-4" />}
         </button>
