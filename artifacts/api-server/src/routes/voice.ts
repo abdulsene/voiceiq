@@ -215,6 +215,97 @@ export function mintVoiceAccessToken(identity: string): { jwt: string; expiresAt
   return { jwt: token.toJwt(), expiresAt };
 }
 
+// ── Caller ID (softphone outbound) ──────────────────────────────────
+
+/**
+ * Phase 3.7 — dedicated caller-ID endpoint for the softphone.
+ *
+ * Softphone previously read this via /api/business/configure which
+ * returns { success, config: { ...business_configs row } }. The
+ * frontend was reading response.twilio_phone_number at the top level
+ * instead of response.config.twilio_phone_number, so callerId was
+ * always null despite the row being correctly populated. That's a
+ * frontend shape-mismatch bug against a large, nested response.
+ *
+ * This dedicated endpoint returns a small, flat shape scoped to the
+ * caller's active business — no nesting to get wrong, no chance for
+ * a future field addition on /business/configure to accidentally
+ * shadow the Softphone contract. Also gives us a testable
+ * route-layer HTTP target without booting the giant api.ts router.
+ *
+ * Auth: requireAuth (uses req.businessId which the auth middleware
+ * has already scoped against memberships).
+ */
+export interface CallerIdResponse {
+  /**
+   * true when we know the business has no provisioned number.
+   * Distinct from a fetch failure — see status codes.
+   */
+  provisioned: boolean;
+  twilio_phone_number: string | null;
+  twilio_phone_sid: string | null;
+  business_id: string;
+}
+
+export async function getCallerIdForCaller(
+  supabase: SupabaseClient,
+  callerBusinessId: string,
+): Promise<
+  | { ok: true; body: CallerIdResponse }
+  | { ok: false; status: number; error: string }
+> {
+  const { data, error } = await supabase
+    .from("business_configs")
+    .select("twilio_phone_number, twilio_phone_sid, phone_number")
+    .eq("business_id", callerBusinessId)
+    .maybeSingle();
+  if (error) return { ok: false, status: 500, error: error.message };
+  const row = (data || null) as
+    | { twilio_phone_number?: string | null; twilio_phone_sid?: string | null; phone_number?: string | null }
+    | null;
+  if (!row) {
+    return { ok: false, status: 404, error: "Business config not found" };
+  }
+  // Prefer the provisioned Twilio number; fall back to the legacy
+  // `phone_number` column that some older tenants still use. The
+  // outbound webhook (POST /voice/outbound) already applies the same
+  // precedence, so the softphone dials from the same number the
+  // webhook allows.
+  const num = row.twilio_phone_number || row.phone_number || null;
+  return {
+    ok: true,
+    body: {
+      provisioned: !!num,
+      twilio_phone_number: num,
+      twilio_phone_sid: row.twilio_phone_sid || null,
+      business_id: callerBusinessId,
+    },
+  };
+}
+
+router.get(
+  "/voice/caller-id",
+  requireAuth,
+  async (req: Request, res: Response): Promise<void> => {
+    const businessId = req.businessId;
+    if (!businessId) {
+      res.status(401).json({ error: "Authentication required" });
+      return;
+    }
+    const supabase = getSupabase();
+    if (!supabase) {
+      res.status(500).json({ error: "Database not configured" });
+      return;
+    }
+    const result = await getCallerIdForCaller(supabase, businessId);
+    if (!result.ok) {
+      res.status(result.status).json({ error: result.error });
+      return;
+    }
+    res.json(result.body);
+  },
+);
+
 router.post(
   "/voice/token",
   requireAuth,

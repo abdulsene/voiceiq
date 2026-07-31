@@ -49,8 +49,16 @@
  *   {
  *     status:          'connecting' | 'taking_message' | 'no_help_available',
  *     topic_name:      string,     // display name of the matched topic
- *     staff_count:     number,     // number of cells being rung (0 for
- *                                  // callback / graceful paths)
+ *     staff_count:     number,     // Phase 3.7: number of CANDIDATES
+ *                                  // being rung (each candidate may
+ *                                  // contribute a <Client> browser leg,
+ *                                  // a <Number> cell leg, or both).
+ *                                  // Pre-3.7 this counted only cells
+ *                                  // via decision.staffPhones, which
+ *                                  // reported 0 for in-app-only staff
+ *                                  // — misleading the LLM about
+ *                                  // availability. 0 for callback /
+ *                                  // graceful / after-hours paths.
  *     handoff_reason:  string,     // conventional label; also written to
  *                                  // calls.handoff_reason for reporting
  *   }
@@ -619,7 +627,14 @@ export async function handleRouteToTopic(
     result: {
       status: publicStatusFor(decision, redirectWillFire),
       topic_name: topicName,
-      staff_count: decision.staffPhones.length,
+      // Phase 3.7 — count ALL candidates, not just those with a
+      // callback_ring_number. Pre-3.7 used decision.staffPhones which
+      // omits in-app-only staff (live browser, no cell). Live prod
+      // confirmed the miss: handoff_reason='topic_match_ringing' with
+      // staff_count=0 and one entry in rung_user_ids. That 0 goes to
+      // the LLM as availability context — the AI would say "nobody's
+      // available" while routing was actively ringing a browser.
+      staff_count: decision.staffCandidates.length,
       handoff_reason: decision.handoffReason,
       decision,
       twiml,

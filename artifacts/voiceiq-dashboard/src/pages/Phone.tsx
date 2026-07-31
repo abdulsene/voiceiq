@@ -193,7 +193,18 @@ export default function PhonePage() {
                 : "granted (or not yet requested)"
             }
           />
-          <DevRow label="Caller ID" value={sp.callerId?.twilioNumber || "not configured"} />
+          <DevRow
+            label="Caller ID"
+            value={
+              sp.callerIdState.status === "provisioned"
+                ? sp.callerIdState.twilioNumber
+                : sp.callerIdState.status === "loading"
+                ? "loading…"
+                : sp.callerIdState.status === "not_provisioned"
+                ? "no Twilio number provisioned"
+                : `load failed: ${sp.callerIdState.message}`
+            }
+          />
           <DevRow
             label="Identity"
             value={sp.identity || "—"}
@@ -262,18 +273,45 @@ export default function PhonePage() {
               permission when prompted.
             </span>
           </div>
-        ) : !sp.callerId ? (
+        ) : sp.callerIdState.status === "loading" ? (
+          <div className="text-xs text-neutral-500">Looking up your business's caller ID…</div>
+        ) : sp.callerIdState.status === "error" ? (
+          // Phase 3.7 — DISTINCT from "not provisioned." Pre-3.7 a
+          // 200 with a nested body shape the frontend didn't read
+          // rendered identically to a genuine "no number on file,"
+          // sending ops on a config chase. Now: an actual load
+          // failure says so and shows the error.
+          <div className="flex items-start gap-2 rounded-md bg-red-50 p-3 text-xs text-red-800">
+            <AlertTriangle className="h-4 w-4 mt-0.5 shrink-0" />
+            <div>
+              <div className="font-semibold">Couldn't load your caller ID</div>
+              <div className="mt-1">
+                {sp.callerIdState.message} — try refreshing this page. If it persists after a
+                reload, your session may have expired.
+              </div>
+            </div>
+          </div>
+        ) : sp.callerIdState.status === "not_provisioned" ? (
           <div className="flex items-start gap-2 rounded-md bg-amber-50 p-3 text-xs text-amber-800">
             <AlertTriangle className="h-4 w-4 mt-0.5 shrink-0" />
-            <span>
-              No provisioned business number found. Outbound calls need a Twilio number attached to
-              this business — visit Settings → My Receptionist.
-            </span>
+            <div>
+              <div className="font-semibold">No Twilio number provisioned for this business</div>
+              <div className="mt-1">
+                Outbound calls need a business number to appear as the caller ID. Visit{" "}
+                <Link href="/settings/ai" className="text-blue-600 hover:underline">
+                  Settings → My Receptionist
+                </Link>{" "}
+                to provision one.
+              </div>
+            </div>
           </div>
         ) : (
           <div>
             <div className="text-xs text-neutral-500 mb-2">
-              Calling from <span className="font-medium text-neutral-800">{sp.callerId.twilioNumber}</span>
+              Calling from <span className="font-medium text-neutral-800">{sp.callerIdState.twilioNumber}</span>
+              {sp.callerIdState.sid ? (
+                <span className="ml-2 text-neutral-400">({sp.callerIdState.sid})</span>
+              ) : null}
             </div>
             <div className="flex gap-2">
               <input

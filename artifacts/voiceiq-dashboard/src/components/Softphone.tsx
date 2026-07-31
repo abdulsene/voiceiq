@@ -57,12 +57,25 @@ interface CallerId {
   twilioNumber: string;
 }
 
+/**
+ * Phase 3.7 — distinguish "genuinely not provisioned" from "we failed
+ * to load it." Pre-3.7 both rendered as "not configured" which sent
+ * ops on a config chase when the actual bug was a frontend shape
+ * mismatch against /business/configure.
+ */
+export type CallerIdState =
+  | { status: "loading" }
+  | { status: "provisioned"; twilioNumber: string; sid: string | null }
+  | { status: "not_provisioned" }
+  | { status: "error"; message: string };
+
 export interface SoftphoneContextValue {
   enabled: boolean;
   serverEnabled: boolean | null;
   status: SoftphoneStatus;
   identity: string | null;
   callerId: CallerId | null;
+  callerIdState: CallerIdState;
   isMuted: boolean;
   active: unknown | null;
   hasActiveCall: boolean;
@@ -98,6 +111,7 @@ export function useSoftphone(): SoftphoneContextValue {
       status: "idle",
       identity: null,
       callerId: null,
+      callerIdState: { status: "loading" },
       isMuted: false,
       active: null,
       hasActiveCall: false,
@@ -120,17 +134,44 @@ export function useSoftphone(): SoftphoneContextValue {
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
-async function fetchOwnCallerId(): Promise<CallerId | null> {
+/**
+ * Phase 3.7 — dedicated /api/voice/caller-id endpoint. Previously read
+ * /api/business/configure which returns { config: { ...row } } (nested);
+ * the frontend read `response.twilio_phone_number` at the top level
+ * instead of `response.config.twilio_phone_number`, so callerId was
+ * always null even when the DB row was correctly populated. Two fixes:
+ *
+ *   1. New dedicated endpoint returns a flat { twilio_phone_number, ... }
+ *      shape — no nesting to get wrong.
+ *   2. Returns three DISTINCT states: provisioned (has a number),
+ *      not_provisioned (row exists but no number), error (HTTP fail).
+ *      Pre-3.7 all three rendered as "not configured" in the UI,
+ *      which sent ops on a config chase when the actual bug was a
+ *      response-shape mismatch.
+ */
+async function fetchOwnCallerId(): Promise<CallerIdState> {
   try {
-    const res = await fetch("/api/business/configure", {
+    const res = await fetch("/api/voice/caller-id", {
       headers: { "Content-Type": "application/json", ...getAuthHeaders() },
     });
-    if (!res.ok) return null;
-    const cfg = await res.json();
-    const num = cfg?.twilio_phone_number || cfg?.phone_number;
-    return num ? { twilioNumber: num } : null;
-  } catch {
-    return null;
+    if (!res.ok) {
+      return { status: "error", message: `HTTP ${res.status}` };
+    }
+    const body = (await res.json()) as {
+      provisioned?: boolean;
+      twilio_phone_number?: string | null;
+      twilio_phone_sid?: string | null;
+    };
+    if (body.provisioned && body.twilio_phone_number) {
+      return {
+        status: "provisioned",
+        twilioNumber: body.twilio_phone_number,
+        sid: body.twilio_phone_sid ?? null,
+      };
+    }
+    return { status: "not_provisioned" };
+  } catch (e) {
+    return { status: "error", message: (e as Error).message };
   }
 }
 
@@ -353,12 +394,20 @@ export function SoftphoneProvider({ children }: { children: ReactNode }) {
   );
 
   const device = useTwilioDevice({ enabled });
-  const [callerId, setCallerId] = useState<CallerId | null>(null);
+  const [callerIdState, setCallerIdState] = useState<CallerIdState>({ status: "loading" });
+  // Phase 3.7 — derived flat CallerId | null for backwards compat with
+  // components that just want "the number." The rich state (loading /
+  // provisioned / not_provisioned / error) is on callerIdState.
+  const callerId: CallerId | null =
+    callerIdState.status === "provisioned"
+      ? { twilioNumber: callerIdState.twilioNumber }
+      : null;
   const [activeStartedAt, setActiveStartedAt] = useState<number | null>(null);
 
   useEffect(() => {
     if (!enabled) return;
-    void fetchOwnCallerId().then(setCallerId);
+    setCallerIdState({ status: "loading" });
+    void fetchOwnCallerId().then(setCallerIdState);
   }, [enabled]);
 
   useEffect(() => {
@@ -403,6 +452,7 @@ export function SoftphoneProvider({ children }: { children: ReactNode }) {
       status: device.status,
       identity: device.identity,
       callerId,
+      callerIdState,
       isMuted: device.isMuted,
       active: device.active,
       hasActiveCall,
@@ -430,6 +480,7 @@ export function SoftphoneProvider({ children }: { children: ReactNode }) {
       device.toggleMute,
       device.outputDeviceSelectionSupported,
       callerId,
+      callerIdState,
       hasActiveCall,
       hasIncomingCall,
       activeStartedAt,
