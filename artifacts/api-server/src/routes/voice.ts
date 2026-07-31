@@ -426,24 +426,17 @@ export interface BuildOutboundDialTwimlOptions {
    * Phase 3.8 — optional <Dial action> URL. When provided, Twilio
    * POSTs to it (default POST, we set method="POST" explicitly to
    * document the contract) when the child leg terminates, carrying
-   * DialCallStatus + DialCallDuration + DialCallSid + AnsweredBy
-   * (when machineDetection is enabled). Feeds handleOutboundStatus.
+   * DialCallStatus + DialCallDuration + DialCallSid. Feeds
+   * handleOutboundStatus.
+   *
+   * Phase 3.12 — historical note: 3.9 also assumed AnsweredBy would
+   * arrive here from AMD; it never did (Twilio has a separate
+   * amdStatusCallback URL for that). 3.10 wired the separate URL;
+   * 3.11 proved AMD via <Dial><Number> silently no-ops when the
+   * parent is a Client-initiated call (which every softphone dial
+   * is). 3.12 removed AMD entirely in favor of staff disposition.
    */
   statusCallbackUrl?: string | null;
-  /**
-   * Phase 3.9 — AMD mode. Valid Twilio values on the <Number> verb:
-   *   'Enable'           — ~3-6s delay, ~65-85% accuracy
-   *   'DetectMessageEnd' — waits for greeting to end, 15-30s delay
-   *   null               — disabled
-   *
-   * Defaults to 'Enable' via NEVERR_OUTBOUND_AMD_MODE env
-   * (set env='false' or override here with null to disable).
-   * Chose Enable over DetectMessageEnd because the whole point of
-   * the softphone is fast staff-driven outbound; a 20s delay per
-   * human answer is unacceptable UX. Voicemail misclassification is
-   * annoying but recoverable via redial.
-   */
-  amdMode?: "Enable" | "DetectMessageEnd" | null;
   /**
    * Phase 3.9 — ringback tone for the CALLER. answerOnBridge="true"
    * without ringTone means the caller hears silence until the child
@@ -451,17 +444,6 @@ export interface BuildOutboundDialTwimlOptions {
    * 3.4. Defaults to 'us'; pass null to opt out.
    */
   ringTone?: string | null;
-  /**
-   * Phase 3.10 — URL Twilio POSTs the AMD result to. REQUIRED when
-   * amdMode is set; without it, Twilio runs machineDetection and
-   * silently drops the result (verified live 2026-07-31: TwiML
-   * emitted machineDetection="Enable" but no amdStatusCallback, so
-   * every voicemail was misclassified as answered_human because
-   * AnsweredBy never arrived anywhere). The <Dial action> callback
-   * does NOT carry AnsweredBy — that was the Phase 3.9 assumption
-   * that turned out to be wrong.
-   */
-  amdStatusCallbackUrl?: string | null;
 }
 
 export function buildOutboundDialTwiml(
@@ -475,28 +457,19 @@ export function buildOutboundDialTwiml(
   // Phase 3.9 — ringTone defaults to 'us'; explicit null suppresses.
   const ringTone = opts.ringTone === undefined ? "us" : opts.ringTone;
   const ringToneAttr = ringTone ? ` ringTone="${xmlEscape(ringTone)}"` : "";
-  // Phase 3.9 — machineDetection on the <Number> child.
-  // Phase 3.10 — CORRECTION to the 3.9 comment: AnsweredBy does NOT
-  // fold into the <Dial action> callback. Twilio POSTs it to the
-  // amdStatusCallback URL only. Without amdStatusCallback the AMD
-  // result is silently discarded. Emit BOTH: the attribute that
-  // triggers detection, and the URL that receives the result.
-  const amdMode = opts.amdMode === undefined ? "Enable" : opts.amdMode;
-  const amdAttr = amdMode ? ` machineDetection="${xmlEscape(amdMode)}"` : "";
-  // amdStatusCallback only makes sense when detection is enabled.
-  // If a caller passes the URL without a mode, we still emit the URL
-  // — Twilio will just never call it. If a caller passes the mode
-  // without a URL, we log a warning-adjacent shape (the callback
-  // never fires). Neither is common in practice.
-  const amdCallbackAttrs =
-    amdMode && opts.amdStatusCallbackUrl
-      ? ` amdStatusCallback="${xmlEscape(opts.amdStatusCallbackUrl)}" amdStatusCallbackMethod="POST"`
-      : "";
+  // Phase 3.12 — AMD attributes removed entirely. See file header
+  // + migration 046 for the rationale (AMD via <Dial><Number> was
+  // silently no-op'd by Twilio when the parent is a Client-initiated
+  // call, which every softphone dial is; even if it had worked, it
+  // couldn't answer the "voicemail: message left vs not" question
+  // that was the actual reporting need). Staff disposition on hangup
+  // (PATCH /api/voice/calls/:id/disposition) replaces the automatic
+  // classification.
   return (
     `<?xml version="1.0" encoding="UTF-8"?>` +
     `<Response>` +
     `<Dial callerId="${xmlEscape(callerId)}" answerOnBridge="true"${ringToneAttr}${actionAttrs}>` +
-    `<Number${amdAttr}${amdCallbackAttrs}>${xmlEscape(to)}</Number>` +
+    `<Number>${xmlEscape(to)}</Number>` +
     `</Dial>` +
     `</Response>`
   );
@@ -629,33 +602,12 @@ router.post(
     }
 
     const statusCallbackUrl = `${getPublicApiBase()}/api/voice/outbound-status`;
-    // Phase 3.10 — dedicated AMD result URL. Twilio POSTs AnsweredBy
-    // here after machineDetection completes; without it the AMD
-    // analysis silently discards the result.
-    const amdStatusCallbackUrl = `${getPublicApiBase()}/api/voice/amd-status`;
-    // Phase 3.9 — NEVERR_OUTBOUND_AMD_MODE env override. Accepts
-    // 'Enable' (default, ~4s AMD delay), 'DetectMessageEnd' (slower,
-    // more accurate), or 'false'/'off' to disable AMD entirely.
-    // Any other value falls back to the built-in default.
     const twiml = buildOutboundDialTwiml(biz.twilioPhoneNumber, to, {
       statusCallbackUrl,
-      amdMode: resolveOutboundAmdMode(),
-      amdStatusCallbackUrl,
     });
     res.status(200).type("text/xml").send(twiml);
   },
 );
-
-/**
- * Phase 3.9 — resolve the AMD mode from env. Isolated so tests can
- * stub the env cleanly.
- */
-export function resolveOutboundAmdMode(): "Enable" | "DetectMessageEnd" | null {
-  const raw = (process.env.NEVERR_OUTBOUND_AMD_MODE || "").trim();
-  if (raw === "DetectMessageEnd") return "DetectMessageEnd";
-  if (raw === "false" || raw === "off" || raw === "0") return null;
-  return "Enable"; // includes empty/unset — sane default for the softphone
-}
 
 /**
  * Phase 3.9 — normalize a US phone number to E.164.
@@ -1048,216 +1000,208 @@ router.post(
   },
 );
 
-// ── AMD status callback (Phase 3.10) ────────────────────────────────
+// ── Staff call disposition (Phase 3.12) ─────────────────────────────
 
 /**
- * Twilio POST body for the amdStatusCallback URL declared on
- * <Number>. Twilio's docs list these fields; we type only the ones
- * we actually consume so unrelated fields (MachineDetectionDuration,
- * account SIDs, etc.) can pass through untouched.
+ * Replaces AMD (Phase 3.10 → removed in 3.12). Staff writes the
+ * disposition after the call ends via PATCH /api/voice/calls/:id/disposition.
+ *
+ * Whitelist enforced here + rejected at the route on any other value.
+ * Kept as a Set so a future validator can share the same source of
+ * truth without diverging.
  */
-export interface AmdStatusBody {
-  /** Parent leg CallSid — same value our row is keyed on. */
-  CallSid?: string;
-  /**
-   * Twilio's AMD verdict. Values: human, machine_start,
-   * machine_end_beep, machine_end_silence, machine_end_other, fax,
-   * unknown.
-   */
-  AnsweredBy?: string;
-}
+export type CallDisposition =
+  | "reached_person"
+  | "voicemail_left_message"
+  | "voicemail_no_message"
+  | "wrong_number"
+  | "no_answer_bad_line";
 
-export interface AmdStatusResult {
-  ok: boolean;
-  updatedCallsRow: boolean;
-  outcome: OutboundOutcome | null;
-  /** True when we skipped the outcome overwrite because the row's
-   *  current outcome is a terminal non-answered value (no_answer /
-   *  busy / failed). Raw AnsweredBy is still stored for forensics. */
-  preservedTerminalOutcome: boolean;
-}
-
-/**
- * Terminal outcomes that dial-action can produce and that AMD MUST
- * NOT downgrade. If Twilio's dial-action landed first and reported
- * no-answer / busy / failed, any subsequent AMD signal about the
- * same call is meaningless (the call never actually connected to a
- * machine). AMD-first + then no-answer never happens in practice —
- * AMD needs a media stream to analyze.
- */
-const TERMINAL_NON_ANSWERED_OUTCOMES: ReadonlySet<string> = new Set([
-  "no_answer",
-  "busy",
-  "failed",
+export const CALL_DISPOSITIONS: ReadonlySet<CallDisposition> = new Set<CallDisposition>([
+  "reached_person",
+  "voicemail_left_message",
+  "voicemail_no_message",
+  "wrong_number",
+  "no_answer_bad_line",
 ]);
 
+export interface DispositionWriteInput {
+  /** UUID from the calls table — the frontend passes this from the
+   *  recent-calls response, or from a modal shown at hangup time. */
+  callRowId: string;
+  disposition: CallDisposition;
+}
+
+export interface DispositionWriteResult {
+  ok: boolean;
+  status: number;
+  error?: string;
+  /**
+   * The updated disposition value when ok. Not the full row — the
+   * frontend already has (or can refetch) the rest.
+   */
+  disposition?: CallDisposition;
+}
+
 /**
- * Phase 3.10 — the AMD result handler.
+ * Phase 3.12 — write a staff disposition to a `calls` row, scoping
+ * by BOTH business_id AND handled_by_user_id so a staff member can
+ * only disposition calls THEY placed. Cross-user attempts return 404
+ * (never 403 — indistinguishable from "call doesn't exist" so we
+ * don't leak the existence of other staff's calls).
  *
- * Two arrival orderings to handle correctly:
+ * Whitelisted disposition values only. Anything else → 400.
  *
- *   1. AMD arrives FIRST (typical when the callee is a voicemail
- *      system — Twilio detects the greeting and fires this callback
- *      before the child leg terminates). Row has no status yet or is
- *      still 'initiated'. We store answered_by and re-map call_outcome
- *      using whatever the row already has for status + duration
- *      (usually still empty at this point — mapDialOutcome will fall
- *      back to 'failed' for empty status; we compensate by ONLY
- *      writing call_outcome when we can make a meaningful call).
- *
- *      Simpler: if AMD says machine_*, write call_outcome='voicemail'
- *      directly — no status needed because AMD IS the classification.
- *
- *   2. AMD arrives SECOND (typical when the callee is a human — the
- *      Dial-action fires when they hang up, AMD fires when analysis
- *      completes if it was running). Row already has status +
- *      call_outcome. We upgrade answered_human → voicemail; but
- *      preserve no_answer / busy / failed as-is.
- *
- * Always returns 200 valid TwiML (Phase 3.4 discipline).
+ * NEVER overwrites call_outcome (the Twilio-inferred value). When
+ * disposition and call_outcome disagree, that disagreement is the
+ * signal — reporting reads disposition when present, falls back to
+ * call_outcome. See migration 046 header for the design principle.
  */
-export async function handleAmdStatus(
+export async function writeCallDispositionForCaller(
   supabase: SupabaseClient,
-  body: AmdStatusBody,
-): Promise<AmdStatusResult> {
-  const parentSid = typeof body.CallSid === "string" ? body.CallSid : "";
-  const answeredBy = typeof body.AnsweredBy === "string" ? body.AnsweredBy : "";
-  if (!parentSid || !answeredBy) {
-    return { ok: true, updatedCallsRow: false, outcome: null, preservedTerminalOutcome: false };
+  callerUserId: string,
+  callerBusinessId: string,
+  input: DispositionWriteInput,
+  now: Date = new Date(),
+): Promise<DispositionWriteResult> {
+  if (!input.callRowId || typeof input.callRowId !== "string") {
+    return { ok: false, status: 400, error: "call id required" };
   }
-
-  let existingOutcome: string | null = null;
-  let existingStatus: string | null = null;
-  let existingDuration: number | null = null;
-  try {
-    const { data } = await supabase
-      .from("calls")
-      .select("call_outcome, status, duration_seconds")
-      .eq("twilio_call_sid", parentSid)
-      .maybeSingle();
-    const row = data as
-      | { call_outcome?: string | null; status?: string | null; duration_seconds?: number | null }
-      | null;
-    if (!row) {
-      // Row not found. This can happen if the AMD callback races the
-      // /voice/outbound insert (very short-lived race — insert runs
-      // synchronously before we return the TwiML that starts the
-      // dial). Log and 200 — nothing to do.
-      Sentry.captureMessage("voice_amd_status_row_not_found", {
-        level: "warning",
-        extra: { parentSid, answeredBy },
-      });
-      return { ok: true, updatedCallsRow: false, outcome: null, preservedTerminalOutcome: false };
-    }
-    existingOutcome = row.call_outcome ?? null;
-    existingStatus = row.status ?? null;
-    existingDuration = typeof row.duration_seconds === "number" ? row.duration_seconds : null;
-  } catch (err: any) {
-    Sentry.captureMessage("voice_amd_status_row_read_failed", {
-      level: "warning",
-      extra: { parentSid, error: err?.message },
-    });
-  }
-
-  // Terminal-outcome guard. If Dial-action already stamped no-answer
-  // / busy / failed, an AMD signal here is spurious — store raw
-  // answered_by for forensics but leave call_outcome alone.
-  if (existingOutcome && TERMINAL_NON_ANSWERED_OUTCOMES.has(existingOutcome)) {
-    try {
-      await supabase
-        .from("calls")
-        .update({ answered_by: answeredBy })
-        .eq("twilio_call_sid", parentSid);
-    } catch (err: any) {
-      Sentry.captureException(err, {
-        extra: { where: "handleAmdStatus.preserveTerminal", parentSid },
-      });
-    }
+  if (!CALL_DISPOSITIONS.has(input.disposition)) {
     return {
-      ok: true,
-      updatedCallsRow: true,
-      outcome: (existingOutcome as OutboundOutcome),
-      preservedTerminalOutcome: true,
+      ok: false,
+      status: 400,
+      error: `disposition must be one of: ${Array.from(CALL_DISPOSITIONS).join(", ")}`,
     };
   }
-
-  // Compute the new outcome. mapDialOutcome checks AMD verdict FIRST
-  // (Phase 3.10), so machine_* / fax always yield 'voicemail' even
-  // when the row has no status yet (AMD-first ordering). For AMD
-  // saying 'human' / 'unknown', mapDialOutcome falls through to
-  // status-based mapping — which is 'answered_human' when status is
-  // completed and 'failed' when status is empty. The empty-status
-  // case only matters if AMD returns human before any Dial-action;
-  // in practice AMD returning 'human' means media was flowing so
-  // Dial-action is imminent and will overwrite.
-  const newOutcome = mapDialOutcome(
-    existingStatus ?? "",
-    answeredBy,
-    existingDuration,
-  );
-
-  // Only skip the outcome overwrite when AMD is inconclusive AND
-  // there's no Dial-action status yet — otherwise a spurious
-  // 'unknown' AMD verdict would stamp 'failed' on a call still in
-  // progress. Voicemail / answered_human always overwrite.
-  const isMeaningful =
-    newOutcome === "voicemail" ||
-    newOutcome === "answered_human" ||
-    existingStatus !== null;
-
-  const patch: Record<string, unknown> = { answered_by: answeredBy };
-  if (isMeaningful) patch.call_outcome = newOutcome;
 
   try {
     const { data, error } = await supabase
       .from("calls")
-      .update(patch)
-      .eq("twilio_call_sid", parentSid)
+      .update({
+        disposition: input.disposition,
+        dispositioned_by_user_id: callerUserId,
+        dispositioned_at: now.toISOString(),
+      })
+      .eq("id", input.callRowId)
+      .eq("business_id", callerBusinessId)
+      .eq("handled_by_user_id", callerUserId)
       .select("id")
       .maybeSingle();
     if (error) {
-      Sentry.captureMessage("voice_amd_status_update_failed", {
+      Sentry.captureMessage("voice_disposition_update_failed", {
         level: "warning",
-        extra: { parentSid, error: error.message },
+        extra: { callerUserId, callerBusinessId, callRowId: input.callRowId, error: error.message },
       });
-      return { ok: true, updatedCallsRow: false, outcome: newOutcome, preservedTerminalOutcome: false };
+      return { ok: false, status: 500, error: error.message };
     }
-    return {
-      ok: true,
-      updatedCallsRow: !!data,
-      outcome: isMeaningful ? newOutcome : (existingOutcome as OutboundOutcome | null),
-      preservedTerminalOutcome: false,
-    };
+    if (!data) {
+      // No row matched (call_id + business + user). Could be:
+      //   - Wrong id
+      //   - Row exists but in a different business (cross-tenant probe)
+      //   - Row exists but handled_by another staff (cross-user probe)
+      // Return 404 uniformly so we don't leak which case applies.
+      return { ok: false, status: 404, error: "Call not found" };
+    }
+    return { ok: true, status: 200, disposition: input.disposition };
   } catch (err: any) {
-    Sentry.captureException(err, { extra: { where: "handleAmdStatus", parentSid } });
-    return { ok: true, updatedCallsRow: false, outcome: newOutcome, preservedTerminalOutcome: false };
+    Sentry.captureException(err, {
+      extra: { where: "writeCallDispositionForCaller", callerUserId },
+    });
+    return { ok: false, status: 500, error: err?.message || "disposition_write_failed" };
   }
 }
 
-router.post(
-  "/voice/amd-status",
+/**
+ * Phase 3.12 — look up a `calls` row's UUID by Twilio parent CallSid,
+ * scoped to the caller's business + user. The DispositionModal needs
+ * the row's id (UUID) to PATCH, but the browser only knows the Twilio
+ * CallSid from its Call object. Small endpoint, tightly scoped.
+ * Returns 404 (not 403) on cross-scope miss to avoid leaking whether
+ * the SID exists in another tenant.
+ */
+export async function lookupCallByTwilioSidForCaller(
+  supabase: SupabaseClient,
+  callerUserId: string,
+  callerBusinessId: string,
+  twilioCallSid: string,
+): Promise<
+  | { ok: true; call: { id: string; disposition: string | null; call_outcome: string | null; caller_number: string | null } }
+  | { ok: false; status: number; error: string }
+> {
+  if (!twilioCallSid || typeof twilioCallSid !== "string") {
+    return { ok: false, status: 400, error: "twilio_call_sid required" };
+  }
+  const { data, error } = await supabase
+    .from("calls")
+    .select("id, disposition, call_outcome, caller_number")
+    .eq("business_id", callerBusinessId)
+    .eq("handled_by_user_id", callerUserId)
+    .eq("twilio_call_sid", twilioCallSid)
+    .maybeSingle();
+  if (error) return { ok: false, status: 500, error: error.message };
+  if (!data) return { ok: false, status: 404, error: "Call not found" };
+  return {
+    ok: true,
+    call: data as { id: string; disposition: string | null; call_outcome: string | null; caller_number: string | null },
+  };
+}
+
+router.get(
+  "/voice/calls/by-twilio-sid/:sid",
+  requireAuth,
   async (req: Request, res: Response): Promise<void> => {
-    // Same 200-always discipline as /outbound-status. The whole
-    // pipeline is designed so no path here can surface non-2xx.
-    if (!verifyTwilioSignature(req)) {
-      Sentry.captureMessage("voice_amd_status_signature_rejected", {
-        level: "error",
-        extra: { path: req.originalUrl },
-      });
-      res.status(200).type("text/xml").send('<?xml version="1.0" encoding="UTF-8"?><Response/>');
+    const userId = req.userId;
+    const businessId = req.businessId;
+    if (!userId || !businessId) {
+      res.status(401).json({ error: "Authentication required" });
       return;
     }
     const supabase = getSupabase();
     if (!supabase) {
-      res.status(200).type("text/xml").send('<?xml version="1.0" encoding="UTF-8"?><Response/>');
+      res.status(500).json({ error: "Database not configured" });
       return;
     }
-    try {
-      await handleAmdStatus(supabase, (req.body || {}) as AmdStatusBody);
-    } catch (err: any) {
-      Sentry.captureException(err, { extra: { where: "voice.amd-status.handler" } });
+    const result = await lookupCallByTwilioSidForCaller(
+      supabase,
+      userId,
+      businessId,
+      String(req.params.sid || ""),
+    );
+    if (!result.ok) {
+      res.status(result.status).json({ error: result.error });
+      return;
     }
-    res.status(200).type("text/xml").send('<?xml version="1.0" encoding="UTF-8"?><Response/>');
+    res.json({ call: result.call });
+  },
+);
+
+router.patch(
+  "/voice/calls/:id/disposition",
+  requireAuth,
+  async (req: Request, res: Response): Promise<void> => {
+    const userId = req.userId;
+    const businessId = req.businessId;
+    if (!userId || !businessId) {
+      res.status(401).json({ error: "Authentication required" });
+      return;
+    }
+    const supabase = getSupabase();
+    if (!supabase) {
+      res.status(500).json({ error: "Database not configured" });
+      return;
+    }
+    const body = (req.body || {}) as Record<string, unknown>;
+    const disposition = body.disposition as CallDisposition;
+    const result = await writeCallDispositionForCaller(supabase, userId, businessId, {
+      callRowId: String(req.params.id || ""),
+      disposition,
+    });
+    if (!result.ok) {
+      res.status(result.status).json({ error: result.error });
+      return;
+    }
+    res.json({ disposition: result.disposition });
   },
 );
 
@@ -1275,6 +1219,14 @@ export interface RecentCallRow {
   start_time: string | null;
   end_time: string | null;
   created_at: string | null;
+  /**
+   * Phase 3.12 — staff-entered disposition (nullable). Distinct
+   * from call_outcome (Twilio-inferred). Frontend renders
+   * disposition when set; falls back to call_outcome; visibly
+   * flags rows that could have been dispositioned but weren't.
+   */
+  disposition: string | null;
+  dispositioned_at: string | null;
 }
 
 export interface RecentCallsResponse {
@@ -1293,7 +1245,7 @@ export async function listRecentInAppCallsForUser(
   const { data, error } = await supabase
     .from("calls")
     .select(
-      "id, twilio_call_sid, direction, caller_number, answered_via, status, call_outcome, duration_seconds, start_time, end_time, created_at",
+      "id, twilio_call_sid, direction, caller_number, answered_via, status, call_outcome, duration_seconds, start_time, end_time, created_at, disposition, dispositioned_at",
     )
     .eq("business_id", businessId)
     .eq("handled_by_user_id", userId)

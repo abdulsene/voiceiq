@@ -413,6 +413,11 @@ interface RecentCall {
   start_time: string | null;
   end_time: string | null;
   created_at: string | null;
+  // Phase 3.12 — staff disposition (nullable). Distinct from
+  // call_outcome. Panel shows disposition when set + flags rows that
+  // could have been dispositioned but weren't.
+  disposition: string | null;
+  dispositioned_at: string | null;
 }
 
 /**
@@ -524,19 +529,53 @@ function displayOutcome(call: RecentCall): { label: string; tone: "answered" | "
   );
 }
 
+/**
+ * Phase 3.12 — human-readable disposition labels. Keep in sync with
+ * the server's whitelist (CALL_DISPOSITIONS in routes/voice.ts).
+ * Mismatch just falls through to the raw enum which is grep-able,
+ * matching the OUTCOME_DISPLAY escape hatch.
+ */
+const DISPOSITION_DISPLAY: Record<string, { label: string; tone: "answered" | "missed" | "neutral" }> = {
+  reached_person: { label: "Reached person", tone: "answered" },
+  voicemail_left_message: { label: "Voicemail — left message", tone: "missed" },
+  voicemail_no_message: { label: "Voicemail — no message", tone: "missed" },
+  wrong_number: { label: "Wrong number", tone: "missed" },
+  no_answer_bad_line: { label: "No answer / bad line", tone: "missed" },
+};
+
+/**
+ * Phase 3.12 — is this a call we WOULD have shown the disposition
+ * modal for (i.e., it connected and is outbound)? Used to render an
+ * "Not dispositioned" hint on undispositioned rows that COULD have
+ * been dispositioned — distinct from calls that never connected
+ * (no_answer / busy / failed / caller_hung_up_during_ring), which
+ * have accurate inferred outcomes and don't need staff input.
+ */
+function isDispositionableRow(call: RecentCall): boolean {
+  if (call.direction !== "outbound") return false;
+  const inferred = call.call_outcome || call.status || "";
+  return inferred === "answered_human" || inferred === "answered" || inferred === "completed" || inferred === "voicemail";
+}
+
 function RecentCallRow({ call }: { call: RecentCall }) {
   const outbound = call.direction === "outbound";
-  const outcome = displayOutcome(call);
+  const inferred = displayOutcome(call);
+  // Phase 3.12 — disposition wins over inferred outcome for display.
+  // We render BOTH pieces of info so a viewer can see disagreement
+  // (e.g. Twilio said 'voicemail' but staff dispositioned
+  // 'reached_person' — that difference is the signal).
+  const dispositionMeta = call.disposition ? DISPOSITION_DISPLAY[call.disposition] : null;
+  const tone = dispositionMeta?.tone ?? inferred.tone;
   const Icon = outbound
     ? PhoneOutgoing
-    : outcome.tone === "answered"
+    : tone === "answered"
     ? PhoneIncoming
     : PhoneMissed;
   const iconColor = outbound
     ? "text-blue-600"
-    : outcome.tone === "answered"
+    : tone === "answered"
     ? "text-emerald-600"
-    : outcome.tone === "missed"
+    : tone === "missed"
     ? "text-red-500"
     : "text-neutral-400";
   const when = call.created_at
@@ -549,6 +588,7 @@ function RecentCallRow({ call }: { call: RecentCall }) {
     typeof call.duration_seconds === "number" && call.duration_seconds > 0
       ? `${Math.floor(call.duration_seconds / 60)}:${String(call.duration_seconds % 60).padStart(2, "0")}`
       : null;
+  const undispositioned = isDispositionableRow(call) && !call.disposition;
   return (
     <li className="flex items-center gap-3 py-2.5">
       <Icon className={`h-4 w-4 shrink-0 ${iconColor}`} />
@@ -556,9 +596,33 @@ function RecentCallRow({ call }: { call: RecentCall }) {
         <div className="text-sm font-medium text-neutral-900 truncate">
           {formatPhoneForDisplay(call.caller_number) || call.caller_number || "(unknown)"}
         </div>
-        <div className="text-xs text-neutral-500">
-          {outbound ? "Outbound" : "Inbound"} · {outcome.label}
-          {duration ? ` · ${duration}` : ""}
+        <div className="text-xs text-neutral-500 flex flex-wrap items-center gap-x-1.5">
+          <span>{outbound ? "Outbound" : "Inbound"}</span>
+          <span>·</span>
+          {dispositionMeta ? (
+            // Disposition is the primary display when set.
+            <>
+              <span className="font-medium text-neutral-700">{dispositionMeta.label}</span>
+              {dispositionMeta.label !== inferred.label ? (
+                <span className="text-neutral-400">(Twilio: {inferred.label})</span>
+              ) : null}
+            </>
+          ) : (
+            <>
+              <span>{inferred.label}</span>
+              {undispositioned ? (
+                <span className="rounded-full bg-amber-50 text-amber-800 text-[10px] font-medium px-1.5 py-0.5 border border-amber-200">
+                  Not dispositioned
+                </span>
+              ) : null}
+            </>
+          )}
+          {duration ? (
+            <>
+              <span>·</span>
+              <span>{duration}</span>
+            </>
+          ) : null}
         </div>
       </div>
       <div className="text-xs text-neutral-400 shrink-0">{when}</div>

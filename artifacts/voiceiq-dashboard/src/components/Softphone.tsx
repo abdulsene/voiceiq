@@ -32,6 +32,29 @@ import {
 import { Link, useLocation } from "wouter";
 import { Phone, PhoneOff, Mic, MicOff, PhoneIncoming, Volume2, VolumeX } from "lucide-react";
 import { useTwilioDevice, type SoftphoneStatus, type CallPhase } from "../hooks/useTwilioDevice";
+// Phase 3.12 — staff disposition types shared client-side.
+export type CallDisposition =
+  | "reached_person"
+  | "voicemail_left_message"
+  | "voicemail_no_message"
+  | "wrong_number"
+  | "no_answer_bad_line";
+
+export const CALL_DISPOSITIONS: readonly CallDisposition[] = [
+  "reached_person",
+  "voicemail_left_message",
+  "voicemail_no_message",
+  "wrong_number",
+  "no_answer_bad_line",
+] as const;
+
+export const DISPOSITION_LABEL: Record<CallDisposition, string> = {
+  reached_person: "Reached person",
+  voicemail_left_message: "Voicemail — left message",
+  voicemail_no_message: "Voicemail — no message",
+  wrong_number: "Wrong number",
+  no_answer_bad_line: "No answer / bad line",
+};
 import { getAuthHeaders } from "../lib/api";
 
 const ENABLED_CACHE_KEY = "neverr_softphone_enabled";
@@ -69,6 +92,24 @@ export type CallerIdState =
   | { status: "not_provisioned" }
   | { status: "error"; message: string };
 
+/**
+ * Phase 3.12 — a call that just ended, was connected, was outbound,
+ * and could/should be dispositioned. Non-null triggers the modal.
+ * Cleared when the modal writes or is dismissed. Only outbound calls
+ * that actually connected surface here — no_answer / busy / failed /
+ * canceled-during-ring go straight to the recent-calls panel with
+ * the inferred outcome (asking staff to disposition a call that
+ * never connected is noise).
+ */
+export interface DispositionCandidate {
+  /** Row UUID from GET /voice/calls/by-twilio-sid/:sid. */
+  callRowId: string;
+  /** For the modal header — the number the staff dialed. */
+  calleeNumber: string;
+  /** For diagnosability if the modal errors. */
+  twilioCallSid: string;
+}
+
 export interface SoftphoneContextValue {
   enabled: boolean;
   serverEnabled: boolean | null;
@@ -94,6 +135,10 @@ export interface SoftphoneContextValue {
   callNumber: (to: string) => Promise<boolean>;
   hangup: () => void;
   toggleMute: () => void;
+  /** Phase 3.12 — see DispositionCandidate. */
+  pendingDisposition: DispositionCandidate | null;
+  dismissPendingDisposition: () => void;
+  writePendingDisposition: (d: CallDisposition) => Promise<{ ok: boolean; error?: string }>;
 }
 
 const SoftphoneContext = createContext<SoftphoneContextValue | null>(null);
@@ -130,6 +175,9 @@ export function useSoftphone(): SoftphoneContextValue {
       callNumber: async () => false,
       hangup: () => {},
       toggleMute: () => {},
+      pendingDisposition: null,
+      dismissPendingDisposition: () => {},
+      writePendingDisposition: async () => ({ ok: false, error: "no provider" }),
     };
   }
   return ctx;
@@ -418,6 +466,100 @@ export function SoftphoneProvider({ children }: { children: ReactNode }) {
     else setActiveStartedAt(null);
   }, [device.active]);
 
+  // Phase 3.12 — disposition candidate detection. Track the
+  // most-recently active OUTBOUND call that made it to 'connected'.
+  // When it transitions to 'ended', look up its row id via the new
+  // /voice/calls/by-twilio-sid endpoint and surface a modal. Skips
+  // calls that never connected (staff hangup while ringing, etc.)
+  // — those already have accurate inferred outcomes.
+  const [pendingDisposition, setPendingDisposition] = useState<DispositionCandidate | null>(null);
+  const lastConnectedOutboundRef = useRef<{
+    twilioCallSid: string;
+    calleeNumber: string;
+  } | null>(null);
+  useEffect(() => {
+    if (device.callPhase !== "connected") return;
+    const active = device.active as any;
+    if (!active) return;
+    const direction = active.parameters?.Direction ?? active.direction?.();
+    // A Client-initiated outbound call has direction 'OUTGOING' in the
+    // Voice SDK. The parameters.To on an outbound call is the dialed
+    // number; on an inbound call it's the business's own inbound
+    // number. Use direction as the primary signal.
+    const isOutbound = String(direction || "").toUpperCase() === "OUTGOING";
+    if (!isOutbound) return;
+    const twilioCallSid = active.parameters?.CallSid;
+    const calleeNumber = active.customParameters?.get?.("To") || active.parameters?.To || "";
+    if (!twilioCallSid) return;
+    lastConnectedOutboundRef.current = {
+      twilioCallSid,
+      calleeNumber,
+    };
+  }, [device.callPhase, device.active]);
+
+  useEffect(() => {
+    if (device.callPhase !== "ended") return;
+    const lastConnected = lastConnectedOutboundRef.current;
+    if (!lastConnected) return;
+    // Consumed — clear the ref so we don't re-fire on stale state.
+    lastConnectedOutboundRef.current = null;
+    (async () => {
+      // Small delay so the /voice/outbound row insert (synchronous
+      // in the handler) has definitely landed before we look it up.
+      await new Promise((r) => setTimeout(r, 300));
+      try {
+        const res = await fetch(
+          `/api/voice/calls/by-twilio-sid/${encodeURIComponent(lastConnected.twilioCallSid)}`,
+          { headers: { "Content-Type": "application/json", ...getAuthHeaders() } },
+        );
+        if (!res.ok) return; // silent — modal is opt-in UX, not a failure surface
+        const body = (await res.json()) as {
+          call?: { id: string; disposition: string | null; caller_number: string | null };
+        };
+        if (!body.call || !body.call.id) return;
+        // If the row is already dispositioned (rare — modal was already
+        // shown and written), don't reopen.
+        if (body.call.disposition) return;
+        setPendingDisposition({
+          callRowId: body.call.id,
+          twilioCallSid: lastConnected.twilioCallSid,
+          calleeNumber: body.call.caller_number || lastConnected.calleeNumber,
+        });
+      } catch {
+        // Non-fatal; the modal is a UX assist, not a required flow.
+      }
+    })();
+  }, [device.callPhase]);
+
+  const dismissPendingDisposition = useCallback(() => {
+    setPendingDisposition(null);
+  }, []);
+  const writePendingDisposition = useCallback(
+    async (disposition: CallDisposition): Promise<{ ok: boolean; error?: string }> => {
+      const pending = pendingDisposition;
+      if (!pending) return { ok: false, error: "no pending call" };
+      try {
+        const res = await fetch(
+          `/api/voice/calls/${encodeURIComponent(pending.callRowId)}/disposition`,
+          {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json", ...getAuthHeaders() },
+            body: JSON.stringify({ disposition }),
+          },
+        );
+        if (!res.ok) {
+          const body = await res.json().catch(() => null);
+          return { ok: false, error: (body as any)?.error || `HTTP ${res.status}` };
+        }
+        setPendingDisposition(null);
+        return { ok: true };
+      } catch (e) {
+        return { ok: false, error: (e as Error).message };
+      }
+    },
+    [pendingDisposition],
+  );
+
   // Bump the heartbeat freshness in reachability the moment we
   // register — routing needs a fresh HB before it will ring the
   // browser, and we can't wait 30s for the next refresh.
@@ -472,6 +614,9 @@ export function SoftphoneProvider({ children }: { children: ReactNode }) {
       callNumber,
       hangup: device.hangup,
       toggleMute: device.toggleMute,
+      pendingDisposition,
+      dismissPendingDisposition,
+      writePendingDisposition,
     }),
     [
       enabled,
@@ -496,6 +641,9 @@ export function SoftphoneProvider({ children }: { children: ReactNode }) {
       setEnabled,
       setRingtoneMuted,
       callNumber,
+      pendingDisposition,
+      dismissPendingDisposition,
+      writePendingDisposition,
     ],
   );
 
@@ -532,6 +680,18 @@ export function SoftphoneProvider({ children }: { children: ReactNode }) {
       {/* Dock — minimal pill, click navigates to /phone. Hidden while
           an active call strip is showing to keep the top-center focus. */}
       {!device.active && !device.incoming ? <DockPill /> : null}
+
+      {/* Phase 3.12 — disposition modal after a connected outbound
+          call ends. NO pre-selection (silent-default would recreate
+          the exact bad-data problem this replaces). Auto-dismisses
+          after 20s and clears the candidate. */}
+      {pendingDisposition ? (
+        <DispositionModal
+          candidate={pendingDisposition}
+          onDismiss={dismissPendingDisposition}
+          onSubmit={writePendingDisposition}
+        />
+      ) : null}
     </SoftphoneContext.Provider>
   );
 }
@@ -725,6 +885,136 @@ function ActiveCallStrip({
  * Full controls / dialpad / toggle live on the /phone page in 3.3c so
  * the dock cannot be the only place a user finds the softphone.
  */
+
+/**
+ * Phase 3.12 — post-call disposition modal.
+ *
+ * Design principles from the phase brief:
+ *   - NO pre-selection. A pre-selected default silently writes
+ *     "reached_person" on every skipped call, which recreates the
+ *     exact bad-data problem this replaces.
+ *   - Skippable. Auto-dismisses after 20s. Skipping leaves the row
+ *     with no disposition (call_outcome stays as the Twilio-inferred
+ *     value). Reporting must render "not dispositioned" for those.
+ *   - Only shown after a CONNECTED outbound call — not for
+ *     no_answer / busy / failed / canceled_during_ring which
+ *     already have accurate inferred outcomes.
+ */
+function DispositionModal({
+  candidate,
+  onDismiss,
+  onSubmit,
+}: {
+  candidate: DispositionCandidate;
+  onDismiss: () => void;
+  onSubmit: (d: CallDisposition) => Promise<{ ok: boolean; error?: string }>;
+}) {
+  const [selected, setSelected] = useState<CallDisposition | null>(null);
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [remaining, setRemaining] = useState(20);
+
+  useEffect(() => {
+    const id = setInterval(() => {
+      setRemaining((r) => {
+        if (r <= 1) {
+          clearInterval(id);
+          onDismiss();
+          return 0;
+        }
+        return r - 1;
+      });
+    }, 1000);
+    return () => clearInterval(id);
+  }, [onDismiss]);
+
+  const submit = async () => {
+    if (!selected || submitting) return;
+    setSubmitting(true);
+    setError(null);
+    const result = await onSubmit(selected);
+    setSubmitting(false);
+    if (!result.ok) setError(result.error || "Could not save disposition");
+  };
+
+  return (
+    <div className="fixed inset-0 z-[9998] flex items-center justify-center bg-black/40 backdrop-blur-sm">
+      <div className="w-[460px] max-w-[95vw] rounded-2xl bg-white shadow-2xl p-6">
+        <div className="flex items-start justify-between gap-3 mb-4">
+          <div>
+            <div className="text-xs uppercase tracking-wide text-neutral-500">Call ended</div>
+            <div className="text-lg font-semibold text-neutral-900 mt-0.5">
+              How did that call with{" "}
+              <span className="font-mono text-neutral-700">
+                {candidate.calleeNumber || "the customer"}
+              </span>{" "}
+              go?
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={onDismiss}
+            aria-label="Skip"
+            className="text-neutral-400 hover:text-neutral-700"
+          >
+            ✕
+          </button>
+        </div>
+
+        <div className="space-y-1.5 mb-4">
+          {CALL_DISPOSITIONS.map((opt) => (
+            <label
+              key={opt}
+              className={`flex items-center gap-3 rounded-md border p-2.5 cursor-pointer text-sm hover:bg-neutral-50 ${
+                selected === opt
+                  ? "border-blue-400 bg-blue-50 text-blue-900"
+                  : "border-neutral-200 text-neutral-800"
+              }`}
+            >
+              <input
+                type="radio"
+                name="disposition"
+                value={opt}
+                checked={selected === opt}
+                onChange={() => setSelected(opt)}
+                className="h-3.5 w-3.5"
+              />
+              <span>{DISPOSITION_LABEL[opt]}</span>
+            </label>
+          ))}
+        </div>
+
+        {error ? (
+          <div className="mb-3 rounded-md bg-red-50 p-2 text-xs text-red-800">{error}</div>
+        ) : null}
+
+        <div className="flex items-center justify-between gap-3">
+          <span className="text-xs text-neutral-400 tabular-nums">
+            Auto-dismisses in {remaining}s (leaves undispositioned)
+          </span>
+          <div className="flex gap-2">
+            <button
+              type="button"
+              onClick={onDismiss}
+              className="rounded-md border border-neutral-300 px-3 py-1.5 text-sm text-neutral-700 hover:bg-neutral-50"
+            >
+              Skip
+            </button>
+            <button
+              type="button"
+              onClick={() => void submit()}
+              disabled={!selected || submitting}
+              className="rounded-md bg-blue-600 px-3 py-1.5 text-sm font-medium text-white disabled:opacity-50 hover:bg-blue-700"
+            >
+              {submitting ? "Saving…" : "Save"}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function DockPill() {
   const sp = useSoftphone();
   const [, navigate] = useLocation();
