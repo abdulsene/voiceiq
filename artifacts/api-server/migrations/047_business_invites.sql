@@ -37,7 +37,12 @@
 -- Columns:
 --
 --   id UUID PK
---   business_id UUID   FK -> businesses(id) ON DELETE CASCADE
+--   business_id TEXT   FK -> business_configs(business_id) ON DELETE CASCADE
+--                      (business_configs is the canonical tenant parent in
+--                       this schema — every other tenant-scoped table
+--                       references it. There is no root `businesses` table.
+--                       business_id is TEXT across the whole schema, not
+--                       UUID — matches user_businesses, leads, staff_topics.)
 --   email TEXT         invited email address (lowercased)
 --   role TEXT          enterprise role granted on acceptance
 --   callback_ring_number TEXT    optional E.164; copied to user_businesses on accept
@@ -69,7 +74,7 @@ BEGIN;
 
 CREATE TABLE IF NOT EXISTS business_invites (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  business_id UUID NOT NULL,
+  business_id TEXT NOT NULL,
   email TEXT NOT NULL,
   role TEXT NOT NULL,
   callback_ring_number TEXT,
@@ -92,7 +97,7 @@ BEGIN
   ) THEN
     ALTER TABLE business_invites
       ADD CONSTRAINT business_invites_business_fk
-      FOREIGN KEY (business_id) REFERENCES businesses(id) ON DELETE CASCADE;
+      FOREIGN KEY (business_id) REFERENCES business_configs(business_id) ON DELETE CASCADE;
   END IF;
 
   IF NOT EXISTS (
