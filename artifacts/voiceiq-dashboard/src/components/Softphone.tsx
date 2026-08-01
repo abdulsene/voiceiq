@@ -101,6 +101,28 @@ export type CallerIdState =
  * the inferred outcome (asking staff to disposition a call that
  * never connected is noise).
  */
+/**
+ * Phase 3.14 — disposition write event stream.
+ *
+ * The recent-calls panel subscribes to these so it can update the
+ * relevant row in place — no refetch to learn a value we just sent.
+ *
+ *  - 'optimistic' fires the instant the user clicks Save. Panel
+ *    applies immediately; user never watches a spinner.
+ *  - 'confirmed' fires once the PATCH returns 2xx. Panel no-op
+ *    (already applied); useful for other future subscribers.
+ *  - 'revert' fires if the PATCH fails. Panel rolls the row back
+ *    to its pre-optimistic snapshot and surfaces the error inline.
+ *
+ * The error is delivered on the revert event because the modal is
+ * gone by then — closing it immediately is the whole point of
+ * optimistic UX.
+ */
+export type DispositionEvent =
+  | { kind: "optimistic"; rowId: string; disposition: CallDisposition }
+  | { kind: "confirmed"; rowId: string; disposition: CallDisposition }
+  | { kind: "revert"; rowId: string; error: string };
+
 export interface DispositionCandidate {
   /** Row UUID from GET /voice/calls/by-twilio-sid/:sid. */
   callRowId: string;
@@ -138,7 +160,19 @@ export interface SoftphoneContextValue {
   /** Phase 3.12 — see DispositionCandidate. */
   pendingDisposition: DispositionCandidate | null;
   dismissPendingDisposition: () => void;
-  writePendingDisposition: (d: CallDisposition) => Promise<{ ok: boolean; error?: string }>;
+  /**
+   * Phase 3.14 — fire-and-forget. Emits an 'optimistic' event
+   * synchronously and closes the modal immediately; the caller does
+   * NOT need to await this. PATCH result (success or failure) is
+   * delivered via the disposition event stream (subscribeDisposition).
+   */
+  writePendingDisposition: (d: CallDisposition) => void;
+  /**
+   * Phase 3.14 — subscribe to disposition write events. Returns an
+   * unsubscribe function. Callers MUST call the returned function on
+   * unmount, otherwise the listener leaks and re-fires on stale state.
+   */
+  subscribeDisposition: (cb: (ev: DispositionEvent) => void) => () => void;
 }
 
 const SoftphoneContext = createContext<SoftphoneContextValue | null>(null);
@@ -177,7 +211,8 @@ export function useSoftphone(): SoftphoneContextValue {
       toggleMute: () => {},
       pendingDisposition: null,
       dismissPendingDisposition: () => {},
-      writePendingDisposition: async () => ({ ok: false, error: "no provider" }),
+      writePendingDisposition: () => {},
+      subscribeDisposition: () => () => {},
     };
   }
   return ctx;
@@ -589,30 +624,70 @@ export function SoftphoneProvider({ children }: { children: ReactNode }) {
   const dismissPendingDisposition = useCallback(() => {
     setPendingDisposition(null);
   }, []);
-  const writePendingDisposition = useCallback(
-    async (disposition: CallDisposition): Promise<{ ok: boolean; error?: string }> => {
-      const pending = pendingDisposition;
-      if (!pending) return { ok: false, error: "no pending call" };
-      try {
-        const res = await fetch(
-          `/api/voice/calls/${encodeURIComponent(pending.callRowId)}/disposition`,
-          {
-            method: "PATCH",
-            headers: { "Content-Type": "application/json", ...getAuthHeaders() },
-            body: JSON.stringify({ disposition }),
-          },
-        );
-        if (!res.ok) {
-          const body = await res.json().catch(() => null);
-          return { ok: false, error: (body as any)?.error || `HTTP ${res.status}` };
-        }
-        setPendingDisposition(null);
-        return { ok: true };
-      } catch (e) {
-        return { ok: false, error: (e as Error).message };
-      }
+
+  // Phase 3.14 — disposition write event stream. Ref-backed listener
+  // set so the subscribe helper's identity is stable (does not
+  // re-run subscriber useEffects). Listeners must unsubscribe on
+  // unmount; the returned function from subscribeDisposition does that.
+  const dispositionListenersRef = useRef(new Set<(ev: DispositionEvent) => void>());
+  const subscribeDisposition = useCallback(
+    (cb: (ev: DispositionEvent) => void): (() => void) => {
+      dispositionListenersRef.current.add(cb);
+      return () => {
+        dispositionListenersRef.current.delete(cb);
+      };
     },
-    [pendingDisposition],
+    [],
+  );
+  const emitDispositionEvent = useCallback((ev: DispositionEvent) => {
+    // Snapshot to a local array first — a listener that unsubscribes
+    // itself during dispatch (or that another listener removes) must
+    // not corrupt the iteration.
+    const snapshot = Array.from(dispositionListenersRef.current);
+    for (const cb of snapshot) {
+      try {
+        cb(ev);
+      } catch (err) {
+        console.error("[softphone/disposition] listener threw", err);
+      }
+    }
+  }, []);
+
+  const writePendingDisposition = useCallback(
+    (disposition: CallDisposition): void => {
+      const pending = pendingDisposition;
+      if (!pending) return;
+      const rowId = pending.callRowId;
+      // 1. Optimistic: notify subscribers and close the modal in the
+      //    same tick. From the user's perspective the write is done.
+      emitDispositionEvent({ kind: "optimistic", rowId, disposition });
+      setPendingDisposition(null);
+      // 2. PATCH in the background. Success/failure comes back via
+      //    the same event stream (confirmed / revert). Callers do
+      //    NOT await this — the return type is void.
+      void (async () => {
+        try {
+          const res = await fetch(
+            `/api/voice/calls/${encodeURIComponent(rowId)}/disposition`,
+            {
+              method: "PATCH",
+              headers: { "Content-Type": "application/json", ...getAuthHeaders() },
+              body: JSON.stringify({ disposition }),
+            },
+          );
+          if (!res.ok) {
+            const body = await res.json().catch(() => null);
+            const error = (body as any)?.error || `HTTP ${res.status}`;
+            emitDispositionEvent({ kind: "revert", rowId, error });
+            return;
+          }
+          emitDispositionEvent({ kind: "confirmed", rowId, disposition });
+        } catch (e) {
+          emitDispositionEvent({ kind: "revert", rowId, error: (e as Error).message });
+        }
+      })();
+    },
+    [pendingDisposition, emitDispositionEvent],
   );
 
   // Bump the heartbeat freshness in reachability the moment we
@@ -672,6 +747,7 @@ export function SoftphoneProvider({ children }: { children: ReactNode }) {
       pendingDisposition,
       dismissPendingDisposition,
       writePendingDisposition,
+      subscribeDisposition,
     }),
     [
       enabled,
@@ -699,6 +775,7 @@ export function SoftphoneProvider({ children }: { children: ReactNode }) {
       pendingDisposition,
       dismissPendingDisposition,
       writePendingDisposition,
+      subscribeDisposition,
     ],
   );
 
@@ -962,11 +1039,12 @@ function DispositionModal({
 }: {
   candidate: DispositionCandidate;
   onDismiss: () => void;
-  onSubmit: (d: CallDisposition) => Promise<{ ok: boolean; error?: string }>;
+  // Phase 3.14 — fire-and-forget. Provider closes the modal
+  // synchronously on click; failures surface via the disposition
+  // event stream (revert), NOT back through this callback.
+  onSubmit: (d: CallDisposition) => void;
 }) {
   const [selected, setSelected] = useState<CallDisposition | null>(null);
-  const [submitting, setSubmitting] = useState(false);
-  const [error, setError] = useState<string | null>(null);
   const [remaining, setRemaining] = useState(20);
 
   useEffect(() => {
@@ -983,13 +1061,12 @@ function DispositionModal({
     return () => clearInterval(id);
   }, [onDismiss]);
 
-  const submit = async () => {
-    if (!selected || submitting) return;
-    setSubmitting(true);
-    setError(null);
-    const result = await onSubmit(selected);
-    setSubmitting(false);
-    if (!result.ok) setError(result.error || "Could not save disposition");
+  const submit = () => {
+    if (!selected) return;
+    // No await, no spinner, no error state — provider closes us in
+    // the same tick. Any downstream PATCH failure is caught by the
+    // panel's revert handler.
+    onSubmit(selected);
   };
 
   return (
@@ -1039,10 +1116,6 @@ function DispositionModal({
           ))}
         </div>
 
-        {error ? (
-          <div className="mb-3 rounded-md bg-red-50 p-2 text-xs text-red-800">{error}</div>
-        ) : null}
-
         <div className="flex items-center justify-between gap-3">
           <span className="text-xs text-neutral-400 tabular-nums">
             Auto-dismisses in {remaining}s (leaves undispositioned)
@@ -1057,11 +1130,11 @@ function DispositionModal({
             </button>
             <button
               type="button"
-              onClick={() => void submit()}
-              disabled={!selected || submitting}
+              onClick={submit}
+              disabled={!selected}
               className="rounded-md bg-blue-600 px-3 py-1.5 text-sm font-medium text-white disabled:opacity-50 hover:bg-blue-700"
             >
-              {submitting ? "Saving…" : "Save"}
+              Save
             </button>
           </div>
         </div>

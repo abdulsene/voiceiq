@@ -18,7 +18,7 @@
  *     via Vite `define` and api_started_at via /api/config).
  */
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link } from "wouter";
 import {
   Phone as PhoneIcon,
@@ -422,14 +422,35 @@ interface RecentCall {
 
 /**
  * Phase 3.8 — reads GET /api/voice/recent-calls (browser-only calls
- * for the current user's active business). Auto-refreshes when the
- * softphone transitions from active back to idle so a just-completed
- * call appears without a manual reload.
+ * for the current user's active business).
+ *
+ * Refresh triggers (event-driven, NO polling):
+ *   1. On mount.
+ *   2. When the softphone transitions active <-> idle (refreshKey
+ *      derived from sp.hasActiveCall). NOTE: the active→idle edge
+ *      fires the moment Twilio emits 'disconnect', which is BEFORE
+ *      /voice/outbound-status has landed the row's final outcome. A
+ *      delayed second load ~900ms later picks up the finalized row.
+ *   3. Manual Refresh button — still useful for pulling in calls
+ *      handled by other staff.
+ *
+ * Row-in-place updates (no refetch):
+ *   • subscribeDisposition on the softphone context. Optimistic
+ *     apply on Save click, confirm no-op, revert on failure. The
+ *     staff member never watches a spinner to confirm their own
+ *     input, and we don't burn a network round-trip to learn a
+ *     value we just sent.
  */
 function RecentInAppCallsPanel({ refreshKey }: { refreshKey: string }) {
+  const sp = useSoftphone();
   const [calls, setCalls] = useState<RecentCall[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  // Phase 3.14 — surfaced when an optimistic disposition write is
+  // reverted by a PATCH failure. Cleared on next successful load or
+  // next manual dismiss. This is the ONLY error surface post-modal
+  // (the modal itself closes synchronously on Save).
+  const [revertNotice, setRevertNotice] = useState<string | null>(null);
 
   const load = async () => {
     setLoading(true);
@@ -448,10 +469,85 @@ function RecentInAppCallsPanel({ refreshKey }: { refreshKey: string }) {
     }
   };
 
+  // Phase 3.14 — snapshot of each row's pre-optimistic disposition
+  // state, keyed by row id. Populated on 'optimistic', consumed on
+  // 'revert'. Not React state — we don't want revert-snapshot writes
+  // to trigger renders; they're a private undo log.
+  const revertSnapshotRef = useRef<
+    Map<string, { disposition: string | null; dispositioned_at: string | null }>
+  >(new Map());
+
+  // Phase 3.14 — track prev refreshKey so we only schedule the
+  // delayed post-call refetch on the specific active→idle edge
+  // (NOT on mount, and NOT on idle→active).
+  const prevRefreshKeyRef = useRef(refreshKey);
+
   useEffect(() => {
     void load();
+    const wasActive = prevRefreshKeyRef.current === "active";
+    const isIdle = refreshKey === "idle";
+    prevRefreshKeyRef.current = refreshKey;
+    if (!(wasActive && isIdle)) return;
+    // The active→idle edge fires the instant Twilio emits
+    // 'disconnect'. Give /voice/outbound-status ~900ms to land the
+    // final call_outcome + duration + end_time, then refetch once.
+    // Single-shot setTimeout — NOT a setInterval; no polling.
+    const t = setTimeout(() => void load(), 900);
+    return () => clearTimeout(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [refreshKey]);
+
+  // Phase 3.14 — subscribe to disposition write events. Cleanup
+  // MUST unsubscribe or the listener leaks and re-fires on stale
+  // provider state.
+  useEffect(() => {
+    return sp.subscribeDisposition((ev) => {
+      if (ev.kind === "optimistic") {
+        setCalls((prev) => {
+          if (!prev) return prev;
+          const target = prev.find((c) => c.id === ev.rowId);
+          if (!target) return prev;
+          // Snapshot for potential revert.
+          revertSnapshotRef.current.set(ev.rowId, {
+            disposition: target.disposition,
+            dispositioned_at: target.dispositioned_at,
+          });
+          return prev.map((c) =>
+            c.id === ev.rowId
+              ? {
+                  ...c,
+                  disposition: ev.disposition,
+                  dispositioned_at: new Date().toISOString(),
+                }
+              : c,
+          );
+        });
+        setRevertNotice(null);
+      } else if (ev.kind === "confirmed") {
+        // Already applied; drop the revert snapshot — we won't need
+        // it now. If a future refetch corrects our optimistic
+        // `dispositioned_at` timestamp to the server's, fine.
+        revertSnapshotRef.current.delete(ev.rowId);
+      } else if (ev.kind === "revert") {
+        setCalls((prev) => {
+          if (!prev) return prev;
+          const snap = revertSnapshotRef.current.get(ev.rowId);
+          revertSnapshotRef.current.delete(ev.rowId);
+          if (!snap) return prev;
+          return prev.map((c) =>
+            c.id === ev.rowId
+              ? {
+                  ...c,
+                  disposition: snap.disposition,
+                  dispositioned_at: snap.dispositioned_at,
+                }
+              : c,
+          );
+        });
+        setRevertNotice(`Couldn't save disposition: ${ev.error}`);
+      }
+    });
+  }, [sp.subscribeDisposition]);
 
   return (
     <section className="rounded-xl border border-neutral-200 bg-white p-5">
@@ -469,6 +565,20 @@ function RecentInAppCallsPanel({ refreshKey }: { refreshKey: string }) {
           {loading ? "Loading…" : "Refresh"}
         </button>
       </div>
+
+      {revertNotice ? (
+        <div className="mb-2 flex items-start justify-between gap-2 text-xs text-red-800 rounded-md bg-red-50 p-2">
+          <span>{revertNotice}</span>
+          <button
+            type="button"
+            onClick={() => setRevertNotice(null)}
+            className="text-red-700 hover:text-red-900"
+            aria-label="Dismiss"
+          >
+            ✕
+          </button>
+        </div>
+      ) : null}
 
       {error ? (
         <div className="text-xs text-red-700 rounded-md bg-red-50 p-2">
