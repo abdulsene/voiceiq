@@ -31,7 +31,12 @@ import {
 } from "react";
 import { Link, useLocation } from "wouter";
 import { Phone, PhoneOff, Mic, MicOff, PhoneIncoming, Volume2, VolumeX } from "lucide-react";
-import { useTwilioDevice, type SoftphoneStatus, type CallPhase } from "../hooks/useTwilioDevice";
+import {
+  useTwilioDevice,
+  type SoftphoneStatus,
+  type CallPhase,
+  type FailureKind,
+} from "../hooks/useTwilioDevice";
 // Phase 3.12 — staff disposition types shared client-side.
 export type CallDisposition =
   | "reached_person"
@@ -132,6 +137,41 @@ export interface DispositionCandidate {
   twilioCallSid: string;
 }
 
+/**
+ * Phase 3.15 — computed reason the current user is unreachable to
+ * routing. `null` = reachable (or off-duty, so the question is moot).
+ * The banner + StatusPill switch on this to render specific messages;
+ * different reasons demand different actions.
+ *
+ *   mic-blocked           — browser mic permission denied. Cannot boot
+ *                           the Device without it. Fix: enable in
+ *                           browser site settings.
+ *   signed-out            — dashboard session expired (401 from
+ *                           /voice/token). Fix: sign in again.
+ *   network-offline       — navigator.onLine === false, or token
+ *                           refresh keeps failing on network errors.
+ *                           Fix: reconnect. Auto-recovers on 'online'.
+ *   device-unregistered   — Twilio Device is not registered right
+ *                           now (unregister event, error event, or
+ *                           still connecting/idle after long enough).
+ *                           Fix: usually self-heals on visibilitychange.
+ *   stale-heartbeat       — Device is registered but the server
+ *                           thinks we're stale. Should be transient
+ *                           post Phase 3.15 (visibility trigger pings
+ *                           immediately); if persistent, something is
+ *                           blocking the fetch to /voice/heartbeat.
+ *   no-endpoint           — on duty with in-app calling off AND no
+ *                           callback number. Never was reachable.
+ */
+export type UnreachableReason =
+  | "mic-blocked"
+  | "signed-out"
+  | "network-offline"
+  | "device-unregistered"
+  | "stale-heartbeat"
+  | "no-endpoint"
+  | null;
+
 export interface SoftphoneContextValue {
   enabled: boolean;
   serverEnabled: boolean | null;
@@ -151,6 +191,23 @@ export interface SoftphoneContextValue {
   reachability: Reachability | null;
   /** Phase 3.4 — Chromium supports it, Firefox doesn't. */
   outputDeviceSelectionSupported: boolean;
+  /** Phase 3.15 — see FailureKind in useTwilioDevice. */
+  failureKind: FailureKind;
+  /**
+   * Phase 3.15 — the caller's own on-duty state, hydrated on mount
+   * and updated via OnDutyToggle. Needed by the unreachable banner
+   * (only render when on-duty — being unreachable off-duty is fine).
+   * Nullable while loading; provider treats null as "unknown, don't
+   * render banner yet."
+   */
+  isOnDuty: boolean | null;
+  setIsOnDuty: (v: boolean) => void;
+  /**
+   * Phase 3.15 — computed unreachability reason. Null when reachable
+   * (or off-duty). Non-null → the banner renders. See
+   * UnreachableReason for the enum + fixes.
+   */
+  unreachableReason: UnreachableReason;
   refreshReachability: () => Promise<void>;
   setEnabled: (v: boolean) => Promise<void> | void;
   setRingtoneMuted: (v: boolean) => void;
@@ -209,6 +266,10 @@ export function useSoftphone(): SoftphoneContextValue {
       callNumber: async () => false,
       hangup: () => {},
       toggleMute: () => {},
+      failureKind: null,
+      isOnDuty: null,
+      setIsOnDuty: () => {},
+      unreachableReason: null,
       pendingDisposition: null,
       dismissPendingDisposition: () => {},
       writePendingDisposition: () => {},
@@ -394,6 +455,13 @@ export function SoftphoneProvider({ children }: { children: ReactNode }) {
     }
   });
   const [reachability, setReachability] = useState<Reachability | null>(null);
+  // Phase 3.15 — on-duty state lifted into the provider so the
+  // unreachable banner (mounted app-wide) can gate on it. Hydrated
+  // once on mount from /business/team/on-duty vs /auth/me. The
+  // OnDutyToggle keeps ownership of the toggle click; it calls
+  // setIsOnDuty via the context after each optimistic flip so the
+  // banner reflects reality without a page reload.
+  const [isOnDuty, setIsOnDuty] = useState<boolean | null>(null);
 
   const setRingtoneMuted = useCallback((v: boolean) => {
     setRingtoneMutedRaw(v);
@@ -480,6 +548,86 @@ export function SoftphoneProvider({ children }: { children: ReactNode }) {
   );
 
   const device = useTwilioDevice({ enabled });
+
+  // Phase 3.15 — hydrate on-duty state once. This duplicates the
+  // fetch that OnDutyToggle already does, but the toggle lives
+  // inside this provider tree so we can't reference its state.
+  // The toggle calls setIsOnDuty via the context after every flip
+  // so the two views stay in sync without a race.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const [meRes, onDutyRes] = await Promise.all([
+          fetch("/api/auth/me", {
+            headers: { "Content-Type": "application/json", ...getAuthHeaders() },
+          }).then((r) => (r.ok ? r.json() : null)),
+          fetch("/api/business/team/on-duty", {
+            headers: { "Content-Type": "application/json", ...getAuthHeaders() },
+          }).then((r) => (r.ok ? r.json() : { members: [] })),
+        ]);
+        if (cancelled) return;
+        const myId = meRes?.user?.id;
+        const list = (onDutyRes?.members as Array<{ user_id: string }> | undefined) ?? [];
+        setIsOnDuty(!!myId && list.some((m) => m.user_id === myId));
+      } catch {
+        if (!cancelled) setIsOnDuty(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  /**
+   * Phase 3.15 — classify unreachability into an actionable reason.
+   * Priority matters: the first matching cause wins so the banner
+   * doesn't render "stale heartbeat" when the real problem is that
+   * the user is signed out.
+   *
+   * We only compute a reason when the user is ON DUTY. Being
+   * unreachable off-duty is fine — the whole point of off-duty is
+   * "don't ring me."
+   */
+  const unreachableReason = useMemo<UnreachableReason>(() => {
+    if (isOnDuty !== true) return null;
+    // 1. Signed out. Nothing else can proceed until the user signs in.
+    if (device.status === "signed-out" || device.failureKind === "auth") return "signed-out";
+    // 2. Network offline. navigator.onLine can lag but we defer to it
+    //    plus repeated network-kind refresh failures.
+    if (typeof navigator !== "undefined" && navigator.onLine === false) return "network-offline";
+    // 3. Mic blocked — the hook set permission-denied.
+    if (device.status === "permission-denied") return "mic-blocked";
+    // 4. Server thinks we're unreachable → decide by why.
+    //    reachability endpoint aggregates: has_callback_ring_number,
+    //    in_app_calling_enabled, device_heartbeat_fresh. When
+    //    reachable=true, no banner even if the device state looks
+    //    weird (callback covers us).
+    if (!reachability) return null; // don't shout while unknown
+    if (reachability.reachable) return null;
+    if (!reachability.has_callback_ring_number && !reachability.in_app_calling_enabled) {
+      return "no-endpoint";
+    }
+    // In-app calling is on but heartbeat is stale (or device isn't
+    // registered locally). If the local device is fully un/reg'd,
+    // that's a strictly worse signal than "stale-heartbeat" (we know
+    // we can't ping).
+    if (
+      device.status === "unregistered" ||
+      device.status === "error" ||
+      device.status === "connecting" ||
+      device.status === "requesting-permission" ||
+      device.status === "idle"
+    ) {
+      return "device-unregistered";
+    }
+    return "stale-heartbeat";
+  }, [
+    isOnDuty,
+    device.status,
+    device.failureKind,
+    reachability,
+  ]);
   const [callerIdState, setCallerIdState] = useState<CallerIdState>({ status: "loading" });
   // Phase 3.7 — derived flat CallerId | null for backwards compat with
   // components that just want "the number." The rich state (loading /
@@ -738,6 +886,10 @@ export function SoftphoneProvider({ children }: { children: ReactNode }) {
       preferenceError,
       reachability,
       outputDeviceSelectionSupported: device.outputDeviceSelectionSupported,
+      failureKind: device.failureKind,
+      isOnDuty,
+      setIsOnDuty,
+      unreachableReason,
       refreshReachability,
       setEnabled,
       setRingtoneMuted,
@@ -760,6 +912,7 @@ export function SoftphoneProvider({ children }: { children: ReactNode }) {
       device.toggleMute,
       device.outputDeviceSelectionSupported,
       device.callPhase,
+      device.failureKind,
       callerId,
       callerIdState,
       hasActiveCall,
@@ -768,6 +921,8 @@ export function SoftphoneProvider({ children }: { children: ReactNode }) {
       ringtoneMuted,
       preferenceError,
       reachability,
+      isOnDuty,
+      unreachableReason,
       refreshReachability,
       setEnabled,
       setRingtoneMuted,
@@ -1181,6 +1336,9 @@ export function StatusPill({
     connecting: { label: "Connecting…", color: "bg-blue-100 text-blue-800" },
     registered: { label: "Ready", color: "bg-green-100 text-green-800" },
     unregistered: { label: "Offline", color: "bg-red-100 text-red-800" },
+    // Phase 3.15 — session gone. Red, not amber, because the fix is
+    // an explicit user action (sign in), not "wait and see."
+    "signed-out": { label: "Signed out", color: "bg-red-100 text-red-800" },
     error: { label: "Error", color: "bg-red-100 text-red-800" },
   };
   let label = base[status].label;
@@ -1212,13 +1370,21 @@ export function StatusPill({
 export function SoftphoneIndicator() {
   const sp = useSoftphone();
   const [, navigate] = useLocation();
-  const state = deriveIndicatorState(sp.status, sp.serverEnabled);
+  // Phase 3.15 — when on duty and unreachable, this indicator MUST
+  // read red so it's impossible to miss (per phase brief #4). The
+  // reason enum comes from the provider and already accounts for
+  // "off-duty → don't shout." Fall back to the derived state
+  // otherwise.
+  const state =
+    sp.unreachableReason && sp.isOnDuty === true
+      ? { label: "Unreachable", dot: "bg-red-500", text: "text-red-600" }
+      : deriveIndicatorState(sp.status, sp.serverEnabled);
   return (
     <button
       type="button"
       onClick={() => navigate("/phone")}
       className="flex items-center gap-1.5 hover:opacity-70 transition-opacity"
-      title="Open softphone"
+      title={sp.unreachableReason ? "Unreachable — click for details" : "Open softphone"}
     >
       <span className={`w-2 h-2 rounded-full ${state.dot}`} />
       <Phone className="w-3.5 h-3.5 text-gray-400" />
@@ -1235,6 +1401,12 @@ export function deriveIndicatorState(
 ): { label: string; dot: string; text: string } {
   if (status === "permission-denied") {
     return { label: "Mic blocked", dot: "bg-red-500", text: "text-red-600" };
+  }
+  // Phase 3.15 — signed-out shows in-band with other red states so the
+  // user notices immediately, but with distinct copy so the fix is
+  // obvious ("Signed out" ≠ "Offline"). The banner carries the CTA.
+  if (status === "signed-out") {
+    return { label: "Signed out", dot: "bg-red-500", text: "text-red-600" };
   }
   if (status === "error" || status === "unregistered") {
     return { label: "Offline", dot: "bg-red-500", text: "text-red-600" };
@@ -1254,3 +1426,143 @@ export function deriveIndicatorState(
 // Re-export Link so the system-bar can render a clickable indicator
 // without pulling wouter directly.
 export { Link as SoftphoneLink };
+
+/**
+ * Phase 3.15 — the LOUD unreachable banner.
+ *
+ * Mounted app-wide in App.tsx so it appears on every dashboard page,
+ * not just /phone. Renders only when the user is on duty AND has a
+ * non-null unreachableReason.
+ *
+ * Distinguished causes render distinct copy + CTAs (per phase brief
+ * #4). Also fires a browser Notification once per session when the
+ * reason first appears (best-effort — needs prior permission) and
+ * flashes the tab title so a backgrounded tab can't hide it.
+ *
+ * NOT dismissable. Dismissing a banner about "you cannot receive
+ * calls" defeats the point — either fix it or clock out.
+ */
+export function UnreachableBanner() {
+  const sp = useSoftphone();
+  const [, navigate] = useLocation();
+  const reason = sp.unreachableReason;
+  const shouldShow = sp.isOnDuty === true && reason !== null;
+
+  // Fire a Notification once per (mount, reason) so a hidden tab can
+  // audibly / visually alert the user. Best-effort; requires prior
+  // permission (we do NOT auto-request from the banner). Tracked in
+  // a ref so re-renders don't spam.
+  const notifiedForReasonRef = useRef<UnreachableReason>(null);
+  useEffect(() => {
+    if (!shouldShow || reason === notifiedForReasonRef.current) return;
+    notifiedForReasonRef.current = reason;
+    if (typeof Notification === "undefined") return;
+    if (Notification.permission !== "granted") return;
+    try {
+      new Notification("Neverr — you can't receive calls", {
+        body: bannerCopyFor(reason).headline,
+        requireInteraction: true,
+      });
+    } catch {}
+  }, [shouldShow, reason]);
+
+  // Tab title flash — pulls the same channel as the ringing flash but
+  // stays on until unreachability is resolved. Restores original
+  // title on cleanup.
+  useEffect(() => {
+    if (!shouldShow) return;
+    const original = document.title;
+    let flipped = false;
+    const id = setInterval(() => {
+      flipped = !flipped;
+      document.title = flipped ? `⚠️ Can't receive calls` : original;
+    }, 900);
+    return () => {
+      clearInterval(id);
+      document.title = original;
+    };
+  }, [shouldShow]);
+
+  if (!shouldShow) return null;
+  const copy = bannerCopyFor(reason);
+  return (
+    <div
+      role="alert"
+      aria-live="assertive"
+      className="w-full bg-red-600 text-white text-sm px-4 py-2 flex items-center gap-3 shadow-md"
+    >
+      <span className="text-lg leading-none" aria-hidden>
+        ⚠
+      </span>
+      <div className="flex-1 min-w-0">
+        <div className="font-semibold">{copy.headline}</div>
+        <div className="text-red-100 text-xs">{copy.body}</div>
+      </div>
+      {copy.cta ? (
+        <button
+          type="button"
+          onClick={() => {
+            if (copy.cta!.href === "signout") {
+              window.location.assign("/auth");
+              return;
+            }
+            navigate(copy.cta!.href);
+          }}
+          className="rounded-md bg-white text-red-700 text-xs font-semibold px-3 py-1.5 hover:bg-red-50"
+        >
+          {copy.cta.label}
+        </button>
+      ) : null}
+    </div>
+  );
+}
+
+function bannerCopyFor(reason: UnreachableReason): {
+  headline: string;
+  body: string;
+  cta: { label: string; href: string } | null;
+} {
+  switch (reason) {
+    case "signed-out":
+      return {
+        headline: "Signed out — you cannot receive calls",
+        body: "Your dashboard session expired. Sign back in to keep receiving calls.",
+        cta: { label: "Sign in", href: "signout" },
+      };
+    case "network-offline":
+      return {
+        headline: "Offline — you cannot receive calls",
+        body: "Your network dropped. Calls will resume as soon as you're back online.",
+        cta: null,
+      };
+    case "mic-blocked":
+      return {
+        headline: "Microphone blocked — you cannot receive calls",
+        body:
+          "Grant microphone access to this site in your browser settings, then reload the page.",
+        cta: { label: "Open Phone", href: "/phone" },
+      };
+    case "device-unregistered":
+      return {
+        headline: "Softphone not connected — you cannot receive calls",
+        body: "Open the Phone page to reconnect your browser device, or add a callback number.",
+        cta: { label: "Open Phone", href: "/phone" },
+      };
+    case "stale-heartbeat":
+      return {
+        headline: "Softphone unreachable — calls may miss you",
+        body:
+          "This tab hasn't checked in with the server. Bringing it to the foreground usually fixes it; if it persists, open the Phone page.",
+        cta: { label: "Open Phone", href: "/phone" },
+      };
+    case "no-endpoint":
+      return {
+        headline: "No way to reach you — you cannot receive calls",
+        body:
+          "You're on duty with in-app calling off and no callback number. Enable in-app calling on the Phone page, or add a callback number in Team settings.",
+        cta: { label: "Open Phone", href: "/phone" },
+      };
+    case null:
+      return { headline: "", body: "", cta: null };
+  }
+}

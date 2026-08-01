@@ -74,7 +74,7 @@ import ChatWidget from "./components/ChatWidget";
 // the Twilio Device only boots for authenticated users; renders a
 // bottom-right dock + top-center incoming/active call banners. Exposes
 // useSoftphone() for click-to-call from leads/calls pages.
-import { SoftphoneProvider } from "./components/Softphone";
+import { SoftphoneProvider, UnreachableBanner } from "./components/Softphone";
 // GDPR cookie consent (CookieYes). Renders nothing — only toggles a
 // CSS class on <html> based on route so the CookieYes banner UI is
 // suppressed on auth/contact forms and inside the authenticated
@@ -622,6 +622,14 @@ function DashboardLayout() {
         <div className="flex min-h-screen bg-[#f0f2f5]">
           <Sidebar />
           <main className="flex-1 min-w-0 md:ml-[220px] overflow-y-auto min-h-screen">
+            {/* Phase 3.15 — app-wide unreachable banner. Only renders
+                when the caller is on duty AND has a specific
+                unreachableReason (mic blocked / signed out / device
+                unregistered / network offline / stale heartbeat /
+                no endpoint). Distinguished copy + CTA per reason.
+                Sits ABOVE the DemoBanner so it always wins visual
+                priority. */}
+            <UnreachableBanner />
             <DemoBanner />
             <div className="flex justify-end items-center gap-3 px-6 pt-4 pb-0">
               {/* Phase 3.1b: on-duty toggle. Sits leftmost in the header

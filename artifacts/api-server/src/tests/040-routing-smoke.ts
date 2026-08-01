@@ -272,6 +272,9 @@ import twilio from "twilio";
 // compute expected identities via the helper so a formula change in
 // buildClientIdentity is caught by the fixtures automatically.
 import { buildClientIdentity } from "../lib/voice/client-identity";
+// Phase 3.15 — team page shows a "silently unreachable" flag driven
+// by the team endpoint's new device_heartbeat_fresh field.
+import { handleListTeam } from "../routes/team";
 import { buildRouteToTopicTool } from "../agents";
 import { renderPromptFromHelpers } from "../lib/prompt-renderer";
 
@@ -1541,7 +1544,10 @@ async function T37_zero_match_upsert_creates_row() {
 const CLIENT_A = buildClientIdentity(USER_A, BIZ);
 const CLIENT_B = buildClientIdentity(USER_B, BIZ);
 const FRESH_HB = () => new Date().toISOString();
-const STALE_HB = () => new Date(Date.now() - 5 * 60_000).toISOString();
+// Phase 3.15 — widened DEVICE_FRESHNESS_SECS from 90 to 300. STALE_HB
+// bumped from 5 min → 10 min so it's unambiguously past the new
+// window (5 min is now exactly the boundary).
+const STALE_HB = () => new Date(Date.now() - 10 * 60_000).toISOString();
 
 /**
  * Phase 3.3 T38 — <Client> TwiML shape: a candidate with
@@ -1927,7 +1933,7 @@ async function T42_twilio_call_sid_upsert() {
  * callback_ring_number is dropped from the candidate list — otherwise
  * routing would ring a dead <Client>.
  */
-async function T43_stale_heartbeat_drops_candidate() {
+async function T43_stale_heartbeat_included_and_tagged() {
   const fake = new FakeSupabaseClient();
   stubDefaultBusiness(fake);
   stubStaffTopics(fake, [
@@ -1938,7 +1944,9 @@ async function T43_stale_heartbeat_drops_candidate() {
     (c) => c.op === "select" && c.table === "user_businesses",
     {
       data: [
-        // A: stale heartbeat + no callback → dropped
+        // A: stale heartbeat + no callback → Phase 3.15 INCLUDES with
+        // deviceStale=true (was dropped pre-3.15; silent unreachability
+        // was the exact prod bug that phase fixes).
         {
           user_id: USER_A,
           callback_ring_number: null,
@@ -1946,7 +1954,7 @@ async function T43_stale_heartbeat_drops_candidate() {
           in_app_calling_enabled: true,
           voice_device_last_seen_at: STALE_HB(),
         },
-        // B: fresh heartbeat → kept
+        // B: fresh heartbeat → kept as before, deviceStale=false.
         {
           user_id: USER_B,
           callback_ring_number: null,
@@ -1963,10 +1971,24 @@ async function T43_stale_heartbeat_drops_candidate() {
   if (!result.ok) failures.push(`not ok: ${(result as any).error}`);
   else {
     const cands = result.result.decision.staffCandidates;
-    if (cands.length !== 1) failures.push(`candidate count=${cands.length} (expected 1 — A dropped for stale HB)`);
-    else if (cands[0].userId !== USER_B) failures.push(`kept wrong user: ${cands[0].userId}`);
+    if (cands.length !== 2) {
+      failures.push(`candidate count=${cands.length} (expected 2 — both kept, A tagged stale)`);
+    } else {
+      const a = cands.find((c) => c.userId === USER_A);
+      const b = cands.find((c) => c.userId === USER_B);
+      if (!a) failures.push("USER_A missing — stale HB was dropped (pre-3.15 behaviour)");
+      if (!b) failures.push("USER_B missing");
+      if (a && a.deviceStale !== true) failures.push(`USER_A deviceStale=${a.deviceStale} (expected true)`);
+      if (b && b.deviceStale === true) failures.push(`USER_B deviceStale=${b.deviceStale} (expected false/undefined)`);
+      if (a && a.clientIdentity !== CLIENT_A) failures.push(`USER_A client identity missing (${a.clientIdentity})`);
+    }
   }
-  record("T43 stale heartbeat drops in-app-only candidate", failures.length === 0, failures.join("; ") || "unregistered device is unavailable in routing candidate query");
+  record(
+    "T43 stale heartbeat INCLUDED as candidate + tagged deviceStale (Phase 3.15)",
+    failures.length === 0,
+    failures.join("; ") ||
+      "routing tries the browser instead of silently skipping — dead Client fails fast",
+  );
 }
 
 /**
@@ -2636,8 +2658,11 @@ async function T56_reachability_matrix() {
       expected: { reachable: true, has_callback_ring_number: false, in_app_calling_enabled: true, device_heartbeat_fresh: true },
     },
     {
-      label: "no callback + stale device (5 min old)",
-      row: { callback_ring_number: null, in_app_calling_enabled: true, voice_device_last_seen_at: new Date(Date.now() - 5 * 60_000).toISOString() },
+      // Phase 3.15 — DEVICE_FRESHNESS_SECS widened 90→300s. 10 min
+      // sits clearly outside; 5 min (previous) is exactly on the
+      // boundary. This keeps the "stale" case unambiguous.
+      label: "no callback + stale device (10 min old, > new 300s window)",
+      row: { callback_ring_number: null, in_app_calling_enabled: true, voice_device_last_seen_at: new Date(Date.now() - 10 * 60_000).toISOString() },
       expected: { reachable: false, has_callback_ring_number: false, in_app_calling_enabled: true, device_heartbeat_fresh: false },
     },
     {
@@ -4136,6 +4161,231 @@ async function T92_no_amd_attributes_in_emitted_twiml() {
   record("T92 no AMD attributes in ANY buildOutboundDialTwiml shape", failures.length === 0, failures.join("; ") || "AMD stays removed across every option combination");
 }
 
+// ── Phase 3.15 — reachability across backgrounding / sleep / expiry ─
+
+/**
+ * Phase 3.15 T93 — buildDialTwiml shortens the Dial timeout when
+ * EVERY candidate has a stale device AND no callback number. In that
+ * state we're only ringing possibly-dead browser endpoints; the
+ * caller shouldn't sit through the full 30s window before falling
+ * through to legacy transfer / after-hours. Baseline 30s stays for
+ * the mixed case (any fresh candidate, or any callback number).
+ */
+async function T93_all_stale_shortens_dial_timeout() {
+  const failures: string[] = [];
+  // (a) All stale + no callback → shortened to ALL_STALE_DIAL_TIMEOUT_SECS (15).
+  const twimlAllStale = buildDialTwiml(
+    {
+      path: "topic_match",
+      staffCandidates: [
+        { userId: USER_A, callbackRingNumber: null, clientIdentity: CLIENT_A, deviceStale: true },
+        { userId: USER_B, callbackRingNumber: null, clientIdentity: CLIENT_B, deviceStale: true },
+      ],
+      staffPhones: [],
+      staffUserIds: [USER_A, USER_B],
+      legacyPhone: null,
+      handoffReason: "topic_match_ringing",
+      transferStatus: "routing_topic_match",
+    },
+    {
+      callerId: "+14155550100",
+      whisperUrl: null,
+      recordingStatusUrl: null,
+      dialStatusUrl: null,
+    },
+  );
+  if (!/timeout="15"/.test(twimlAllStale)) {
+    failures.push(`all-stale expected timeout="15" got: ${twimlAllStale.match(/timeout="\d+"/)?.[0]}`);
+  }
+
+  // (b) Any fresh candidate → base 30s timeout preserved.
+  const twimlMixed = buildDialTwiml(
+    {
+      path: "topic_match",
+      staffCandidates: [
+        { userId: USER_A, callbackRingNumber: null, clientIdentity: CLIENT_A, deviceStale: true },
+        { userId: USER_B, callbackRingNumber: null, clientIdentity: CLIENT_B, deviceStale: false },
+      ],
+      staffPhones: [],
+      staffUserIds: [USER_A, USER_B],
+      legacyPhone: null,
+      handoffReason: "topic_match_ringing",
+      transferStatus: "routing_topic_match",
+    },
+    {
+      callerId: "+14155550100",
+      whisperUrl: null,
+      recordingStatusUrl: null,
+      dialStatusUrl: null,
+    },
+  );
+  if (!/timeout="30"/.test(twimlMixed)) {
+    failures.push(`mixed expected timeout="30" got: ${twimlMixed.match(/timeout="\d+"/)?.[0]}`);
+  }
+
+  // (c) All stale BUT has callback number → base 30s. The callback
+  //     leg is a real phone; the caller might reasonably take up to
+  //     30s to grab it. Only shorten when EVERY leg is possibly-dead.
+  const twimlStaleButCallback = buildDialTwiml(
+    {
+      path: "topic_match",
+      staffCandidates: [
+        { userId: USER_A, callbackRingNumber: "+14155550111", clientIdentity: CLIENT_A, deviceStale: true },
+      ],
+      staffPhones: ["+14155550111"],
+      staffUserIds: [USER_A],
+      legacyPhone: null,
+      handoffReason: "topic_match_ringing",
+      transferStatus: "routing_topic_match",
+    },
+    {
+      callerId: "+14155550100",
+      whisperUrl: null,
+      recordingStatusUrl: null,
+      dialStatusUrl: null,
+    },
+  );
+  if (!/timeout="30"/.test(twimlStaleButCallback)) {
+    failures.push(`stale+callback expected timeout="30" got: ${twimlStaleButCallback.match(/timeout="\d+"/)?.[0]}`);
+  }
+
+  record(
+    "T93 all-stale-no-callback → shortened Dial timeout; mixed or callback → base 30s",
+    failures.length === 0,
+    failures.join("; ") ||
+      "caller doesn't sit through 30s of dead-Client ring before fallback kicks in",
+  );
+}
+
+/**
+ * Phase 3.15 T94 — routing must still reach a fallback when ALL
+ * candidates are stale. Even in the worst case (every browser dead),
+ * the caller should be dialed against possibly-dead <Client> legs
+ * simultaneously (fail-fast) AND the action callback should trigger
+ * the normal no-answer fallback. This test verifies we don't produce
+ * a zero-candidate decision when we have on-duty users — the
+ * "silent-drop" bug Phase 3.15 fixes.
+ */
+async function T94_never_zero_candidates_when_on_duty_stale() {
+  const fake = new FakeSupabaseClient();
+  stubDefaultBusiness(fake);
+  stubStaffTopics(fake, [
+    { user_id: USER_A, topic_slug: TOPIC_ROADSIDE },
+  ]);
+  fake.on(
+    (c) => c.op === "select" && c.table === "user_businesses",
+    {
+      data: [
+        // Only candidate is stale + no callback. Pre-3.15 this
+        // produced an empty candidate list and cascaded to
+        // legacy_transfer/after_hours (silent drop = the bug).
+        // Post-3.15 the Client leg is included and fails fast.
+        {
+          user_id: USER_A,
+          callback_ring_number: null,
+          client_identity: CLIENT_A,
+          in_app_calling_enabled: true,
+          voice_device_last_seen_at: STALE_HB(),
+        },
+      ],
+    },
+  );
+
+  const result = await handleRouteToTopic(asClient(fake), baseBody);
+  const failures: string[] = [];
+  if (!result.ok) failures.push(`not ok: ${(result as any).error}`);
+  else {
+    const dec = result.result.decision;
+    if (dec.path !== "topic_match") failures.push(`path=${dec.path} (expected topic_match, not fallback)`);
+    if (dec.staffCandidates.length !== 1) failures.push(`candidate count=${dec.staffCandidates.length}`);
+    if (dec.staffCandidates[0]?.deviceStale !== true) {
+      failures.push(`candidate deviceStale=${dec.staffCandidates[0]?.deviceStale} (expected true)`);
+    }
+    // TwiML should still emit the <Client> leg + shortened timeout.
+    if (result.result.twiml === null) failures.push("twiml=null (expected TwiML for topic_match)");
+    else {
+      if (!/<Client/.test(result.result.twiml)) failures.push("twiml missing <Client>");
+      if (!/timeout="15"/.test(result.result.twiml)) {
+        failures.push(`twiml timeout not shortened: ${result.result.twiml.match(/timeout="\d+"/)?.[0]}`);
+      }
+    }
+  }
+  record(
+    "T94 all-stale on-duty user → path=topic_match with stale Client leg (not silent drop)",
+    failures.length === 0,
+    failures.join("; ") ||
+      "silently unreachable is now impossible when at least one on-duty user exists",
+  );
+}
+
+/**
+ * Phase 3.15 T95 — team endpoint exposes device freshness so the
+ * Team page can flag rows that are on duty but silently unreachable
+ * (no callback + no fresh device). This is the operational visibility
+ * requirement from the phase brief (#5). Route contract, not UI —
+ * covers the field shape + fresh/stale computation boundary.
+ */
+async function T95_team_endpoint_returns_device_freshness() {
+  const fake = new FakeSupabaseClient();
+  fake.on(
+    (c) => c.op === "select" && c.table === "user_businesses",
+    {
+      data: [
+        {
+          user_id: USER_A,
+          role: "user",
+          is_on_duty: true,
+          on_duty_since: new Date().toISOString(),
+          callback_ring_number: null,
+          created_at: new Date().toISOString(),
+          in_app_calling_enabled: true,
+          voice_device_last_seen_at: FRESH_HB(),
+        },
+        {
+          user_id: USER_B,
+          role: "user",
+          is_on_duty: true,
+          on_duty_since: new Date().toISOString(),
+          callback_ring_number: null,
+          created_at: new Date().toISOString(),
+          in_app_calling_enabled: true,
+          voice_device_last_seen_at: STALE_HB(),
+        },
+      ],
+    },
+  );
+  // Also stub staff_topics + users hydration to empty — TeamPage
+  // renders those, they just don't matter for this contract test.
+  fake.on((c) => c.op === "select" && c.table === "staff_topics", { data: [] });
+  fake.on((c) => c.op === "select" && c.table === "auth_users_view", { data: [] });
+
+  const result = await handleListTeam(asClient(fake), BIZ);
+  const failures: string[] = [];
+  if (!result.ok) failures.push(`not ok: ${(result as any).error}`);
+  else {
+    const a = result.members.find((m) => m.user_id === USER_A);
+    const b = result.members.find((m) => m.user_id === USER_B);
+    if (!a || !b) {
+      failures.push(`missing members A=${!!a} B=${!!b}`);
+    } else {
+      // Shape: new fields present + typed correctly.
+      if (typeof a.in_app_calling_enabled !== "boolean") failures.push("in_app_calling_enabled missing/wrong type");
+      if (typeof a.device_heartbeat_fresh !== "boolean") failures.push("device_heartbeat_fresh missing/wrong type");
+      if (typeof a.voice_device_last_seen_at !== "string" && a.voice_device_last_seen_at !== null) {
+        failures.push("voice_device_last_seen_at wrong type");
+      }
+      // Semantics: A fresh, B stale.
+      if (a.device_heartbeat_fresh !== true) failures.push(`A expected fresh, got ${a.device_heartbeat_fresh}`);
+      if (b.device_heartbeat_fresh !== false) failures.push(`B expected stale, got ${b.device_heartbeat_fresh}`);
+    }
+  }
+  record(
+    "T95 team endpoint exposes device_heartbeat_fresh + voice_device_last_seen_at + in_app_calling_enabled",
+    failures.length === 0,
+    failures.join("; ") || "team page can flag on-duty-but-silently-unreachable rows",
+  );
+}
+
 // ── Bonus: whisper composition and TwiML ────────────────────────────
 
 async function whisper_composition() {
@@ -4204,7 +4454,7 @@ async function main() {
   await T40b_dial_status_rest_fallback_attribution();
   await T41_false_match_regression();
   await T42_twilio_call_sid_upsert();
-  await T43_stale_heartbeat_drops_candidate();
+  await T43_stale_heartbeat_included_and_tagged();
   await T44_token_identity_ignores_client_supplied();
   await T45_parse_client_uris();
   await T46_outbound_twiml_shape();
@@ -4264,6 +4514,13 @@ async function main() {
   await T90_disposition_happy_path_write();
   await T91_disposition_route_http();
   await T92_no_amd_attributes_in_emitted_twiml();
+  // Phase 3.15 — keep on-duty staff reachable across backgrounding /
+  // sleep / token expiry. T43 (stale-drop) inverted to T43 (stale-
+  // include+tag) above; new tests below verify the shortened-timeout
+  // path + never-zero-candidates invariant + team endpoint contract.
+  await T93_all_stale_shortens_dial_timeout();
+  await T94_never_zero_candidates_when_on_duty_stale();
+  await T95_team_endpoint_returns_device_freshness();
   await whisper_composition();
 
   const fails = results.filter((r) => !r.pass);

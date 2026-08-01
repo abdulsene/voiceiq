@@ -40,6 +40,11 @@ import {
   ASSIGNABLE_ENTERPRISE_ROLES,
   type EnterpriseRole,
 } from "../middlewares/auth";
+// Phase 3.15 — shared with routing.ts + reachability so all three
+// surfaces (routing engine, /voice/reachability, team page) apply the
+// same freshness threshold. Widened 90→300s to tolerate throttled
+// background tabs; see the constant's own JSDoc.
+import { DEVICE_FRESHNESS_SECS } from "../lib/routing/constants";
 
 const router = Router();
 
@@ -66,6 +71,13 @@ export interface TeamMemberRow {
   callback_ring_number: string | null;
   assigned_topics: string[];
   created_at: string | null;
+  // Phase 3.15 — device presence so the Team page can flag rows
+  // that are on duty + in-app calling but with a stale/never-seen
+  // heartbeat AND no callback number (operational risk owner
+  // should see, per phase brief #5). We do NOT auto-clock out.
+  in_app_calling_enabled: boolean;
+  voice_device_last_seen_at: string | null;
+  device_heartbeat_fresh: boolean;
 }
 
 interface UserBusinessRow {
@@ -75,6 +87,9 @@ interface UserBusinessRow {
   on_duty_since: string | null;
   callback_ring_number: string | null;
   created_at: string | null;
+  // Phase 3.15 — see TeamMemberRow.
+  in_app_calling_enabled: boolean | null;
+  voice_device_last_seen_at: string | null;
 }
 
 interface StaffTopicRow {
@@ -235,7 +250,9 @@ export async function handleListTeam(
   try {
     const ubResp = await supabase
       .from("user_businesses")
-      .select("user_id, role, is_on_duty, on_duty_since, callback_ring_number, created_at")
+      .select(
+        "user_id, role, is_on_duty, on_duty_since, callback_ring_number, created_at, in_app_calling_enabled, voice_device_last_seen_at",
+      )
       .eq("business_id", businessId)
       .order("created_at", { ascending: true });
     if (ubResp.error) {
@@ -269,8 +286,14 @@ export async function handleListTeam(
       topicsByUser.set(row.user_id, arr);
     }
 
+    const nowMs = Date.now();
     const members: TeamMemberRow[] = ubRows.map((r) => {
       const u = userMap.get(r.user_id);
+      const lastMs = r.voice_device_last_seen_at
+        ? Date.parse(r.voice_device_last_seen_at)
+        : NaN;
+      const heartbeatFresh =
+        !Number.isNaN(lastMs) && nowMs - lastMs <= DEVICE_FRESHNESS_SECS * 1000;
       return {
         user_id: r.user_id,
         email: u?.email ?? null,
@@ -281,6 +304,9 @@ export async function handleListTeam(
         callback_ring_number: r.callback_ring_number,
         assigned_topics: (topicsByUser.get(r.user_id) ?? []).sort(),
         created_at: r.created_at,
+        in_app_calling_enabled: r.in_app_calling_enabled === true,
+        voice_device_last_seen_at: r.voice_device_last_seen_at,
+        device_heartbeat_fresh: heartbeatFresh,
       };
     });
     return { ok: true, members };
@@ -567,7 +593,9 @@ export async function handleListOnDuty(
   try {
     const ubResp = await supabase
       .from("user_businesses")
-      .select("user_id, role, is_on_duty, on_duty_since, callback_ring_number, created_at")
+      .select(
+        "user_id, role, is_on_duty, on_duty_since, callback_ring_number, created_at, in_app_calling_enabled, voice_device_last_seen_at",
+      )
       .eq("business_id", businessId)
       .eq("is_on_duty", true);
     if (ubResp.error) return { ok: false, status: 500, error: "Database error" };
@@ -584,8 +612,14 @@ export async function handleListOnDuty(
       arr.push(row.topic_slug);
       topicsByUser.set(row.user_id, arr);
     }
+    const nowMs = Date.now();
     const members: TeamMemberRow[] = ubRows.map((r) => {
       const u = userMap.get(r.user_id);
+      const lastMs = r.voice_device_last_seen_at
+        ? Date.parse(r.voice_device_last_seen_at)
+        : NaN;
+      const heartbeatFresh =
+        !Number.isNaN(lastMs) && nowMs - lastMs <= DEVICE_FRESHNESS_SECS * 1000;
       return {
         user_id: r.user_id,
         email: u?.email ?? null,
@@ -596,6 +630,9 @@ export async function handleListOnDuty(
         callback_ring_number: r.callback_ring_number,
         assigned_topics: (topicsByUser.get(r.user_id) ?? []).sort(),
         created_at: r.created_at,
+        in_app_calling_enabled: r.in_app_calling_enabled === true,
+        voice_device_last_seen_at: r.voice_device_last_seen_at,
+        device_heartbeat_fresh: heartbeatFresh,
       };
     });
     return { ok: true, members };

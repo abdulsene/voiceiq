@@ -299,34 +299,58 @@ interface UserBusinessRow {
 }
 
 /**
- * Phase 3.3 — decide whether a user_businesses row contributes a live
- * <Client> leg. Returns the client_identity iff in-app calling is
- * enabled AND the device has been seen within DEVICE_FRESHNESS_SECS.
- * Otherwise null → the dial-builder emits no <Client> for this user.
+ * Phase 3.3 — decide whether a user_businesses row contributes a
+ * <Client> leg. Returns the client_identity when in-app calling is
+ * enabled AND we have a client_identity to dial.
+ *
+ * Phase 3.15 — DROPPED the freshness gate. Previously stale-
+ * heartbeat rows returned null and the whole candidate got dropped
+ * (silent unreachability — the exact prod bug this phase fixes).
+ * Now: include the leg, tag deviceStale, let Twilio fail-fast on a
+ * dead endpoint. Freshness is still evaluated via isClientDeviceStale
+ * and surfaced to the user via /voice/reachability + the app banner.
  */
-function liveClientIdentity(row: UserBusinessRow, now: Date = new Date()): string | null {
+function liveClientIdentity(row: UserBusinessRow): string | null {
   if (!row.in_app_calling_enabled) return null;
   if (!row.client_identity) return null;
-  const last = row.voice_device_last_seen_at ? Date.parse(row.voice_device_last_seen_at) : NaN;
-  if (Number.isNaN(last)) return null;
-  const ageMs = now.getTime() - last;
-  if (ageMs > DEVICE_FRESHNESS_SECS * 1000) return null;
   return row.client_identity;
 }
 
 /**
+ * Phase 3.15 — device stale iff we have a heartbeat timestamp and
+ * it's older than DEVICE_FRESHNESS_SECS, OR we have no timestamp at
+ * all. Returns null when the row doesn't contribute a Client leg
+ * (in_app_calling_enabled=false or no client_identity) so callers
+ * can distinguish "no leg" from "leg + stale."
+ */
+function isClientDeviceStale(row: UserBusinessRow, now: Date = new Date()): boolean | null {
+  if (!row.in_app_calling_enabled || !row.client_identity) return null;
+  const last = row.voice_device_last_seen_at ? Date.parse(row.voice_device_last_seen_at) : NaN;
+  if (Number.isNaN(last)) return true;
+  const ageMs = now.getTime() - last;
+  return ageMs > DEVICE_FRESHNESS_SECS * 1000;
+}
+
+/**
  * Phase 3.3 — a candidate is dialable iff EITHER a callback_ring_number
- * is set OR their device is live (returns a client identity). Anyone
- * who matches neither is dropped from the ring list so we don't emit
- * an empty <Client>-less <Number>-less TwiML fragment.
+ * is set OR they contribute a Client leg (returns a client identity).
+ * Anyone who matches neither is dropped from the ring list so we don't
+ * emit an empty <Client>-less <Number>-less TwiML fragment.
+ *
+ * Phase 3.15 — deviceStale is tagged so the dial-builder can shorten
+ * the Dial timeout when every candidate is stale AND has no callback
+ * (avoids 30s of dead air before falling through to legacy transfer).
  */
 function toCandidateOrNull(row: UserBusinessRow, now: Date = new Date()): StaffCandidate | null {
-  const client = liveClientIdentity(row, now);
+  const client = liveClientIdentity(row);
   if (!row.callback_ring_number && !client) return null;
+  const stale = isClientDeviceStale(row, now);
   return {
     userId: row.user_id,
     callbackRingNumber: row.callback_ring_number,
     clientIdentity: client,
+    // Only meaningful when we're emitting a client leg; leave undefined otherwise.
+    deviceStale: client ? stale === true : undefined,
   };
 }
 

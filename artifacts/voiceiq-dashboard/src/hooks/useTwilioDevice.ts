@@ -40,7 +40,27 @@ export type SoftphoneStatus =
   | "connecting"
   | "registered"
   | "unregistered"
+  // Phase 3.15 — distinct from "error" so the banner can render an
+  // actionable "Signed out — sign in to keep receiving calls" prompt.
+  // Set when POST /voice/token returns 401 (dashboard session expired)
+  // rather than a generic transport failure.
+  | "signed-out"
   | "error";
+
+/**
+ * Phase 3.15 — classify the last failure so the app-wide unreachable
+ * banner can render a specific, actionable message rather than
+ * generic "Not receiving." Set alongside `error` string.
+ *
+ *   network     — fetch threw or non-401 HTTP failure. Recoverable
+ *                 on reconnect; refresh loop retries with backoff.
+ *   auth        — 401 from /voice/token. Session gone; user must
+ *                 sign in again. Not recoverable without user action.
+ *   register    — Twilio Device.register() rejected or the SDK
+ *                 emitted an 'error' event. Recoverable on visibility
+ *                 change (we call register() again).
+ */
+export type FailureKind = "network" | "auth" | "register" | null;
 
 /**
  * Phase 3.9 — explicit lifecycle for the ACTIVE call, independent of
@@ -73,24 +93,83 @@ const HEARTBEAT_INTERVAL_MS = 30_000;
 // during which incoming calls would fail).
 const REFRESH_LEAD_TIME_MS = 5 * 60 * 1000;
 
+/**
+ * Phase 3.15 — bounded exponential backoff for token refresh network
+ * failures. A single flaky fetch was leaving Device permanently
+ * unregistered before this. Steps: 5s, 15s, 45s, cap at 120s. We keep
+ * trying forever on network failures (the user's session is still
+ * valid; we just can't reach us); on 401 we STOP and mark signed-out.
+ */
+const REFRESH_BACKOFF_STEPS_MS = [5_000, 15_000, 45_000, 120_000];
+
+/**
+ * Phase 3.15 — typed error so callers can distinguish 401 (session
+ * expired, don't retry) from a generic transport failure (retry with
+ * backoff). Thrown by fetchToken; consumed by scheduleRefresh + boot.
+ */
+class TokenFetchError extends Error {
+  constructor(public kind: "network" | "auth", message: string) {
+    super(message);
+    this.name = "TokenFetchError";
+  }
+}
+
 async function fetchToken(): Promise<TokenPayload> {
-  const res = await fetch("/api/voice/token", {
-    method: "POST",
-    headers: { "Content-Type": "application/json", ...getAuthHeaders() },
-  });
-  if (!res.ok) throw new Error(`token fetch failed: ${res.status}`);
+  let res: Response;
+  try {
+    res = await fetch("/api/voice/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...getAuthHeaders() },
+    });
+  } catch (e) {
+    throw new TokenFetchError("network", `token fetch network error: ${(e as Error).message}`);
+  }
+  if (res.status === 401 || res.status === 403) {
+    throw new TokenFetchError("auth", `token endpoint returned ${res.status}`);
+  }
+  if (!res.ok) {
+    throw new TokenFetchError("network", `token fetch failed: ${res.status}`);
+  }
   return res.json();
 }
 
-async function postHeartbeat(): Promise<void> {
+/**
+ * Phase 3.15 — heartbeat POST with debug logging of the gap since
+ * the last ping. Under Chromium's hidden-tab throttling, the gap
+ * BALLOONS from the intended 30s to ≥60s (and eventually
+ * once-per-minute cap after ~5 min hidden). Logging the actual gap
+ * lets us tell whether the widened DEVICE_FRESHNESS_SECS window is
+ * still enough or whether the throttling has crossed even 5 minutes
+ * (in which case the next intervention is a Web Worker heartbeat).
+ *
+ * The Phase 3.15 investigation found that the constants we're
+ * shipping (300s window + on-visibility ping) tolerate documented
+ * Chromium behaviour without a Worker. But because throttling can
+ * evolve across browser versions, we log gaps > 90s at info level
+ * so future regressions produce evidence in the console.
+ */
+let lastHeartbeatTs = 0;
+async function postHeartbeat(cause: string): Promise<void> {
+  const now = Date.now();
+  const gapMs = lastHeartbeatTs > 0 ? now - lastHeartbeatTs : null;
+  if (gapMs !== null && gapMs > 90_000) {
+    console.info(
+      `[softphone/heartbeat] gap=${Math.round(gapMs / 1000)}s cause=${cause} — ` +
+        `exceeded old 90s window; the widened 300s window is what's keeping us reachable`,
+    );
+  } else {
+    console.debug(`[softphone/heartbeat] gap=${gapMs === null ? "first" : `${Math.round(gapMs / 1000)}s`} cause=${cause}`);
+  }
+  lastHeartbeatTs = now;
   try {
     await fetch("/api/voice/heartbeat", {
       method: "POST",
       headers: { "Content-Type": "application/json", ...getAuthHeaders() },
     });
   } catch {
-    // Non-fatal — the next heartbeat retry will hit; if we lose
-    // registration for >90s the routing engine drops us as a candidate.
+    // Non-fatal — the next heartbeat retry will hit; visibility /
+    // focus / online triggers guarantee we ping again as soon as the
+    // browser gives us CPU back.
   }
 }
 
@@ -118,6 +197,8 @@ export interface UseTwilioDeviceResult {
   callPhase: CallPhase;
   isMuted: boolean;
   error: string | null;
+  /** Phase 3.15 — see FailureKind. */
+  failureKind: FailureKind;
   /**
    * Phase 3.4 — true iff the browser implements HTMLAudioElement
    * .setSinkId (Chromium yes, Firefox no as of FF 141). Feature
@@ -205,6 +286,9 @@ export function useTwilioDevice(opts: UseTwilioDeviceOptions): UseTwilioDeviceRe
   const [callPhase, setCallPhase] = useState<CallPhase>("none");
   const [isMuted, setIsMuted] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Phase 3.15 — see FailureKind. Set alongside `error` to give the
+  // banner enough info to render a specific message.
+  const [failureKind, setFailureKind] = useState<FailureKind>(null);
   // Phase 3.4 — snapshot at mount; the value can't change over the
   // lifetime of a page.
   const outputDeviceSelectionSupported = detectOutputDeviceSelectionSupport();
@@ -213,6 +297,10 @@ export function useTwilioDevice(opts: UseTwilioDeviceOptions): UseTwilioDeviceRe
   const refreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const heartbeatTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const disposedRef = useRef(false);
+  // Phase 3.15 — track which backoff step we're on so consecutive
+  // network failures don't hammer the token endpoint. Reset on any
+  // successful refresh.
+  const refreshBackoffStepRef = useRef(0);
 
   const clearTimers = () => {
     if (refreshTimerRef.current) {
@@ -235,9 +323,36 @@ export function useTwilioDevice(opts: UseTwilioDeviceOptions): UseTwilioDeviceRe
       try {
         const fresh = await fetchToken();
         dev.updateToken(fresh.token);
+        // Success — clear any prior failure state + reset backoff.
+        refreshBackoffStepRef.current = 0;
+        setError(null);
+        setFailureKind(null);
         scheduleRefresh(fresh.expires_at);
       } catch (e) {
+        if (e instanceof TokenFetchError && e.kind === "auth") {
+          // Phase 3.15 — session gone. Do NOT retry; that just burns
+          // requests and produces spurious 401s in the logs. Surface
+          // signed-out so the banner can prompt sign-in.
+          console.warn("[softphone/token] refresh got 401 — session expired");
+          setStatus("signed-out");
+          setError("Signed out — sign in to keep receiving calls");
+          setFailureKind("auth");
+          return;
+        }
+        // Network failure — retry with bounded backoff. Keep the
+        // Device alive on the existing token (still valid for a bit;
+        // Twilio's tokenWillExpire event and the token TTL provide
+        // additional safety).
+        const step = Math.min(refreshBackoffStepRef.current, REFRESH_BACKOFF_STEPS_MS.length - 1);
+        const backoffMs = REFRESH_BACKOFF_STEPS_MS[step];
+        refreshBackoffStepRef.current = step + 1;
+        console.warn(
+          `[softphone/token] refresh failed (${(e as Error).message}); retry in ${backoffMs / 1000}s (step ${step + 1})`,
+        );
         setError(`token refresh failed: ${(e as Error).message}`);
+        setFailureKind("network");
+        if (refreshTimerRef.current) clearTimeout(refreshTimerRef.current);
+        refreshTimerRef.current = setTimeout(() => scheduleRefresh(expiresAt), backoffMs);
       }
     }, delayMs);
   }, []);
@@ -269,8 +384,18 @@ export function useTwilioDevice(opts: UseTwilioDeviceOptions): UseTwilioDeviceRe
       try {
         payload = await fetchToken();
       } catch (e) {
+        if (e instanceof TokenFetchError && e.kind === "auth") {
+          // Phase 3.15 — boot-time 401. Session is already gone;
+          // show the signed-out state immediately rather than the
+          // generic "error" which hides the actionable prompt.
+          setStatus("signed-out");
+          setError("Signed out — sign in to keep receiving calls");
+          setFailureKind("auth");
+          return;
+        }
         setStatus("error");
         setError(`Could not fetch voice token: ${(e as Error).message}`);
+        setFailureKind("network");
         return;
       }
       if (disposedRef.current) return;
@@ -287,12 +412,20 @@ export function useTwilioDevice(opts: UseTwilioDeviceOptions): UseTwilioDeviceRe
       device.on("registered", () => {
         setStatus("registered");
         setError(null);
-        void postHeartbeat();
+        setFailureKind(null);
+        // Immediate ping — do NOT wait for the interval. The routing
+        // engine gates on freshness; we want to be counted before
+        // the next call arrives.
+        void postHeartbeat("registered-event");
         if (heartbeatTimerRef.current) clearInterval(heartbeatTimerRef.current);
-        heartbeatTimerRef.current = setInterval(postHeartbeat, HEARTBEAT_INTERVAL_MS);
+        heartbeatTimerRef.current = setInterval(
+          () => postHeartbeat("interval"),
+          HEARTBEAT_INTERVAL_MS,
+        );
       });
       device.on("unregistered", () => {
         setStatus("unregistered");
+        setFailureKind("register");
         if (heartbeatTimerRef.current) {
           clearInterval(heartbeatTimerRef.current);
           heartbeatTimerRef.current = null;
@@ -301,14 +434,28 @@ export function useTwilioDevice(opts: UseTwilioDeviceOptions): UseTwilioDeviceRe
       device.on("error", (err: any) => {
         setError(err?.message || "Device error");
         setStatus("error");
+        setFailureKind("register");
       });
       device.on("tokenWillExpire", async () => {
         try {
           const fresh = await fetchToken();
           device.updateToken(fresh.token);
+          refreshBackoffStepRef.current = 0;
+          setError(null);
+          setFailureKind(null);
           scheduleRefresh(fresh.expires_at);
         } catch (e) {
+          if (e instanceof TokenFetchError && e.kind === "auth") {
+            setStatus("signed-out");
+            setError("Signed out — sign in to keep receiving calls");
+            setFailureKind("auth");
+            return;
+          }
           setError(`token refresh failed: ${(e as Error).message}`);
+          setFailureKind("network");
+          // tokenWillExpire fires ~90s before expiry; if we fail here
+          // the scheduled refresh will retry with backoff. Don't
+          // stack up another handler.
         }
       });
       device.on("incoming", (call: Call) => {
@@ -363,6 +510,66 @@ export function useTwilioDevice(opts: UseTwilioDeviceOptions): UseTwilioDeviceRe
     // stable identity matters; we accept a stale closure here.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [enabled, scheduleRefresh]);
+
+  /**
+   * Phase 3.15 — wake / focus / online triggers.
+   *
+   * The main problem this fixes: Chromium (and Firefox to a lesser
+   * extent) throttles main-thread setInterval in hidden tabs. After
+   * ~5 minutes hidden, timers fire at most ~1/min. A 30s ping under
+   * throttling stretches to ≥60s, blowing the old 90s freshness
+   * window. When the user tabs back in, we DON'T want them to wait
+   * for the next throttled tick — we want an immediate ping so
+   * routing can find them by the next call.
+   *
+   * On top of that: system sleep can pause everything for hours;
+   * network can drop and re-establish; a "network offline → online"
+   * transition needs an immediate ping. All three events converge
+   * on the same handler: ping now, and if the Device somehow lost
+   * registration, re-register.
+   *
+   * Guarded by `enabled` so we don't install listeners when the
+   * softphone is off.
+   */
+  useEffect(() => {
+    if (!enabled) return;
+    const wakeup = (cause: string) => {
+      // Only ping while we have a device; a signed-out or errored
+      // hook won't have one and pinging without a valid session is
+      // pointless (heartbeat requires auth).
+      const dev = deviceRef.current;
+      if (!dev) return;
+      void postHeartbeat(cause);
+      // If the SDK's state has drifted from "registered" (rare but
+      // documented on iOS Safari after long sleeps), poke it. The
+      // Device's own reconnect logic usually handles this, but we
+      // do a nudge to be sure. Guarded on state() because calling
+      // register() on an already-registered device is safe but noisy.
+      try {
+        const state = (dev as any).state;
+        if (state && state !== "registered" && state !== "registering") {
+          void (dev.register() as unknown as Promise<void>).catch(() => {});
+        }
+      } catch {
+        // Older SDK versions might not expose .state — skip the
+        // registration nudge, the SDK will still auto-reconnect on
+        // signalling activity.
+      }
+    };
+    const onVisible = () => {
+      if (document.visibilityState === "visible") wakeup("visibility-change");
+    };
+    const onFocus = () => wakeup("window-focus");
+    const onOnline = () => wakeup("navigator-online");
+    document.addEventListener("visibilitychange", onVisible);
+    window.addEventListener("focus", onFocus);
+    window.addEventListener("online", onOnline);
+    return () => {
+      document.removeEventListener("visibilitychange", onVisible);
+      window.removeEventListener("focus", onFocus);
+      window.removeEventListener("online", onOnline);
+    };
+  }, [enabled]);
 
   const accept = useCallback(() => {
     if (!incoming) return;
@@ -460,6 +667,7 @@ export function useTwilioDevice(opts: UseTwilioDeviceOptions): UseTwilioDeviceRe
     callPhase,
     isMuted,
     error,
+    failureKind,
     outputDeviceSelectionSupported,
     accept,
     reject,

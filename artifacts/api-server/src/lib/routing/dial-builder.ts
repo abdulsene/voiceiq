@@ -28,6 +28,29 @@
  */
 
 import type { RoutingDecision, StaffCandidate } from "./fallback-logic";
+import { ALL_STALE_DIAL_TIMEOUT_SECS } from "./constants";
+
+/**
+ * Phase 3.15 — decide the effective Dial timeout. When we're only
+ * dialing possibly-dead browser endpoints (every candidate has a
+ * stale device AND no callback number), shorten the ring window so
+ * fallback kicks in fast. Mixed cases (any fresh candidate, or any
+ * candidate with a callback number) keep the caller-supplied
+ * timeoutSecs (or 30 default) — those callers might reasonably take
+ * the whole window to answer.
+ */
+function effectiveTimeoutSecs(
+  candidates: StaffCandidate[],
+  requestedTimeoutSecs: number | undefined,
+): number {
+  const base = requestedTimeoutSecs ?? 30;
+  if (candidates.length === 0) return base;
+  const allStaleAndNoCallback = candidates.every(
+    (c) => c.deviceStale === true && !c.callbackRingNumber,
+  );
+  if (!allStaleAndNoCallback) return base;
+  return Math.min(base, ALL_STALE_DIAL_TIMEOUT_SECS);
+}
 
 export interface DialBuilderOptions {
   /**
@@ -217,11 +240,11 @@ function renderCandidate(
  * Render the <Dial> attributes block. Only includes optional
  * attributes when their inputs are non-null.
  */
-function renderDialAttrs(opts: DialBuilderOptions): string {
+function renderDialAttrs(opts: DialBuilderOptions, timeoutSecs: number): string {
   const parts: string[] = [
     'answerOnBridge="true"',
     `callerId="${xmlEscape(opts.callerId)}"`,
-    `timeout="${opts.timeoutSecs ?? 30}"`,
+    `timeout="${timeoutSecs}"`,
   ];
   // Phase 3.4 — default ringback so the caller doesn't sit in silence.
   // ringTone === null (explicitly) suppresses the attribute; undefined
@@ -303,7 +326,16 @@ export function buildDialTwiml(
     }
   }
 
-  const attrs = renderDialAttrs(opts);
+  // Phase 3.15 — compute the effective timeout AFTER we've established
+  // the candidate list. The legacy_transfer path has no candidates so
+  // it always gets the base timeout.
+  const timeoutSecs = effectiveTimeoutSecs(
+    decision.path === "topic_match" || decision.path === "any_on_duty"
+      ? decision.staffCandidates
+      : [],
+    opts.timeoutSecs,
+  );
+  const attrs = renderDialAttrs(opts, timeoutSecs);
   // Phase 3.4 — pre-dial <Say>: caller hears "Connecting you now…"
   // before the ringback starts. Without this + ringTone, the caller
   // heard 30s of dead air while the browser rang.

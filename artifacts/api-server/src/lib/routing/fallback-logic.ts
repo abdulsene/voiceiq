@@ -33,11 +33,28 @@ export interface StaffCandidate {
   callbackRingNumber: string | null;
   /**
    * Phase 3.3 — Twilio Client identity to dial via <Client>. Non-null
-   * only when the staff member has in_app_calling_enabled=true AND a
-   * fresh heartbeat (see DEVICE_FRESHNESS_SECS in routes/voice.ts).
-   * Null → dial-builder emits no <Client> for this candidate.
+   * whenever the staff member has in_app_calling_enabled=true and a
+   * client_identity has been derived. Null → dial-builder emits no
+   * <Client> for this candidate.
+   *
+   * Phase 3.15 — the freshness check was REMOVED from this predicate.
+   * Previously a stale heartbeat forced this to null and the whole
+   * candidate got dropped when they had no callback. Now: we include
+   * the Client leg and let a dead <Client> fail fast; simultaneous
+   * ring with other candidates and the dial-status callback handle
+   * the "nobody home" outcome cleanly, and the user keeps getting
+   * warned via /voice/reachability + the app banner.
    */
   clientIdentity?: string | null;
+  /**
+   * Phase 3.15 — set when the Client leg is being included despite
+   * a stale heartbeat (device may or may not answer). Used by the
+   * dial-builder to shorten the Dial timeout when every candidate is
+   * stale AND has no callback number — otherwise the caller would
+   * ring out for the full 30s window before falling through.
+   * Absent / undefined = fresh (or no client leg at all).
+   */
+  deviceStale?: boolean;
 }
 
 export type RoutingPath =

@@ -13,7 +13,7 @@
  */
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { Loader2, UsersRound, PhoneCall, Circle } from "lucide-react";
+import { Loader2, UsersRound, PhoneCall, Circle, AlertTriangle } from "lucide-react";
 import { toast } from "sonner";
 
 import { fetchApi, getAuthHeaders } from "../../lib/api";
@@ -29,6 +29,12 @@ type TeamMember = {
   callback_ring_number: string | null;
   assigned_topics: string[];
   created_at: string | null;
+  // Phase 3.15 — device presence for the "on duty but silently
+  // unreachable" flag. Owner-visible so they can nudge someone whose
+  // heartbeat has been stale for hours.
+  in_app_calling_enabled: boolean;
+  voice_device_last_seen_at: string | null;
+  device_heartbeat_fresh: boolean;
 };
 
 const POLL_MS = 30_000;
@@ -43,6 +49,43 @@ const ROLE_LABEL: Record<string, string> = {
   user: "User",
   readonly: "Read-only",
 };
+
+/**
+ * Phase 3.15 — a row is "silently unreachable" when they're on duty
+ * with in-app calling ON, no callback number, and their heartbeat
+ * has gone stale (or never arrived). Routing since 3.15 will still
+ * TRY to ring the browser (fail-fast rather than silent-drop), but
+ * the owner should see the risk on the team page and decide whether
+ * to reach out to the staff member. We do NOT auto-clock out.
+ *
+ * Rows with a callback number are NOT flagged — the callback is a
+ * reliable fallback path, so silent unreachability doesn't apply.
+ */
+function isSilentlyUnreachable(m: TeamMember): boolean {
+  if (!m.is_on_duty) return false;
+  if (m.callback_ring_number) return false;
+  if (!m.in_app_calling_enabled) return true;
+  return !m.device_heartbeat_fresh;
+}
+
+function formatUnreachableTitle(m: TeamMember): string {
+  if (!m.in_app_calling_enabled) {
+    return "On duty with in-app calling off and no callback number. Routing has nothing to ring.";
+  }
+  if (!m.voice_device_last_seen_at) {
+    return "On duty with in-app calling on, but this device has never checked in. No callback number configured.";
+  }
+  const ageSecs = Math.max(
+    0,
+    Math.floor((Date.now() - Date.parse(m.voice_device_last_seen_at)) / 1000),
+  );
+  const label = ageSecs >= 3600
+    ? `${Math.floor(ageSecs / 3600)}h`
+    : ageSecs >= 60
+    ? `${Math.floor(ageSecs / 60)}m`
+    : `${ageSecs}s`;
+  return `On duty, in-app calling on, but no heartbeat for ${label}. Routing will still try but the browser may not answer.`;
+}
 
 function formatOnDutySince(iso: string | null): string {
   if (!iso) return "";
@@ -187,15 +230,33 @@ export default function TeamPage() {
                       </td>
                       <td className="px-4 py-3">
                         {m.is_on_duty ? (
-                          <span className="inline-flex items-center gap-1.5 text-emerald-700">
-                            <Circle className="w-2 h-2 fill-emerald-500 stroke-emerald-500" />
-                            <span className="font-medium">{t("onDuty.on")}</span>
-                            {m.on_duty_since && (
-                              <span className="text-slate-400 text-xs">
-                                · {t("team.onDutySince", { time: formatOnDutySince(m.on_duty_since) })}
+                          <div className="flex flex-col gap-1">
+                            <span className="inline-flex items-center gap-1.5 text-emerald-700">
+                              <Circle className="w-2 h-2 fill-emerald-500 stroke-emerald-500" />
+                              <span className="font-medium">{t("onDuty.on")}</span>
+                              {m.on_duty_since && (
+                                <span className="text-slate-400 text-xs">
+                                  · {t("team.onDutySince", { time: formatOnDutySince(m.on_duty_since) })}
+                                </span>
+                              )}
+                            </span>
+                            {/* Phase 3.15 — surface the specific
+                                operational problem the phase brief
+                                calls out: on duty with no fresh
+                                heartbeat AND no callback number. This
+                                is the "silently unreachable" case.
+                                We do NOT auto-clock out — the flag
+                                is a signal, the owner decides. */}
+                            {isSilentlyUnreachable(m) ? (
+                              <span
+                                className="inline-flex items-center gap-1 text-[11px] text-amber-800 bg-amber-50 border border-amber-200 rounded px-1.5 py-0.5"
+                                title={formatUnreachableTitle(m)}
+                              >
+                                <AlertTriangle className="w-3 h-3" />
+                                <span>Routing may miss</span>
                               </span>
-                            )}
-                          </span>
+                            ) : null}
+                          </div>
                         ) : (
                           <span className="inline-flex items-center gap-1.5 text-slate-500">
                             <Circle className="w-2 h-2 fill-slate-300 stroke-slate-300" />

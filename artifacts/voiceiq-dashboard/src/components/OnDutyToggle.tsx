@@ -18,39 +18,20 @@ import { Link, useLocation } from "wouter";
 import { AlertTriangle, Loader2 } from "lucide-react";
 import { toast } from "sonner";
 
-import { fetchApi, getAuthHeaders } from "../lib/api";
+import { getAuthHeaders } from "../lib/api";
 import { useSoftphone } from "./Softphone";
-
-type OnDutyMember = { user_id: string };
 
 export default function OnDutyToggle() {
   const { t } = useTranslation();
   const [, navigate] = useLocation();
-  const [isOnDuty, setIsOnDuty] = useState<boolean | null>(null);
+  const sp = useSoftphone();
+  // Phase 3.15 — on-duty state lives in the softphone provider so the
+  // app-wide banner can gate on it. The toggle keeps a local pending
+  // flag but delegates the truth to context. `sp.isOnDuty` is `null`
+  // while hydrating; treat that as "unknown" (button skeleton).
+  const isOnDuty = sp.isOnDuty;
   const [pending, setPending] = useState(false);
   const [unreachableWarning, setUnreachableWarning] = useState<string | null>(null);
-  const sp = useSoftphone();
-
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        const [meRes, onDutyRes] = await Promise.all([
-          fetch("/api/auth/me", { headers: getAuthHeaders() }).then((r) => (r.ok ? r.json() : null)),
-          fetchApi("/business/team/on-duty").catch(() => ({ members: [] })),
-        ]);
-        if (cancelled) return;
-        const myId = meRes?.user?.id;
-        const list = (onDutyRes?.members as OnDutyMember[] | undefined) ?? [];
-        setIsOnDuty(!!myId && list.some((m) => m.user_id === myId));
-      } catch {
-        if (!cancelled) setIsOnDuty(false);
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
 
   // Phase 3.3c — while on-duty, re-evaluate reachability whenever the
   // softphone state changes and surface a warning if we're unreachable.
@@ -116,7 +97,8 @@ export default function OnDutyToggle() {
       });
     }
 
-    setIsOnDuty(next);
+    // Optimistic flip via context — the banner watches this.
+    sp.setIsOnDuty(next);
     setPending(true);
     try {
       const url = next ? "/api/business/team/me/on-duty" : "/api/business/team/me/off-duty";
@@ -127,7 +109,7 @@ export default function OnDutyToggle() {
       // but no device — no warning should show).
       void sp.refreshReachability();
     } catch {
-      setIsOnDuty(!next);
+      sp.setIsOnDuty(!next);
       toast.error(next ? t("onDuty.clockInError") : t("onDuty.clockOutError"));
     } finally {
       setPending(false);
