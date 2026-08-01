@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Link } from "wouter";
 import { useTranslation } from "react-i18next";
 import LandingNav from "../components/LandingNav";
@@ -64,6 +64,13 @@ interface SampleCallT {
 export default function Landing() {
   const { t } = useTranslation();
   const [activeIndustry, setActiveIndustry] = useState<HeroKey>("plumbing");
+  // Phase 3.17 — landing page also handles the #error= fragment
+  // Supabase Auth throws when an old-style magic invite link fails
+  // (expired OTP, prefetched by a scanner). Instead of silently
+  // rendering the marketing homepage over a mysterious error hash,
+  // read the fragment and render a small banner explaining what
+  // happened + pointing to Sign in.
+  const supabaseFragmentError = useSupabaseFragmentError();
   const conv = t(`marketing.landing.heroIndustries.${activeIndustry}`, { returnObjects: true }) as HeroIndustryT;
   const heroMessages: { from: "caller" | "ai"; text: string }[] = [
     { from: "caller", text: conv.msg1 },
@@ -81,6 +88,29 @@ export default function Landing() {
   return (
     <div className="min-h-screen bg-[#FAFAF7] text-slate-900">
       <LandingNav />
+      {supabaseFragmentError ? (
+        <div className="w-full bg-amber-50 border-b border-amber-200 text-amber-900 text-sm px-4 py-3">
+          <div className="max-w-5xl mx-auto flex items-start gap-3">
+            <span aria-hidden className="text-lg leading-none">⚠</span>
+            <div className="flex-1">
+              <div className="font-semibold">Your invite link expired</div>
+              <div className="text-xs text-amber-800">
+                This link was consumed before you could open it — usually your
+                mail provider's link scanner (Microsoft Defender or Google Safe
+                Browsing) followed it in the background. Ask whoever invited you
+                to send a new invite. Neverr now uses a scanner-safe invite flow
+                that fixes this permanently.
+              </div>
+            </div>
+            <Link
+              href="/login"
+              className="shrink-0 inline-block px-3 py-1.5 bg-amber-800 text-white text-xs rounded-md font-semibold hover:bg-amber-900"
+            >
+              Sign in
+            </Link>
+          </div>
+        </div>
+      ) : null}
 
       <section className="px-6 pt-12 pb-20 md:pt-20 md:pb-28">
         <div className="max-w-7xl mx-auto grid lg:grid-cols-2 gap-12 lg:gap-16 items-center">
@@ -580,4 +610,42 @@ export default function Landing() {
       <LandingFooter />
     </div>
   );
+}
+
+/**
+ * Phase 3.17 — detect Supabase Auth's `#error=access_denied&
+ * error_code=otp_expired&...` fragment. This is what a redeemed /
+ * prefetched / expired old-style magic invite link produces on the
+ * marketing homepage. We render an explanatory banner instead of
+ * silently rendering the marketing page over a mysterious URL.
+ *
+ * Reads the fragment once on mount, then clears it from the URL bar
+ * so it doesn't stick if the user navigates. Returns true when any
+ * Supabase auth-error fragment is present.
+ */
+function useSupabaseFragmentError(): boolean {
+  const [hasError, setHasError] = useState(false);
+  const memoized = useMemo(() => hasError, [hasError]);
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const raw = window.location.hash.startsWith("#")
+      ? window.location.hash.substring(1)
+      : window.location.hash;
+    if (!raw) return;
+    const params = new URLSearchParams(raw);
+    const err = params.get("error");
+    const code = params.get("error_code");
+    if (err || code) {
+      setHasError(true);
+      // Clear the fragment so refreshing or navigating away doesn't
+      // re-trigger the banner (Supabase's magic-link failure fragments
+      // are always terminal — no reason to hold on to them).
+      try {
+        history.replaceState(null, "", window.location.pathname + window.location.search);
+      } catch {
+        // Some sandboxes block replaceState; ignore.
+      }
+    }
+  }, []);
+  return memoized;
 }

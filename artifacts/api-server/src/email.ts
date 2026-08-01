@@ -9,6 +9,17 @@ function getResend(): Resend | null {
   return _resend;
 }
 
+/**
+ * Phase 3.17 — where the invite link lands. Set in Replit Secrets.
+ * Falls back to the production dashboard URL so we never send a
+ * localhost link into a customer's inbox by accident.
+ */
+function getInviteBaseUrl(): string {
+  const raw = process.env.PUBLIC_APP_URL || process.env.PUBLIC_URL;
+  if (raw && /^https:\/\//.test(raw)) return raw.replace(/\/+$/, "");
+  return "https://neverr.ai";
+}
+
 function escapeHtml(str: string): string {
   return str
     .replace(/&/g, "&amp;")
@@ -163,4 +174,166 @@ export async function sendCallSummaryEmail({
   });
 
   console.log("[Email] Call summary sent to:", to);
+}
+
+/**
+ * Phase 3.17 — branded team invite email via Resend.
+ *
+ * Ships instead of Supabase's default "You have been invited to
+ * access <project>" email, which was:
+ *   (a) unbranded — didn't mention Neverr, the business, or who
+ *       invited them (so it looked like phishing)
+ *   (b) a one-time GET link — Microsoft Defender Safe Links (and
+ *       Google's equivalent) prefetched and consumed it on corporate
+ *       mailboxes, silently marking invites accepted with no
+ *       password set. Live prod evidence:
+ *       aaliyah.louise@ezrentalsandleasing.com, redeemed 48s after
+ *       send, no human interaction.
+ *
+ * This email carries a token that only becomes real when the human
+ * POSTs from our /invite/:token SPA page — GET is safe for scanners
+ * to prefetch. See migration 047 + routes/team.ts Phase 3.17 header.
+ *
+ * Copy requirements from the phase brief:
+ *   - who invited them (name)
+ *   - the business
+ *   - their role
+ *   - one-line what Neverr does
+ *   - what happens after they set a password
+ *   - that the link expires in 7 days
+ */
+export async function sendTeamInviteEmail({
+  to,
+  inviteToken,
+  businessName,
+  inviterName,
+  role,
+  fullName,
+  expiresAt,
+}: {
+  to: string;
+  inviteToken: string;
+  businessName: string;
+  inviterName: string;
+  role: string;
+  fullName: string | null;
+  expiresAt: string;
+}): Promise<void> {
+  const resend = getResend();
+  if (!resend) {
+    console.log("[Email] Skipping invite send — RESEND_API_KEY not set");
+    return;
+  }
+
+  const inviteUrl = `${getInviteBaseUrl()}/invite/${encodeURIComponent(inviteToken)}`;
+  const expiryDate = new Date(expiresAt);
+  const expiryLabel = expiryDate.toLocaleDateString("en-US", {
+    weekday: "long",
+    month: "long",
+    day: "numeric",
+  });
+
+  const safeInviter = escapeHtml(inviterName);
+  const safeBusiness = escapeHtml(businessName);
+  const safeRole = escapeHtml(prettyRoleLabel(role));
+  const safeFullName = fullName ? escapeHtml(fullName) : null;
+  const safeUrl = escapeHtml(inviteUrl);
+  const safeExpiry = escapeHtml(expiryLabel);
+  const greeting = safeFullName ? `Hi ${safeFullName},` : "Hi,";
+
+  const html = `
+<!DOCTYPE html>
+<html>
+<head><meta charset="UTF-8"></head>
+<body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+             background: #F8FAFC; margin: 0; padding: 40px 20px;">
+  <div style="max-width: 600px; margin: 0 auto; background: white;
+              border-radius: 16px; overflow: hidden;
+              box-shadow: 0 4px 24px rgba(0,0,0,0.08);">
+
+    <div style="background: #1B2537; padding: 32px; text-align: center;">
+      <h1 style="color: white; margin: 0; font-size: 24px; font-weight: 800;
+                 letter-spacing: -0.5px;">Neverr</h1>
+      <p style="color: rgba(255,255,255,0.5); margin: 8px 0 0; font-size: 14px;">
+        AI Receptionist for calls, chat, SMS, and CRM
+      </p>
+    </div>
+
+    <div style="padding: 32px;">
+      <p style="color: #1B2537; font-size: 16px; margin: 0 0 16px;">${greeting}</p>
+
+      <p style="color: #475569; line-height: 1.7; font-size: 15px; margin: 0 0 20px;">
+        <strong style="color: #1B2537;">${safeInviter}</strong> invited you to join
+        <strong style="color: #1B2537;">${safeBusiness}</strong> on Neverr as
+        <strong style="color: #1B2537;">${safeRole}</strong>.
+      </p>
+
+      <p style="color: #475569; line-height: 1.7; font-size: 15px; margin: 0 0 24px;">
+        Neverr is the AI receptionist your business uses to never miss a call,
+        chat, or SMS from a customer. You'll answer live calls in the browser,
+        see call transcripts, and manage the shared lead pipeline.
+      </p>
+
+      <div style="text-align: center; margin: 24px 0 28px;">
+        <a href="${safeUrl}"
+           style="background: #2E75B6; color: white; padding: 14px 32px;
+                  border-radius: 10px; text-decoration: none; font-weight: 600;
+                  font-size: 15px; display: inline-block;">
+          Set your password &rarr;
+        </a>
+      </div>
+
+      <p style="color: #64748B; font-size: 13px; line-height: 1.6; margin: 0 0 8px;">
+        <strong style="color: #475569;">What happens next:</strong> you'll set a password,
+        then land on your dashboard with a short checklist (add your callback
+        number, enable in-app calling, go on duty) so the routing engine can
+        reach you.
+      </p>
+
+      <p style="color: #94A3B8; font-size: 12px; line-height: 1.6; margin: 20px 0 0;">
+        This invite expires on <strong>${safeExpiry}</strong>. If it does, ask
+        ${safeInviter} to send a new one.
+      </p>
+
+      <p style="color: #94A3B8; font-size: 11px; line-height: 1.5; margin: 16px 0 0;
+                padding-top: 16px; border-top: 1px solid #E2E8F0;">
+        If the button doesn't work, copy this link into your browser:<br>
+        <span style="font-family: 'SF Mono', Consolas, monospace; word-break: break-all;
+                     color: #64748B;">${safeUrl}</span>
+      </p>
+    </div>
+
+    <div style="background: #F8FAFC; padding: 20px 32px; text-align: center;
+                border-top: 1px solid #E2E8F0;">
+      <p style="color: #94A3B8; font-size: 12px; margin: 0;">
+        Neverr AI &middot; Never missed. Never closed. Never lost.<br>
+        If you weren't expecting this invite, you can safely ignore this email.
+      </p>
+    </div>
+  </div>
+</body>
+</html>`;
+
+  await resend.emails.send({
+    from: "Neverr <invites@neverr.ai>",
+    to,
+    subject: `${inviterName} invited you to ${businessName} on Neverr`,
+    html,
+  });
+
+  console.log("[Email] Team invite sent to:", to);
+}
+
+function prettyRoleLabel(role: string): string {
+  const labels: Record<string, string> = {
+    owner: "Owner",
+    admin: "Admin",
+    manager: "Manager",
+    team_lead: "Team lead",
+    agent_manager: "Agent manager",
+    analyst: "Analyst",
+    user: "Team member",
+    readonly: "Read-only",
+  };
+  return labels[role] || role;
 }

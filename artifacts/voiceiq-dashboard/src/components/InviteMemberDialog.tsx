@@ -97,10 +97,15 @@ export default function InviteMemberDialog({ open, onClose, onInvited }: Props) 
       });
       const body = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(body?.error || `HTTP ${res.status}`);
-      if (body?.invited) {
-        toast.success(t("invite.success", { email: email.trim() }));
+      // Phase 3.17: server now returns { invite_id, email, expires_at,
+      // resent_previous } instead of { user_id, email, invited }.
+      // resent_previous=true means we superseded a prior outstanding
+      // invite for the same email — surface that to the owner so
+      // they know the old email link no longer works.
+      if (body?.resent_previous) {
+        toast.success(t("invite.resentSuccess", { email: email.trim(), defaultValue: `Sent a fresh invite to ${email.trim()} (previous one was superseded).` }));
       } else {
-        toast.success(t("invite.alreadyMember", { email: email.trim() }));
+        toast.success(t("invite.success", { email: email.trim() }));
       }
       onInvited();
     } catch (err: any) {
@@ -115,7 +120,11 @@ export default function InviteMemberDialog({ open, onClose, onInvited }: Props) 
       onClick={onClose}
     >
       <div
-        className="bg-white rounded-2xl shadow-2xl w-full max-w-lg p-6"
+        // Phase 3.17 — cap max height + overflow-y so the MultiSelect
+        // chip list can't push Cancel/Send buttons off-screen when
+        // many topics are picked. The Popover portals to <body> and
+        // renders above the modal, but the chips are IN the modal DOM.
+        className="bg-white rounded-2xl shadow-2xl w-full max-w-lg p-6 max-h-[90vh] overflow-y-auto"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="flex items-start justify-between mb-4">
@@ -175,6 +184,34 @@ export default function InviteMemberDialog({ open, onClose, onInvited }: Props) 
             </select>
           </div>
 
+          {/* Phase 3.17 — callback number promoted ABOVE topics. Zero
+              of 40 members in prod had one, and browser-only means a
+              closed tab is a missed call. Prominent copy + amber
+              highlight when empty, promoting the field visually. */}
+          <div className="rounded-lg border border-amber-200 bg-amber-50/50 p-3 space-y-1">
+            <div className="flex items-center justify-between">
+              <label className="text-xs font-semibold text-amber-900">
+                {t("invite.callbackRingNumber")} — highly recommended
+              </label>
+              <span className="text-[10px] uppercase tracking-wide text-amber-700 font-medium">
+                For reliability
+              </span>
+            </div>
+            <input
+              type="tel"
+              value={callbackRing}
+              onChange={(e) => setCallbackRing(e.target.value)}
+              placeholder="+14155551234"
+              className="w-full px-3 py-2 border border-amber-300 bg-white rounded-lg text-sm font-mono focus:outline-none focus:ring-2 focus:ring-amber-400/40"
+              disabled={submitting}
+            />
+            <p className="text-[11px] text-amber-800">
+              If their browser tab is closed, routing rings this cell instead.
+              Without a callback number, a member is unreachable when their
+              browser isn't open.
+            </p>
+          </div>
+
           <div>
             <label className="text-xs font-medium text-slate-700 mb-1 block">{t("invite.topics")}</label>
             {topicsEmpty ? (
@@ -190,19 +227,6 @@ export default function InviteMemberDialog({ open, onClose, onInvited }: Props) 
                 disabled={submitting}
               />
             )}
-          </div>
-
-          <div>
-            <label className="text-xs font-medium text-slate-700 mb-1 block">{t("invite.callbackRingNumber")}</label>
-            <input
-              type="tel"
-              value={callbackRing}
-              onChange={(e) => setCallbackRing(e.target.value)}
-              placeholder="+14155551234"
-              className="w-full px-3 py-2 border border-slate-300 rounded-lg text-sm font-mono focus:outline-none focus:ring-2 focus:ring-[#2E75B6]/30"
-              disabled={submitting}
-            />
-            <p className="text-[11px] text-slate-500 mt-1">{t("invite.callbackHelp")}</p>
           </div>
 
           <div className="flex gap-2 pt-2">

@@ -236,6 +236,18 @@ const AUTH_BYPASS_PATTERNS = [
   // token comparison + expiry check before minting the Supabase auth user.
   /^\/api\/admin\/users\/activate$/,
   /^\/api\/admin\/team\/activate$/,
+  // Phase 3.17 — first-class business invites. Two public routes:
+  //   GET  /api/invites/lookup/:token → side-effect free lookup for
+  //        the /invite/:token SPA page. A scanner GET can hit this
+  //        as many times as it likes; no DB mutation.
+  //   POST /api/invites/accept → the mutation. Creates the Supabase
+  //        auth user + user_businesses row atomically. Body carries
+  //        { token, password, full_name? } — the token IS the credential.
+  // See routes/team.ts Phase 3.17 header for the full flow rationale
+  // (Microsoft Defender Safe Links prefetch broke the old Supabase
+  // magic-link flow on corporate M365 domains).
+  /^\/api\/invites\/lookup\/[^/]+$/,
+  /^\/api\/invites\/accept$/,
   // Phase 3f: public SMS opt-in pages — businesses share these URLs with
   // their customers to capture Twilio-compliant consent. Submission is
   // IP rate-limited (5/hr/biz) inside the route itself. Tight regex (only

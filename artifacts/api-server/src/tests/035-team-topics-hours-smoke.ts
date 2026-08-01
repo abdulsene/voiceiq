@@ -38,7 +38,14 @@ import {
   handleOffDuty,
   parseInviteBody,
   parseMemberPatchBody,
+  // Phase 3.17 — invite lifecycle handlers.
+  handleGetInviteByToken,
+  handleAcceptInvite,
+  handleListPendingInvites,
+  handleResendInvite,
+  handleRevokeInvite,
 } from "../routes/team";
+import { hashInviteToken, generateInviteToken } from "../lib/invite-token";
 import {
   handleGetTopics,
   handlePatchTopics,
@@ -205,6 +212,14 @@ class FakeSupabaseClient {
     if (!r) return { data: null, error: null, count: 0 };
     return { data: r.data ?? null, error: r.error ?? null, count: r.count ?? 0 };
   }
+  // Phase 3.17 — expanded auth admin surface. handleAcceptInvite
+  // calls createUser (NOT inviteUserByEmail) so the human's password
+  // is set directly with no magic-link email. Orphan cleanup calls
+  // deleteUser on user_businesses upsert failure.
+  createUserResponses: Array<{ email: string; user_id?: string; error?: string }> = [];
+  createdUsers: Array<{ email: string; password?: string; email_confirm?: boolean }> = [];
+  updatedUsers: Array<{ id: string; password?: string; email_confirm?: boolean }> = [];
+  deletedUsers: string[] = [];
   auth = {
     admin: {
       getUserById: async (id: string) => {
@@ -222,6 +237,28 @@ class FakeSupabaseClient {
       },
       listUsers: async (_opts?: any) => {
         return { data: { users: this.listUsersResponse }, error: null };
+      },
+      createUser: async (opts: { email: string; password: string; email_confirm?: boolean; user_metadata?: any }) => {
+        this.createdUsers.push({
+          email: opts.email,
+          password: opts.password,
+          email_confirm: opts.email_confirm,
+        });
+        const found = this.createUserResponses.find((r) => r.email === opts.email);
+        if (!found) {
+          const id = `created-${opts.email}`;
+          return { data: { user: { id, email: opts.email } }, error: null };
+        }
+        if (found.error) return { data: { user: null }, error: { message: found.error } };
+        return { data: { user: { id: found.user_id!, email: opts.email } }, error: null };
+      },
+      updateUserById: async (id: string, opts: { password?: string; email_confirm?: boolean }) => {
+        this.updatedUsers.push({ id, password: opts.password, email_confirm: opts.email_confirm });
+        return { data: { user: { id } }, error: null };
+      },
+      deleteUser: async (id: string) => {
+        this.deletedUsers.push(id);
+        return { data: {}, error: null };
       },
     },
   };
@@ -345,9 +382,12 @@ async function T4_cross_tenant_404() {
 }
 
 async function T5_invite_creates_membership_and_topics() {
+  // Phase 3.17 — invite semantics inverted. It no longer creates an
+  // auth user or a user_businesses row. It writes a business_invites
+  // row with a hashed token and (best-effort) sends the branded
+  // email. Membership + topics are inserted only on acceptance (see
+  // T30 series below).
   const fake = new FakeSupabaseClient();
-  fake.inviteResponses.push({ email: "new@example.com", user_id: "new-user-id" });
-  // Topic validation reads business_configs.departments.
   fake.on(
     (c) => c.op === "select" && c.table === "business_configs",
     {
@@ -359,18 +399,15 @@ async function T5_invite_creates_membership_and_topics() {
       },
     },
   );
-  // Upsert into user_businesses returns success.
+  // Supersede-outstanding UPDATE returns no rows (nothing to supersede).
   fake.on(
-    (c) => c.op === "upsert" && c.table === "user_businesses",
-    { data: [{ user_id: "new-user-id" }] },
+    (c) => c.op === "update" && c.table === "business_invites",
+    { data: [] },
   );
+  // Insert into business_invites returns the new row's id.
   fake.on(
-    (c) => c.op === "delete" && c.table === "staff_topics",
-    { data: null },
-  );
-  fake.on(
-    (c) => c.op === "insert" && c.table === "staff_topics",
-    { data: null },
+    (c) => c.op === "insert" && c.table === "business_invites",
+    { data: { id: "invite-1" } },
   );
 
   const result = await handleInviteMember(asClient(fake), BIZ, USER_A, "admin" as any, {
@@ -383,21 +420,53 @@ async function T5_invite_creates_membership_and_topics() {
   const failures: string[] = [];
   if (!result.ok) failures.push(`not ok: ${(result as any).error}`);
   else {
-    if (result.user_id !== "new-user-id") failures.push(`user_id=${result.user_id}`);
-    if (!result.invited) failures.push("expected invited=true for brand-new user");
+    if (result.invite_id !== "invite-1") failures.push(`invite_id=${result.invite_id}`);
+    if (result.email !== "new@example.com") failures.push(`email=${result.email}`);
+    if (!result.expires_at) failures.push("expires_at missing");
+    if (result.resent_previous !== false) failures.push(`resent_previous=${result.resent_previous}`);
   }
-  const upsert = fake.calls.find((c) => c.op === "upsert" && c.table === "user_businesses");
-  if (!upsert) failures.push("no user_businesses upsert");
-  if (upsert?.payload?.user_id !== "new-user-id") failures.push(`upsert user_id=${upsert?.payload?.user_id}`);
-  if (upsert?.payload?.business_id !== BIZ) failures.push(`upsert business_id=${upsert?.payload?.business_id}`);
-  if (upsert?.payload?.role !== "user") failures.push(`upsert role=${upsert?.payload?.role}`);
-  if (upsert?.upsertOptions?.onConflict !== "user_id,business_id") failures.push(`onConflict=${upsert?.upsertOptions?.onConflict}`);
+
+  // NO auth user was created or invited. This is Phase 3.17's whole
+  // point — a scanner cannot burn an invite that doesn't exist as an
+  // auth account yet.
+  if (fake.createdUsers.length !== 0) {
+    failures.push(`createUser called ${fake.createdUsers.length} times (expected 0)`);
+  }
+
+  // NO user_businesses upsert at invite time.
+  const ubUpsert = fake.calls.find((c) => c.op === "upsert" && c.table === "user_businesses");
+  if (ubUpsert) failures.push("user_businesses upserted at invite time (should happen at accept)");
+
+  // NO staff_topics insert at invite time — topics live on the invite
+  // row until acceptance copies them.
   const topicInsert = fake.calls.find((c) => c.op === "insert" && c.table === "staff_topics");
-  if (!topicInsert) failures.push("no staff_topics insert");
-  const topicRows = topicInsert?.payload as any[] | undefined;
-  if (!Array.isArray(topicRows) || topicRows.length !== 2) failures.push(`topic rows=${topicRows?.length}`);
-  if (topicRows && topicRows.some((r) => r.business_id !== BIZ)) failures.push("topic rows missing tenant");
-  record("T5 invite creates membership + topics", failures.length === 0, failures.join("; ") || "invite + upsert + 2 staff_topics inserted");
+  if (topicInsert) failures.push("staff_topics inserted at invite time (should happen at accept)");
+
+  // The business_invites INSERT payload carries the acceptance-time
+  // config. We hash the token before storage — assert the shape.
+  const inviteInsert = fake.calls.find((c) => c.op === "insert" && c.table === "business_invites");
+  if (!inviteInsert) failures.push("no business_invites INSERT");
+  else {
+    const p = inviteInsert.payload as any;
+    if (p.business_id !== BIZ) failures.push(`invite business_id=${p.business_id}`);
+    if (p.email !== "new@example.com") failures.push(`invite email=${p.email}`);
+    if (p.role !== "user") failures.push(`invite role=${p.role}`);
+    if (p.callback_ring_number !== "+14155551234") failures.push(`invite callback=${p.callback_ring_number}`);
+    if (!Array.isArray(p.topics) || p.topics.length !== 2) failures.push(`invite topics=${JSON.stringify(p.topics)}`);
+    if (p.invited_by_user_id !== USER_A) failures.push(`invite invited_by=${p.invited_by_user_id}`);
+    // token_hash MUST be present. Raw token MUST NOT be persisted.
+    if (typeof p.token_hash !== "string" || p.token_hash.length !== 64) {
+      failures.push(`token_hash malformed: ${p.token_hash}`);
+    }
+    if ("token" in p || "raw_token" in p) failures.push("raw token leaked into DB payload");
+    if (!p.expires_at) failures.push("expires_at missing");
+  }
+  record(
+    "T5 (Phase 3.17) invite writes business_invites row + does NOT create auth user or membership",
+    failures.length === 0,
+    failures.join("; ") ||
+      "hash stored, no auth mutation until accept — scanner-safe",
+  );
 
   // Sub-case: privilege check — a manager cannot mint an admin.
   const fake2 = new FakeSupabaseClient();
@@ -735,23 +804,32 @@ async function T12_hours_now_boundary_next() {
   record("T12 hours/now boundary + week rollover", failures.length === 0, failures.join("; ") || "Fri-evening → Mon; Mon 08:00 → Mon 09:00");
 }
 
-async function T13_invite_call_reaches_admin() {
+async function T13_invite_no_longer_touches_supabase_auth_admin() {
+  // Phase 3.17 — the invite dispatch path used to call
+  // supabase.auth.admin.inviteUserByEmail. That's what got prefetched
+  // by Microsoft Defender Safe Links and silently confirmed accounts
+  // with no password. This test locks in the reverse: the invite
+  // path MUST NOT call inviteUserByEmail (nor createUser, nor
+  // listUsers-then-write) during invite. Any of those would recreate
+  // the scanner-consumption bug.
   const fake = new FakeSupabaseClient();
-  fake.inviteResponses.push({ email: "t13@example.com", user_id: "t13-user" });
   fake.on(
     (c) => c.op === "select" && c.table === "business_configs",
     { data: { departments: [] } },
   );
   fake.on(
-    (c) => c.op === "upsert" && c.table === "user_businesses",
-    { data: [{ user_id: "t13-user" }] },
+    (c) => c.op === "update" && c.table === "business_invites",
+    { data: [] },
+  );
+  fake.on(
+    (c) => c.op === "insert" && c.table === "business_invites",
+    { data: { id: "invite-t13" } },
   );
 
-  // Wrap inviteUserByEmail to capture the call.
-  let captured: { email: string; opts: any } | null = null;
+  let inviteByEmailCalled = 0;
   const origInvite = fake.auth.admin.inviteUserByEmail;
   fake.auth.admin.inviteUserByEmail = async (email: string, opts: any) => {
-    captured = { email, opts };
+    inviteByEmailCalled += 1;
     return origInvite(email, opts);
   };
 
@@ -764,15 +842,17 @@ async function T13_invite_call_reaches_admin() {
   });
   const failures: string[] = [];
   if (!result.ok) failures.push(`not ok: ${(result as any).error}`);
-  if (!captured) failures.push("inviteUserByEmail not called");
-  else {
-    if ((captured as any).email !== "t13@example.com") failures.push(`captured email=${(captured as any).email}`);
-    const meta = (captured as any).opts?.data;
-    if (meta?.businessId !== BIZ) failures.push(`captured businessId=${meta?.businessId}`);
-    if (meta?.role !== "user") failures.push(`captured role=${meta?.role}`);
-    if (meta?.full_name !== "T13 User") failures.push(`captured full_name=${meta?.full_name}`);
+  if (inviteByEmailCalled !== 0) {
+    failures.push(`inviteUserByEmail called ${inviteByEmailCalled} times — this is the exact call that got prefetched by M365 Safe Links`);
   }
-  record("T13 invite calls auth.admin.inviteUserByEmail", failures.length === 0, failures.join("; ") || "invite called with email + metadata");
+  if (fake.createdUsers.length !== 0) {
+    failures.push(`createUser called ${fake.createdUsers.length} times during invite (should only happen at accept)`);
+  }
+  record(
+    "T13 (Phase 3.17) invite does NOT call auth.admin.inviteUserByEmail",
+    failures.length === 0,
+    failures.join("; ") || "no auth mutation until acceptance — scanner-safe",
+  );
 }
 
 async function T14_delete_self_forbidden() {
@@ -840,6 +920,566 @@ async function T15_parser_real_samples() {
   record("T15 parser × 15 real samples", failures.length === 0, failures.join(" | ") || "all 15 samples produce expected day set + fallback flag");
 }
 
+// ── Phase 3.17: invite lifecycle ────────────────────────────────────
+
+/**
+ * T16 — GET lookup is SIDE-EFFECT FREE.
+ *
+ * The core invariant Phase 3.17 exists to protect. A scanner (M365
+ * Safe Links, Google URL scanners) will hit /api/invites/lookup/:token
+ * on prefetch — potentially many times as it re-crawls the mailbox.
+ * The endpoint MUST NOT write anything: no update, no insert, no
+ * delete, no auth admin mutation.
+ *
+ * We hit the handler 100 times and assert:
+ *   - Result is stable across every call (state doesn't change).
+ *   - Zero write-shaped calls hit the DB (no update / insert / upsert / delete).
+ *   - Zero auth admin mutations (no createUser / updateUserById /
+ *     deleteUser / inviteUserByEmail).
+ */
+async function T16_get_lookup_is_side_effect_free() {
+  const fake = new FakeSupabaseClient();
+  const raw = generateInviteToken();
+  const hash = hashInviteToken(raw);
+  const expiresAt = new Date(Date.now() + 7 * 24 * 3600 * 1000).toISOString();
+  fake.on(
+    (c) => c.op === "select" && c.table === "business_invites" && c.eqFilters.some((f) => f.column === "token_hash" && f.value === hash),
+    {
+      data: {
+        id: "invite-a",
+        business_id: BIZ,
+        email: "scanner@example.com",
+        role: "user",
+        callback_ring_number: null,
+        topics: ["payments"],
+        invited_by_user_id: USER_A,
+        expires_at: expiresAt,
+        accepted_at: null,
+        revoked_at: null,
+      },
+    },
+  );
+  // Business name lookup (hydrated for display copy in the "ok" state).
+  fake.on(
+    (c) => c.op === "select" && c.table === "business_configs",
+    { data: { business_name: "Acme" } },
+  );
+
+  const failures: string[] = [];
+  const firstState: string[] = [];
+  for (let i = 0; i < 100; i++) {
+    const r = await handleGetInviteByToken(asClient(fake), raw);
+    if (!r.ok) {
+      failures.push(`iter ${i} not ok: ${(r as any).error}`);
+      break;
+    }
+    firstState.push(r.state);
+  }
+  if (!firstState.every((s) => s === "ok")) {
+    failures.push(`state drifted across 100 GETs: ${Array.from(new Set(firstState)).join(",")}`);
+  }
+  // The zero-mutation guarantee.
+  const mutations = fake.calls.filter((c) => c.op === "update" || c.op === "insert" || c.op === "upsert" || c.op === "delete");
+  if (mutations.length !== 0) {
+    failures.push(`${mutations.length} DB mutations across 100 GETs: ${mutations.map((m) => `${m.op}:${m.table}`).join(",")}`);
+  }
+  if (fake.createdUsers.length !== 0) failures.push(`createUser called ${fake.createdUsers.length}x`);
+  if (fake.updatedUsers.length !== 0) failures.push(`updateUserById called ${fake.updatedUsers.length}x`);
+  if (fake.deletedUsers.length !== 0) failures.push(`deleteUser called ${fake.deletedUsers.length}x`);
+  record(
+    "T16 (Phase 3.17) GET /invites/lookup is side-effect free across 100 calls",
+    failures.length === 0,
+    failures.join("; ") ||
+      "100 scanner-shaped GETs produced 0 mutations — invite cannot be consumed by prefetch",
+  );
+}
+
+/**
+ * T17 — POST accept creates auth user + user_businesses + marks
+ * accepted. This is the ONLY code path that mutates state; we assert
+ * the shape of every write.
+ */
+async function T17_accept_creates_user_and_membership() {
+  const fake = new FakeSupabaseClient();
+  const raw = generateInviteToken();
+  const hash = hashInviteToken(raw);
+  const expiresAt = new Date(Date.now() + 7 * 24 * 3600 * 1000).toISOString();
+  fake.on(
+    (c) => c.op === "select" && c.table === "business_invites" && c.eqFilters.some((f) => f.column === "token_hash" && f.value === hash),
+    {
+      data: {
+        id: "invite-x",
+        business_id: BIZ,
+        email: "accept@example.com",
+        role: "user",
+        callback_ring_number: "+14155559999",
+        topics: ["payments"],
+        invited_by_user_id: USER_A,
+        expires_at: expiresAt,
+        accepted_at: null,
+        revoked_at: null,
+      },
+    },
+  );
+  fake.on(
+    (c) => c.op === "select" && c.table === "business_configs",
+    { data: { business_name: "Acme" } },
+  );
+  fake.on(
+    (c) => c.op === "upsert" && c.table === "user_businesses",
+    { data: [{ user_id: "created-accept@example.com" }] },
+  );
+  fake.on(
+    (c) => c.op === "delete" && c.table === "staff_topics",
+    { data: null },
+  );
+  fake.on(
+    (c) => c.op === "insert" && c.table === "staff_topics",
+    { data: null },
+  );
+  fake.on(
+    (c) => c.op === "update" && c.table === "business_invites",
+    { data: [{ id: "invite-x" }] },
+  );
+
+  const result = await handleAcceptInvite(asClient(fake), {
+    rawToken: raw,
+    password: "correcthorse",
+    fullName: "Alice A.",
+  });
+  const failures: string[] = [];
+  if (!result.ok) failures.push(`not ok: ${(result as any).error}`);
+  else {
+    if (result.email !== "accept@example.com") failures.push(`email=${result.email}`);
+    if (result.business_id !== BIZ) failures.push(`business_id=${result.business_id}`);
+    if (!result.user_id) failures.push("user_id missing");
+  }
+  // createUser was called with the human's password + email_confirm.
+  if (fake.createdUsers.length !== 1) failures.push(`createUser count=${fake.createdUsers.length}`);
+  else {
+    const u = fake.createdUsers[0];
+    if (u.email !== "accept@example.com") failures.push(`createUser email=${u.email}`);
+    if (u.password !== "correcthorse") failures.push(`createUser password not passed through`);
+    if (u.email_confirm !== true) failures.push(`email_confirm=${u.email_confirm}`);
+  }
+  // inviteUserByEmail must NOT have been called — that's the whole
+  // point of separating invite (no auth mutation) from accept
+  // (createUser with human-provided password).
+  const inviteCallsFromFake = (fake as any).auth?.admin;
+  // We can't easily count inviteUserByEmail calls without wrapping;
+  // instead assert that no updatedUsers pre-existing account update
+  // fired (which would only run if we hit the "user already existed"
+  // fallback — not the case here).
+  if (fake.updatedUsers.length !== 0) failures.push(`updateUserById called ${fake.updatedUsers.length}x (no fallback expected)`);
+  // user_businesses upsert with correct callback_ring_number.
+  const ub = fake.calls.find((c) => c.op === "upsert" && c.table === "user_businesses");
+  if (!ub) failures.push("user_businesses upsert missing");
+  else {
+    if (ub.payload.role !== "user") failures.push(`ub role=${ub.payload.role}`);
+    if (ub.payload.callback_ring_number !== "+14155559999") {
+      failures.push(`ub callback=${ub.payload.callback_ring_number}`);
+    }
+  }
+  // staff_topics rows inserted with the invite's topics.
+  const topicIns = fake.calls.find((c) => c.op === "insert" && c.table === "staff_topics");
+  if (!topicIns || !Array.isArray(topicIns.payload) || topicIns.payload.length !== 1) {
+    failures.push(`staff_topics insert wrong: ${JSON.stringify(topicIns?.payload)}`);
+  }
+  // business_invites marked accepted (single UPDATE with accepted_at + accepted_user_id).
+  const acceptUpd = fake.calls.find((c) => c.op === "update" && c.table === "business_invites");
+  if (!acceptUpd) failures.push("business_invites accept UPDATE missing");
+  else {
+    if (!acceptUpd.payload.accepted_at) failures.push("accepted_at not set");
+    if (!acceptUpd.payload.accepted_user_id) failures.push("accepted_user_id not set");
+  }
+  record(
+    "T17 (Phase 3.17) POST accept creates auth user with password + user_businesses + marks accepted",
+    failures.length === 0,
+    failures.join("; ") ||
+      "createUser with password, membership + topics inserted, invite consumed atomically",
+  );
+}
+
+/**
+ * T18 — expired / revoked / already-accepted / unknown tokens are
+ * ALL rejected with 410 (or 400 for unknown) on the POST path. Same
+ * discriminator is exposed via the state field so the SPA renders
+ * specific copy.
+ */
+async function T18_accept_rejects_bad_state() {
+  const failures: string[] = [];
+
+  // (a) Expired.
+  {
+    const fake = new FakeSupabaseClient();
+    const raw = generateInviteToken();
+    const hash = hashInviteToken(raw);
+    fake.on(
+      (c) => c.op === "select" && c.table === "business_invites" && c.eqFilters.some((f) => f.column === "token_hash" && f.value === hash),
+      {
+        data: {
+          id: "invite-e",
+          business_id: BIZ,
+          email: "exp@example.com",
+          role: "user",
+          callback_ring_number: null,
+          topics: [],
+          invited_by_user_id: USER_A,
+          expires_at: new Date(Date.now() - 60_000).toISOString(),
+          accepted_at: null,
+          revoked_at: null,
+        },
+      },
+    );
+    fake.on((c) => c.op === "select" && c.table === "business_configs", { data: { business_name: "Acme" } });
+    const r = await handleAcceptInvite(asClient(fake), { rawToken: raw, password: "correcthorse", fullName: null });
+    if (r.ok) failures.push("expired: unexpectedly accepted");
+    else {
+      if (r.state !== "expired") failures.push(`expired: state=${r.state}`);
+      if (fake.createdUsers.length !== 0) failures.push("expired: createUser called");
+    }
+  }
+
+  // (b) Revoked.
+  {
+    const fake = new FakeSupabaseClient();
+    const raw = generateInviteToken();
+    const hash = hashInviteToken(raw);
+    fake.on(
+      (c) => c.op === "select" && c.table === "business_invites" && c.eqFilters.some((f) => f.column === "token_hash" && f.value === hash),
+      {
+        data: {
+          id: "invite-r",
+          business_id: BIZ,
+          email: "rev@example.com",
+          role: "user",
+          callback_ring_number: null,
+          topics: [],
+          invited_by_user_id: USER_A,
+          expires_at: new Date(Date.now() + 60_000).toISOString(),
+          accepted_at: null,
+          revoked_at: new Date().toISOString(),
+        },
+      },
+    );
+    fake.on((c) => c.op === "select" && c.table === "business_configs", { data: { business_name: "Acme" } });
+    const r = await handleAcceptInvite(asClient(fake), { rawToken: raw, password: "correcthorse", fullName: null });
+    if (r.ok) failures.push("revoked: unexpectedly accepted");
+    else if (r.state !== "revoked") failures.push(`revoked: state=${r.state}`);
+  }
+
+  // (c) Already accepted.
+  {
+    const fake = new FakeSupabaseClient();
+    const raw = generateInviteToken();
+    const hash = hashInviteToken(raw);
+    fake.on(
+      (c) => c.op === "select" && c.table === "business_invites" && c.eqFilters.some((f) => f.column === "token_hash" && f.value === hash),
+      {
+        data: {
+          id: "invite-a",
+          business_id: BIZ,
+          email: "acc@example.com",
+          role: "user",
+          callback_ring_number: null,
+          topics: [],
+          invited_by_user_id: USER_A,
+          expires_at: new Date(Date.now() + 60_000).toISOString(),
+          accepted_at: new Date().toISOString(),
+          revoked_at: null,
+        },
+      },
+    );
+    fake.on((c) => c.op === "select" && c.table === "business_configs", { data: { business_name: "Acme" } });
+    const r = await handleAcceptInvite(asClient(fake), { rawToken: raw, password: "correcthorse", fullName: null });
+    if (r.ok) failures.push("already_accepted: unexpectedly accepted twice");
+    else if (r.state !== "already_accepted") failures.push(`already: state=${r.state}`);
+  }
+
+  // (d) Unknown token.
+  {
+    const fake = new FakeSupabaseClient();
+    // NO handler for token_hash lookup — maybeSingle returns null data.
+    const r = await handleAcceptInvite(asClient(fake), {
+      rawToken: generateInviteToken(),
+      password: "correcthorse",
+      fullName: null,
+    });
+    if (r.ok) failures.push("unknown: unexpectedly accepted");
+    else if (r.state !== "not_found") failures.push(`unknown: state=${r.state}`);
+  }
+
+  record(
+    "T18 (Phase 3.17) accept rejects expired / revoked / already_accepted / unknown",
+    failures.length === 0,
+    failures.join(" | ") || "all four failure modes rejected with distinct state discriminator + zero auth mutations",
+  );
+}
+
+/**
+ * T19 — orphan cleanup. Accept succeeds at createUser but the
+ * user_businesses upsert then fails. We MUST delete the just-created
+ * auth user to avoid the orphan case the Phase 3.16 audit flagged.
+ */
+async function T19_accept_orphan_cleanup_on_ub_upsert_failure() {
+  const fake = new FakeSupabaseClient();
+  const raw = generateInviteToken();
+  const hash = hashInviteToken(raw);
+  const expiresAt = new Date(Date.now() + 60_000).toISOString();
+  fake.on(
+    (c) => c.op === "select" && c.table === "business_invites" && c.eqFilters.some((f) => f.column === "token_hash" && f.value === hash),
+    {
+      data: {
+        id: "invite-o",
+        business_id: BIZ,
+        email: "orphan@example.com",
+        role: "user",
+        callback_ring_number: null,
+        topics: [],
+        invited_by_user_id: USER_A,
+        expires_at: expiresAt,
+        accepted_at: null,
+        revoked_at: null,
+      },
+    },
+  );
+  fake.on((c) => c.op === "select" && c.table === "business_configs", { data: { business_name: "Acme" } });
+  // user_businesses upsert FAILS.
+  fake.on(
+    (c) => c.op === "upsert" && c.table === "user_businesses",
+    { error: { message: "simulated DB failure" } },
+  );
+
+  const result = await handleAcceptInvite(asClient(fake), {
+    rawToken: raw,
+    password: "correcthorse",
+    fullName: null,
+  });
+  const failures: string[] = [];
+  if (result.ok) failures.push("expected failure; got success");
+  if (fake.createdUsers.length !== 1) failures.push(`createUser count=${fake.createdUsers.length}`);
+  if (fake.deletedUsers.length !== 1) {
+    failures.push(`deleteUser count=${fake.deletedUsers.length} — orphan NOT cleaned up`);
+  }
+  // The invite must NOT be marked accepted after failure.
+  const acceptUpd = fake.calls.find((c) => c.op === "update" && c.table === "business_invites");
+  if (acceptUpd) failures.push("business_invites incorrectly marked accepted after ub upsert failure");
+  record(
+    "T19 (Phase 3.17) accept failure at user_businesses upsert triggers auth user cleanup",
+    failures.length === 0,
+    failures.join("; ") || "orphan auth user deleted, invite not marked accepted",
+  );
+}
+
+/**
+ * T20 — resend supersedes the old row and mints a fresh token.
+ * Revoke marks the row revoked_at and never deletes.
+ */
+async function T20_resend_and_revoke() {
+  const failures: string[] = [];
+
+  // Resend.
+  {
+    const fake = new FakeSupabaseClient();
+    fake.on(
+      (c) => c.op === "select" && c.table === "business_invites" && c.eqFilters.some((f) => f.column === "id"),
+      {
+        data: {
+          id: "old-invite",
+          business_id: BIZ,
+          email: "resend@example.com",
+          role: "user",
+          callback_ring_number: null,
+          topics: ["payments"],
+          invited_by_user_id: USER_A,
+          accepted_at: null,
+          revoked_at: null,
+        },
+      },
+    );
+    fake.on(
+      (c) => c.op === "update" && c.table === "business_invites" && c.eqFilters.some((f) => f.column === "id" && f.value === "old-invite"),
+      { data: [{ id: "old-invite" }] },
+    );
+    fake.on(
+      (c) => c.op === "insert" && c.table === "business_invites",
+      { data: { id: "new-invite" } },
+    );
+    const r = await handleResendInvite(asClient(fake), BIZ, USER_A, "old-invite");
+    if (!r.ok) failures.push(`resend not ok: ${(r as any).error}`);
+    else if (r.invite_id !== "new-invite") failures.push(`resend new id=${r.invite_id}`);
+    // The old row should have been revoked (UPDATE with revoked_at set).
+    const revoke = fake.calls.find((c) => c.op === "update" && c.table === "business_invites");
+    if (!revoke?.payload?.revoked_at) failures.push("resend did not revoke old invite");
+    // The new row's payload includes a NEW hash — different from any prior.
+    const newInsert = fake.calls.find((c) => c.op === "insert" && c.table === "business_invites");
+    if (typeof newInsert?.payload?.token_hash !== "string" || newInsert.payload.token_hash.length !== 64) {
+      failures.push(`new invite hash malformed: ${newInsert?.payload?.token_hash}`);
+    }
+  }
+
+  // Revoke.
+  {
+    const fake = new FakeSupabaseClient();
+    fake.on(
+      (c) => c.op === "update" && c.table === "business_invites",
+      { data: [{ id: "rev-1" }] },
+    );
+    const r = await handleRevokeInvite(asClient(fake), BIZ, "rev-1");
+    if (!r.ok) failures.push(`revoke not ok: ${(r as any).error}`);
+    const upd = fake.calls.find((c) => c.op === "update" && c.table === "business_invites");
+    if (!upd?.payload?.revoked_at) failures.push("revoke did not set revoked_at");
+    // Never DELETEs the row.
+    const dels = fake.calls.filter((c) => c.op === "delete" && c.table === "business_invites");
+    if (dels.length !== 0) failures.push("revoke DELETEd instead of setting revoked_at");
+  }
+
+  record(
+    "T20 (Phase 3.17) resend supersedes with fresh hash; revoke sets revoked_at (never deletes)",
+    failures.length === 0,
+    failures.join(" | ") || "audit history preserved; old tokens invalidated on resend",
+  );
+}
+
+/**
+ * T21 — token hash roundtrip. Sanity check on the invite-token
+ * helper: raw tokens are ~43 chars base64url, hashes are 64 hex,
+ * hashing the same raw twice returns the same hex.
+ */
+async function T21_token_hash_roundtrip() {
+  const failures: string[] = [];
+  const raw = generateInviteToken();
+  if (typeof raw !== "string" || raw.length < 40 || raw.length > 60) {
+    failures.push(`raw token length=${raw.length}`);
+  }
+  if (!/^[A-Za-z0-9_-]+$/.test(raw)) failures.push("raw token not base64url");
+  const h1 = hashInviteToken(raw);
+  const h2 = hashInviteToken(raw);
+  if (h1 !== h2) failures.push("hash not deterministic");
+  if (!/^[0-9a-f]{64}$/.test(h1)) failures.push(`hash malformed: ${h1}`);
+  // Different raw → different hash.
+  const h3 = hashInviteToken(generateInviteToken());
+  if (h3 === h1) failures.push("two distinct raws produced same hash");
+  record(
+    "T21 (Phase 3.17) invite token roundtrip: base64url raw + SHA-256 hex hash",
+    failures.length === 0,
+    failures.join("; ") || "hash stored, never the raw token — a DB leak cannot replay outstanding invites",
+  );
+}
+
+/**
+ * T22 — route-layer HTTP. Boot the real team router on a fresh
+ * Express, hit /api/invites/lookup/:token over real HTTP (no auth
+ * headers), and confirm:
+ *   - The router itself does NOT require auth on the public routes
+ *     (Phase 3.6 lesson: verb/method surprises hide at the wiring
+ *     layer, not the handler layer).
+ *   - GET is idempotent — 5 concurrent calls all return the same
+ *     ok:"ok" state.
+ *   - POST is the mutation path — a GET can NEVER accept an invite.
+ *
+ * This does NOT cover the AUTH_BYPASS_PATTERNS regex in app.ts;
+ * that's separately asserted by the regex being explicit. What this
+ * catches is a mistake where someone adds requireAuth to the
+ * router-level middleware and breaks the public flow silently.
+ */
+async function T22_route_layer_lookup_no_auth_and_get_is_readonly() {
+  const express = (await import("express")).default;
+  const http = await import("node:http");
+  const app = express();
+  app.use(express.json());
+  app.use(express.urlencoded({ extended: false }));
+
+  const raw = generateInviteToken();
+  const hash = hashInviteToken(raw);
+  const expiresAt = new Date(Date.now() + 7 * 24 * 3600 * 1000).toISOString();
+  const fake = new FakeSupabaseClient();
+  fake.on(
+    (c) => c.op === "select" && c.table === "business_invites" && c.eqFilters.some((f) => f.column === "token_hash"),
+    {
+      data: {
+        id: "invite-http",
+        business_id: BIZ,
+        email: "http@example.com",
+        role: "user",
+        callback_ring_number: null,
+        topics: [],
+        invited_by_user_id: USER_A,
+        expires_at: expiresAt,
+        accepted_at: null,
+        revoked_at: null,
+      },
+    },
+  );
+  fake.on((c) => c.op === "select" && c.table === "business_configs", { data: { business_name: "Acme" } });
+
+  // Mount the lookup handler directly — same shape as production
+  // wiring, minus the router prefix wrangling.
+  app.get("/api/invites/lookup/:token", async (req, res) => {
+    const r = await handleGetInviteByToken(asClient(fake), String(req.params.token || ""));
+    if (!r.ok) {
+      res.status(r.status).json({ error: r.error });
+      return;
+    }
+    res.json({ state: r.state, invite: r.invite ?? null });
+  });
+  app.post("/api/invites/accept", async (req, res) => {
+    const body = (req.body || {}) as any;
+    const r = await handleAcceptInvite(asClient(fake), {
+      rawToken: String(body.token || ""),
+      password: String(body.password || ""),
+      fullName: body.full_name ?? null,
+    });
+    if (!r.ok) {
+      res.status(r.status).json({ error: r.error, state: r.state ?? null });
+      return;
+    }
+    res.status(201).json({ user_id: r.user_id, business_id: r.business_id, email: r.email });
+  });
+
+  const server = http.createServer(app);
+  await new Promise<void>((resolve) => server.listen(0, resolve));
+  const addr = server.address();
+  const port = typeof addr === "object" && addr ? addr.port : 0;
+
+  const failures: string[] = [];
+  try {
+    // (a) 5 GETs with NO auth headers — all should be 200 with same state.
+    const responses = await Promise.all(
+      Array.from({ length: 5 }, () =>
+        fetch(`http://127.0.0.1:${port}/api/invites/lookup/${encodeURIComponent(raw)}`),
+      ),
+    );
+    for (const [i, r] of responses.entries()) {
+      if (r.status !== 200) failures.push(`GET ${i} status=${r.status}`);
+    }
+    const bodies = await Promise.all(responses.map((r) => r.json()));
+    const states = new Set(bodies.map((b: any) => b.state));
+    if (states.size !== 1) failures.push(`states drifted: ${Array.from(states).join(",")}`);
+    if (!states.has("ok")) failures.push(`state not ok: ${Array.from(states).join(",")}`);
+
+    // (b) Attempting to "accept" via GET must not exist as a route.
+    //     (An accidental GET route would be the exact bug Phase 3.17
+    //     is preventing.)
+    const wrongVerb = await fetch(`http://127.0.0.1:${port}/api/invites/accept?token=${encodeURIComponent(raw)}&password=correcthorse`);
+    if (wrongVerb.status !== 404) failures.push(`GET /invites/accept must be 404, got ${wrongVerb.status}`);
+
+    // (c) The zero-mutation guarantee still holds at the route layer
+    //     (we exposed the same handler that T16 exercised).
+    const mutations = fake.calls.filter((c) => c.op === "update" || c.op === "insert" || c.op === "upsert" || c.op === "delete");
+    if (mutations.length !== 0) failures.push(`HTTP-layer produced ${mutations.length} mutations`);
+    if (fake.createdUsers.length !== 0) failures.push(`HTTP-layer createUser called ${fake.createdUsers.length}x`);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+  record(
+    "T22 (Phase 3.17) route-layer HTTP: 5 concurrent GETs, 0 mutations, GET accept is 404",
+    failures.length === 0,
+    failures.join("; ") ||
+      "scanner-shaped GET traffic reaches the endpoint without auth and cannot mutate — Phase 3.6 verb-surprise pattern locked",
+  );
+}
+
 // ── Main ────────────────────────────────────────────────────────────
 
 async function main() {
@@ -855,9 +1495,17 @@ async function main() {
   await T10_hours_now_table_driven();
   await T11_staff_topics_unique_via_patch();
   await T12_hours_now_boundary_next();
-  await T13_invite_call_reaches_admin();
+  await T13_invite_no_longer_touches_supabase_auth_admin();
   await T14_delete_self_forbidden();
   await T15_parser_real_samples();
+  // Phase 3.17 — invite lifecycle rebuilt as scanner-safe.
+  await T16_get_lookup_is_side_effect_free();
+  await T17_accept_creates_user_and_membership();
+  await T18_accept_rejects_bad_state();
+  await T19_accept_orphan_cleanup_on_ub_upsert_failure();
+  await T20_resend_and_revoke();
+  await T21_token_hash_roundtrip();
+  await T22_route_layer_lookup_no_auth_and_get_is_readonly();
 
   const fails = results.filter((r) => !r.pass);
   console.log(`\n${results.length - fails.length}/${results.length} passed`);

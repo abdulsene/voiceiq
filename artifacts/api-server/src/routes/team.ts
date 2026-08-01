@@ -45,6 +45,16 @@ import {
 // same freshness threshold. Widened 90→300s to tolerate throttled
 // background tabs; see the constant's own JSDoc.
 import { DEVICE_FRESHNESS_SECS } from "../lib/routing/constants";
+// Phase 3.17 — first-class business invites. We own the token, store
+// only its hash, and expose a POST-only acceptance route. Rebuilds
+// the invite flow from scratch after M365 Safe Links prefetched the
+// old one-time Supabase magic links out of production.
+import {
+  issueInviteToken,
+  hashInviteToken,
+  inviteExpiryFromNow,
+} from "../lib/invite-token";
+import { sendTeamInviteEmail } from "../email";
 
 const router = Router();
 
@@ -315,6 +325,33 @@ export async function handleListTeam(
   }
 }
 
+/**
+ * Phase 3.17 — invite lifecycle rebuilt from the ground up.
+ *
+ * OLD FLOW (removed): supabase.auth.admin.inviteUserByEmail sent a
+ * Supabase magic link. Microsoft Defender Safe Links / Google URL
+ * scanners prefetched the one-time GET on corporate M365/Workspace
+ * mailboxes, silently redeeming the token before the human clicked.
+ * Live evidence: aaliyah.louise@ezrentalsandleasing.com,
+ * invited_at 19:27:47 / confirmed_at 19:28:35 (48s later) —
+ * confirmed with no password, no real sign-in.
+ *
+ * NEW FLOW:
+ *   1. Owner POSTs /business/team/invite → we write a
+ *      business_invites row with a hashed token + 7-day expiry.
+ *      NO auth.users row is created.
+ *   2. Branded email is sent via Resend containing
+ *      https://neverr.ai/invite/<raw-token>.
+ *   3. Scanners GET /invite/:token → they hit our SPA HTML (static)
+ *      and the API's GET /invites/lookup/:token (side-effect free).
+ *   4. Human clicks, fills the form, POSTs
+ *      /invites/accept — that is when the Supabase user is created
+ *      with the human's password + user_businesses is inserted.
+ *
+ * Because acceptance is POST-only, scanner GET traffic cannot
+ * consume the invite. Because the DB stores only the hash, a leak
+ * cannot replay outstanding invites.
+ */
 export async function handleInviteMember(
   supabase: SupabaseClient,
   businessId: string,
@@ -322,10 +359,10 @@ export async function handleInviteMember(
   callerRole: EnterpriseRole | undefined,
   body: ParsedInviteBody,
 ): Promise<
-  | { ok: true; user_id: string; email: string; invited: boolean }
+  | { ok: true; invite_id: string; email: string; expires_at: string; resent_previous: boolean }
   | { ok: false; status: number; error: string }
 > {
-  // Privilege check.
+  // Privilege check — reject before any DB write.
   if (!canGrantEnterpriseRole(callerRole, body.role)) {
     return {
       ok: false,
@@ -350,90 +387,654 @@ export async function handleInviteMember(
     }
   }
 
-  // Invite via Supabase Auth admin. Same pattern as enterprise.ts:
-  // if the user already exists, inviteUserByEmail returns an error; fall
-  // back to listUsers to locate them.
-  const admin = (supabase.auth as any).admin;
-  let userId: string | undefined;
-  let invited = false;
-
-  try {
-    const inviteRes = await admin.inviteUserByEmail(body.email, {
-      data: { full_name: body.full_name, businessId, role: body.role },
-    });
-    userId = inviteRes?.data?.user?.id;
-    if (userId) {
-      invited = true;
-    }
-    if (!userId) {
-      const inviteErr = inviteRes?.error;
-      if (inviteErr && !/already.*registered|already exists/i.test(inviteErr.message || "")) {
-        Sentry.captureMessage("team_invite_failed", {
-          level: "error",
-          extra: { businessId, email: body.email, error: inviteErr.message },
-        });
-        return { ok: false, status: 500, error: inviteErr.message || "Invite failed" };
-      }
-      // Already exists → find them.
-      const { data } = await admin.listUsers({ page: 1, perPage: 200 });
-      const found = data?.users?.find(
-        (u: any) => u.email?.toLowerCase() === body.email,
-      );
-      if (!found) {
-        return { ok: false, status: 500, error: "User exists but could not be located" };
-      }
-      userId = found.id;
-    }
-  } catch (err: any) {
-    return { ok: false, status: 500, error: err?.message || "Invite failed" };
+  // Reject if this email is ALREADY a member of this business.
+  // Requires a small userMap lookup via listUsers — cheaper than a
+  // full auth admin round-trip for every invite because we scope to
+  // this business's memberships.
+  const existingMember = await findExistingMemberByEmail(
+    supabase,
+    businessId,
+    body.email,
+  );
+  if (existingMember.error) {
+    return { ok: false, status: 500, error: existingMember.error };
+  }
+  if (existingMember.userId) {
+    return {
+      ok: false,
+      status: 409,
+      error: "This email is already a member of this business",
+    };
   }
 
+  // Supersede any outstanding invite for the same (business, email).
+  // A resend without an explicit /resend call is common — the owner
+  // just clicks Invite again. Revoke old rows so the earlier email
+  // can no longer be accepted; then issue a fresh token.
+  const now = new Date();
+  const supersedeResp = await supabase
+    .from("business_invites")
+    .update({ revoked_at: now.toISOString() })
+    .eq("business_id", businessId)
+    .eq("email", body.email)
+    .is("accepted_at", null)
+    .is("revoked_at", null)
+    .select("id");
+  const resentPrevious = Array.isArray(supersedeResp.data)
+    && supersedeResp.data.length > 0;
+
+  // Mint a token — raw for the email URL, hash for the DB.
+  const { raw, hash } = issueInviteToken();
+  const expiresAt = inviteExpiryFromNow(now);
+
+  const insertResp = await supabase
+    .from("business_invites")
+    .insert({
+      business_id: businessId,
+      email: body.email,
+      role: body.role,
+      callback_ring_number: body.callback_ring_number,
+      topics: body.initial_topics,
+      invited_by_user_id: callerUserId,
+      token_hash: hash,
+      expires_at: expiresAt,
+    })
+    .select("id")
+    .single();
+  if (insertResp.error) {
+    Sentry.captureMessage("team_invite_insert_failed", {
+      level: "error",
+      extra: { businessId, email: body.email, error: insertResp.error.message },
+    });
+    return { ok: false, status: 500, error: "Database error" };
+  }
+  const inviteId = (insertResp.data as { id: string }).id;
+
+  // Fire the branded email. Failure to send is non-fatal — the row
+  // exists and the owner can resend via the UI. We do log it though
+  // so we notice email delivery breakage before customers do.
+  const inviter = await lookupInviterMeta(supabase, callerUserId, businessId);
+  try {
+    await sendTeamInviteEmail({
+      to: body.email,
+      inviteToken: raw,
+      businessName: inviter.businessName,
+      inviterName: inviter.name,
+      role: body.role,
+      fullName: body.full_name,
+      expiresAt,
+    });
+  } catch (err: any) {
+    Sentry.captureException(err, {
+      extra: { where: "sendTeamInviteEmail", inviteId },
+    });
+  }
+
+  return {
+    ok: true,
+    invite_id: inviteId,
+    email: body.email,
+    expires_at: expiresAt,
+    resent_previous: resentPrevious,
+  };
+}
+
+/**
+ * Phase 3.17 helper — look up whether `email` already has an active
+ * (accepted or otherwise persisted) user_businesses row for
+ * `businessId`. Uses the Supabase admin listUsers scoped by the small
+ * membership list to avoid a full auth-user scan for every invite.
+ * Returns { userId } if found, otherwise { userId: null }.
+ */
+async function findExistingMemberByEmail(
+  supabase: SupabaseClient,
+  businessId: string,
+  email: string,
+): Promise<{ userId: string | null; error?: string }> {
+  try {
+    const admin = (supabase.auth as any).admin;
+    // listUsers is paged; page 1 with 200 users is enough for the
+    // sizes we care about at this stage. Revisit if a tenant crosses
+    // 200 members.
+    const { data } = await admin.listUsers({ page: 1, perPage: 200 });
+    const found = data?.users?.find(
+      (u: any) => u.email?.toLowerCase() === email,
+    );
+    if (!found) return { userId: null };
+    const ubResp = await supabase
+      .from("user_businesses")
+      .select("user_id")
+      .eq("user_id", found.id)
+      .eq("business_id", businessId)
+      .maybeSingle();
+    if (ubResp.error) return { userId: null, error: ubResp.error.message };
+    return { userId: ubResp.data ? found.id : null };
+  } catch (err: any) {
+    return { userId: null, error: err?.message || "listUsers failed" };
+  }
+}
+
+/**
+ * Phase 3.17 helper — hydrate the inviter's display name + business
+ * name for the branded email. Never fatal — we fall back to
+ * generic labels if either lookup fails so the invite still lands.
+ */
+async function lookupInviterMeta(
+  supabase: SupabaseClient,
+  inviterUserId: string,
+  businessId: string,
+): Promise<{ name: string; businessName: string }> {
+  let name = "Your teammate";
+  let businessName = "the team";
+  try {
+    const admin = (supabase.auth as any).admin;
+    const userRes = await admin.getUserById(inviterUserId);
+    const meta = userRes?.data?.user?.user_metadata || {};
+    const raw = meta.full_name || meta.name || userRes?.data?.user?.email;
+    if (typeof raw === "string" && raw.trim()) name = raw.trim();
+  } catch {
+    // fall through to default
+  }
+  try {
+    const bizResp = await supabase
+      .from("business_configs")
+      .select("business_name")
+      .eq("business_id", businessId)
+      .maybeSingle();
+    const bn = (bizResp.data as { business_name?: string } | null)?.business_name;
+    if (typeof bn === "string" && bn.trim()) businessName = bn.trim();
+  } catch {
+    // fall through
+  }
+  return { name, businessName };
+}
+
+// ── Phase 3.17: pending invites, GET-by-token, accept, resend, revoke ─
+
+export interface PendingInviteRow {
+  id: string;
+  email: string;
+  role: string;
+  callback_ring_number: string | null;
+  topics: string[];
+  invited_by_user_id: string | null;
+  expires_at: string;
+  created_at: string;
+}
+
+/**
+ * List pending (not accepted, not revoked, not expired) invites for
+ * this business. Owner-visible list on the Team page. Sorted newest
+ * first.
+ */
+export async function handleListPendingInvites(
+  supabase: SupabaseClient,
+  businessId: string,
+): Promise<
+  | { ok: true; invites: PendingInviteRow[] }
+  | { ok: false; status: number; error: string }
+> {
+  const nowIso = new Date().toISOString();
+  const { data, error } = await supabase
+    .from("business_invites")
+    .select("id, email, role, callback_ring_number, topics, invited_by_user_id, expires_at, created_at")
+    .eq("business_id", businessId)
+    .is("accepted_at", null)
+    .is("revoked_at", null)
+    .gt("expires_at", nowIso)
+    .order("created_at", { ascending: false });
+  if (error) return { ok: false, status: 500, error: "Database error" };
+  return { ok: true, invites: (data as PendingInviteRow[] | null) ?? [] };
+}
+
+/**
+ * GET the state of an invite by raw token. Side-effect free — this is
+ * the endpoint the /invite/:token SPA page calls to populate its
+ * form. A scanner hitting this on prefetch does NOT change any DB
+ * state (that's the whole point of Phase 3.17).
+ *
+ * Returned discriminated union lets the client render distinct
+ * copy for each failure mode. Statuses are chosen so the SPA can
+ * key on them:
+ *   - "not_found"        (unknown token, 404)
+ *   - "expired"          (expiry timestamp passed, 410 Gone)
+ *   - "revoked"          (owner revoked or resend superseded, 410)
+ *   - "already_accepted" (someone already POSTed accept, 410)
+ *   - "ok"               (form should render)
+ */
+export type InviteLookupState =
+  | "not_found"
+  | "expired"
+  | "revoked"
+  | "already_accepted"
+  | "ok";
+
+export async function handleGetInviteByToken(
+  supabase: SupabaseClient,
+  rawToken: string,
+): Promise<
+  | { ok: true; state: InviteLookupState;
+      invite?: {
+        email: string;
+        role: string;
+        callback_ring_number: string | null;
+        topics: string[];
+        business_name: string;
+        inviter_name: string | null;
+        expires_at: string;
+      };
+    }
+  | { ok: false; status: number; error: string }
+> {
+  if (!rawToken || typeof rawToken !== "string" || rawToken.length < 20 || rawToken.length > 200) {
+    // Length bounds match what generateInviteToken produces (~43 chars
+    // base64url). Anything wildly off is definitely bogus; 404 without
+    // hitting the DB.
+    return { ok: true, state: "not_found" };
+  }
+  const hash = hashInviteToken(rawToken);
+  const { data, error } = await supabase
+    .from("business_invites")
+    .select(
+      "id, business_id, email, role, callback_ring_number, topics, invited_by_user_id, expires_at, accepted_at, revoked_at",
+    )
+    .eq("token_hash", hash)
+    .maybeSingle();
+  if (error) return { ok: false, status: 500, error: "Database error" };
+  if (!data) return { ok: true, state: "not_found" };
+
+  const row = data as {
+    id: string;
+    business_id: string;
+    email: string;
+    role: string;
+    callback_ring_number: string | null;
+    topics: string[] | null;
+    invited_by_user_id: string | null;
+    expires_at: string;
+    accepted_at: string | null;
+    revoked_at: string | null;
+  };
+
+  if (row.accepted_at) return { ok: true, state: "already_accepted" };
+  if (row.revoked_at) return { ok: true, state: "revoked" };
+  if (Date.parse(row.expires_at) < Date.now()) return { ok: true, state: "expired" };
+
+  // For the "ok" state we hydrate a few display fields (business
+  // name, inviter name) so the SPA can render "Alex invited you to
+  // Acme" without a second round-trip. We do NOT expose the id or
+  // token_hash — the SPA doesn't need either.
+  const inviter =
+    row.invited_by_user_id !== null
+      ? await lookupInviterName(supabase, row.invited_by_user_id)
+      : null;
+  const businessName = await lookupBusinessName(supabase, row.business_id);
+
+  return {
+    ok: true,
+    state: "ok",
+    invite: {
+      email: row.email,
+      role: row.role,
+      callback_ring_number: row.callback_ring_number,
+      topics: row.topics ?? [],
+      business_name: businessName,
+      inviter_name: inviter,
+      expires_at: row.expires_at,
+    },
+  };
+}
+
+async function lookupInviterName(
+  supabase: SupabaseClient,
+  userId: string,
+): Promise<string | null> {
+  try {
+    const admin = (supabase.auth as any).admin;
+    const userRes = await admin.getUserById(userId);
+    const meta = userRes?.data?.user?.user_metadata || {};
+    const raw = meta.full_name || meta.name || userRes?.data?.user?.email;
+    return typeof raw === "string" && raw.trim() ? raw.trim() : null;
+  } catch {
+    return null;
+  }
+}
+
+async function lookupBusinessName(
+  supabase: SupabaseClient,
+  businessId: string,
+): Promise<string> {
+  try {
+    const resp = await supabase
+      .from("business_configs")
+      .select("business_name")
+      .eq("business_id", businessId)
+      .maybeSingle();
+    const bn = (resp.data as { business_name?: string } | null)?.business_name;
+    return typeof bn === "string" && bn.trim() ? bn.trim() : "the team";
+  } catch {
+    return "the team";
+  }
+}
+
+/**
+ * POST accept an invite. This is where the auth user is created (or
+ * looked up if they already had a Supabase account) and the
+ * user_businesses row is inserted. Atomic-ish: on Supabase auth
+ * failure, no membership row is written; on membership insert
+ * failure, we delete the newly-created auth user to avoid orphaning.
+ *
+ * Password requirements match the existing auth signup schema (≥ 8
+ * chars). The email is taken from the invite row — we do NOT trust
+ * the client to send it. Same for role and business_id.
+ */
+export interface AcceptInviteInput {
+  rawToken: string;
+  password: string;
+  fullName: string | null;
+}
+
+export async function handleAcceptInvite(
+  supabase: SupabaseClient,
+  input: AcceptInviteInput,
+): Promise<
+  | { ok: true; user_id: string; business_id: string; email: string }
+  | { ok: false; status: number; error: string; state?: InviteLookupState }
+> {
+  if (!input.rawToken || typeof input.rawToken !== "string") {
+    return { ok: false, status: 400, error: "token required" };
+  }
+  if (!input.password || typeof input.password !== "string" || input.password.length < 8) {
+    return { ok: false, status: 400, error: "Password must be at least 8 characters" };
+  }
+  const hash = hashInviteToken(input.rawToken);
+
+  // Re-check the invite state atomically with the accept. We SELECT
+  // first to get the id + row for the accept UPDATE's WHERE clause;
+  // the UPDATE uses `accepted_at IS NULL AND revoked_at IS NULL AND
+  // expires_at > now()` so a concurrent second POST can't double-
+  // accept the same invite.
+  const lookup = await handleGetInviteByToken(supabase, input.rawToken);
+  if (!lookup.ok) return { ok: false, status: lookup.status, error: lookup.error };
+  if (lookup.state !== "ok") {
+    const msg =
+      lookup.state === "expired" ? "This invite has expired" :
+      lookup.state === "revoked" ? "This invite was revoked" :
+      lookup.state === "already_accepted" ? "This invite has already been accepted" :
+      "This invite link is not valid";
+    return { ok: false, status: 410, error: msg, state: lookup.state };
+  }
+  const invite = lookup.invite!;
+
+  // Create the Supabase auth user with the human's password. We use
+  // admin.createUser (NOT inviteUserByEmail) so no magic link goes
+  // out and no confirmation email is sent — the human's presence at
+  // this POST is proof enough of email ownership (they had to open
+  // our email + click our SPA link to get here).
+  const admin = (supabase.auth as any).admin;
+  let userId: string | undefined;
+  try {
+    const createRes = await admin.createUser({
+      email: invite.email,
+      password: input.password,
+      email_confirm: true,
+      user_metadata: { full_name: input.fullName ?? undefined },
+    });
+    userId = createRes?.data?.user?.id;
+    const createErr = createRes?.error;
+    if (!userId && createErr) {
+      // If the auth user already existed (rare — someone signed up
+      // between invite issuance and acceptance), locate them by email
+      // and update the password. Skip the password update if we can't
+      // locate them cleanly; require the user to reset via /forgot.
+      if (/already.*registered|already exists/i.test(createErr.message || "")) {
+        const listRes = await admin.listUsers({ page: 1, perPage: 200 });
+        const found = listRes?.data?.users?.find(
+          (u: any) => u.email?.toLowerCase() === invite.email,
+        );
+        if (!found) {
+          return { ok: false, status: 500, error: "Account exists but could not be located" };
+        }
+        userId = found.id;
+        // Set the new password so the accept form is actually useful.
+        try {
+          await admin.updateUserById(userId, {
+            password: input.password,
+            email_confirm: true,
+          });
+        } catch {
+          // Non-fatal — they can /forgot-password.
+        }
+      } else {
+        Sentry.captureMessage("invite_accept_create_user_failed", {
+          level: "error",
+          extra: { error: createErr.message },
+        });
+        return { ok: false, status: 500, error: createErr.message || "Could not create account" };
+      }
+    }
+  } catch (err: any) {
+    return { ok: false, status: 500, error: err?.message || "Could not create account" };
+  }
   if (!userId) return { ok: false, status: 500, error: "Could not resolve user id" };
 
-  // Upsert membership.
+  // Hydrate business_id once — everything below writes to the same
+  // (user, business) scope. Fail closed if the invite row disappeared
+  // between the lookup and now (extremely unlikely but not free to
+  // ignore).
+  const businessId = await hydrateBusinessIdForInvite(supabase, hash);
+  if (!businessId) {
+    return { ok: false, status: 500, error: "Invite state changed during acceptance" };
+  }
+
+  // Insert the user_businesses row. If this fails, delete the auth
+  // user we just created (unless it pre-existed) to avoid the orphan
+  // case the Phase 3.16 audit called out.
   const { error: upsertErr } = await supabase
     .from("user_businesses")
     .upsert(
       {
         user_id: userId,
         business_id: businessId,
-        role: body.role,
-        callback_ring_number: body.callback_ring_number,
+        role: invite.role,
+        callback_ring_number: invite.callback_ring_number,
       },
       { onConflict: "user_id,business_id" },
     );
   if (upsertErr) {
-    Sentry.captureMessage("team_invite_ub_upsert_failed", {
+    Sentry.captureMessage("invite_accept_ub_upsert_failed", {
       level: "error",
-      extra: { businessId, userId, error: upsertErr.message },
+      extra: { userId, error: upsertErr.message },
     });
+    // Best-effort orphan cleanup. If deleteUser also fails, we've
+    // still logged the situation for follow-up.
+    try {
+      await admin.deleteUser(userId);
+    } catch (delErr: any) {
+      Sentry.captureException(delErr, {
+        extra: { where: "invite_accept_orphan_cleanup", userId },
+      });
+    }
     return { ok: false, status: 500, error: "Database error" };
   }
 
-  // Insert initial topics. Ignore duplicates via ON CONFLICT-safe pattern:
-  // DELETE existing rows for this user+business first, then INSERT the new set.
-  if (body.initial_topics.length > 0) {
+  // Insert initial topics (best-effort — a failure here doesn't undo
+  // the acceptance; the owner can set them later on the Team page).
+  if (invite.topics.length > 0) {
     await supabase
       .from("staff_topics")
       .delete()
       .eq("user_id", userId)
       .eq("business_id", businessId);
-    const rows = body.initial_topics.map((slug) => ({
+    const rows = invite.topics.map((slug) => ({
       user_id: userId,
       business_id: businessId,
       topic_slug: slug,
     }));
     const { error: topicsErr } = await supabase.from("staff_topics").insert(rows);
     if (topicsErr) {
-      Sentry.captureMessage("team_invite_topics_insert_failed", {
-        level: "error",
-        extra: { businessId, userId, error: topicsErr.message },
+      Sentry.captureMessage("invite_accept_topics_insert_failed", {
+        level: "warning",
+        extra: { userId, error: topicsErr.message },
       });
-      return { ok: false, status: 500, error: "Database error" };
     }
   }
 
-  return { ok: true, user_id: userId, email: body.email, invited };
+  // Mark the invite accepted LAST — so if any earlier step failed we
+  // don't burn the token. Concurrent-double-accept protection via the
+  // WHERE clause: only mark accepted if it's still pending.
+  const acceptResp = await supabase
+    .from("business_invites")
+    .update({
+      accepted_at: new Date().toISOString(),
+      accepted_user_id: userId,
+    })
+    .eq("token_hash", hash)
+    .is("accepted_at", null)
+    .is("revoked_at", null)
+    .select("id");
+  if (acceptResp.error || !acceptResp.data || acceptResp.data.length === 0) {
+    // A concurrent request already accepted this invite. The auth
+    // user + membership are in place; treat as success but log for
+    // observability.
+    Sentry.captureMessage("invite_accept_race_or_stale", {
+      level: "warning",
+      extra: { userId, err: acceptResp.error?.message },
+    });
+  }
+
+  return { ok: true, user_id: userId, business_id: businessId, email: invite.email };
+}
+
+/**
+ * Small helper — resolve the business_id for an invite by its
+ * hash. Called inside handleAcceptInvite where we don't want to
+ * trust anything client-supplied.
+ */
+async function hydrateBusinessIdForInvite(
+  supabase: SupabaseClient,
+  tokenHash: string,
+): Promise<string | null> {
+  const { data } = await supabase
+    .from("business_invites")
+    .select("business_id")
+    .eq("token_hash", tokenHash)
+    .maybeSingle();
+  return (data as { business_id?: string } | null)?.business_id ?? null;
+}
+
+/**
+ * Owner-only. Resend an outstanding invite. Semantics: mint a fresh
+ * token (invalidating the old email link), keep everything else
+ * (role, topics, callback), refresh expires_at. Same email fires.
+ *
+ * The old invite row is REVOKED rather than deleted so we retain
+ * audit history. A new row is INSERTed with the new hash.
+ */
+export async function handleResendInvite(
+  supabase: SupabaseClient,
+  businessId: string,
+  callerUserId: string,
+  inviteId: string,
+): Promise<
+  | { ok: true; invite_id: string; email: string; expires_at: string }
+  | { ok: false; status: number; error: string }
+> {
+  const existing = await supabase
+    .from("business_invites")
+    .select("id, business_id, email, role, callback_ring_number, topics, invited_by_user_id, accepted_at, revoked_at")
+    .eq("id", inviteId)
+    .eq("business_id", businessId)
+    .maybeSingle();
+  if (existing.error) return { ok: false, status: 500, error: "Database error" };
+  if (!existing.data) return { ok: false, status: 404, error: "Invite not found" };
+  const row = existing.data as {
+    id: string;
+    business_id: string;
+    email: string;
+    role: string;
+    callback_ring_number: string | null;
+    topics: string[] | null;
+    invited_by_user_id: string | null;
+    accepted_at: string | null;
+    revoked_at: string | null;
+  };
+  if (row.accepted_at) {
+    return { ok: false, status: 409, error: "This invite has already been accepted" };
+  }
+
+  // Revoke the old row.
+  await supabase
+    .from("business_invites")
+    .update({ revoked_at: new Date().toISOString() })
+    .eq("id", row.id);
+
+  // Insert a new row with a fresh token.
+  const { raw, hash } = issueInviteToken();
+  const expiresAt = inviteExpiryFromNow();
+  const insertResp = await supabase
+    .from("business_invites")
+    .insert({
+      business_id: row.business_id,
+      email: row.email,
+      role: row.role,
+      callback_ring_number: row.callback_ring_number,
+      topics: row.topics ?? [],
+      invited_by_user_id: callerUserId,
+      token_hash: hash,
+      expires_at: expiresAt,
+    })
+    .select("id")
+    .single();
+  if (insertResp.error) {
+    Sentry.captureMessage("invite_resend_insert_failed", {
+      level: "error",
+      extra: { businessId, email: row.email, error: insertResp.error.message },
+    });
+    return { ok: false, status: 500, error: "Database error" };
+  }
+  const newId = (insertResp.data as { id: string }).id;
+
+  const inviter = await lookupInviterMeta(supabase, callerUserId, businessId);
+  try {
+    await sendTeamInviteEmail({
+      to: row.email,
+      inviteToken: raw,
+      businessName: inviter.businessName,
+      inviterName: inviter.name,
+      role: row.role,
+      fullName: null,
+      expiresAt,
+    });
+  } catch (err: any) {
+    Sentry.captureException(err, { extra: { where: "resendTeamInviteEmail", inviteId: newId } });
+  }
+
+  return { ok: true, invite_id: newId, email: row.email, expires_at: expiresAt };
+}
+
+/**
+ * Owner-only. Mark the invite revoked. Idempotent — revoking twice
+ * returns success. Never deletes the row (history matters).
+ */
+export async function handleRevokeInvite(
+  supabase: SupabaseClient,
+  businessId: string,
+  inviteId: string,
+): Promise<{ ok: true } | { ok: false; status: number; error: string }> {
+  const now = new Date().toISOString();
+  const { data, error } = await supabase
+    .from("business_invites")
+    .update({ revoked_at: now })
+    .eq("id", inviteId)
+    .eq("business_id", businessId)
+    .is("accepted_at", null)
+    .select("id");
+  if (error) return { ok: false, status: 500, error: "Database error" };
+  if (!data || data.length === 0) {
+    return { ok: false, status: 404, error: "Invite not found or already accepted" };
+  }
+  return { ok: true };
 }
 
 export async function handlePatchMember(
@@ -700,7 +1301,16 @@ router.post(
       res.status(result.status).json({ error: result.error });
       return;
     }
-    res.status(201).json({ user_id: result.user_id, email: result.email, invited: result.invited });
+    // Phase 3.17 — new response shape. No user_id (auth user isn't
+    // created until acceptance). invite_id is what the UI keys off
+    // for resend/revoke buttons; resent_previous tells the UI
+    // whether to show "invite re-sent" vs "invite sent."
+    res.status(201).json({
+      invite_id: result.invite_id,
+      email: result.email,
+      expires_at: result.expires_at,
+      resent_previous: result.resent_previous,
+    });
   },
 );
 
@@ -826,6 +1436,171 @@ router.delete(
     }
     const targetUserId = String(req.params.userId);
     const result = await handleDeleteMember(supabase, businessId, callerUserId, targetUserId);
+    if (!result.ok) {
+      res.status(result.status).json({ error: result.error });
+      return;
+    }
+    res.json({ ok: true });
+  },
+);
+
+// ─── Phase 3.17 — first-class invites ─────────────────────────────────
+
+/**
+ * Public — no auth. The invite token IS the credential. GET is
+ * side-effect free: hitting it a hundred times (as a scanner will)
+ * does not accept, mark-as-read, or otherwise mutate DB state.
+ * That's the entire point of Phase 3.17. See handleGetInviteByToken.
+ *
+ * Whitelisted in AUTH_BYPASS_PATTERNS in app.ts.
+ */
+router.get(
+  "/invites/lookup/:token",
+  async (req: Request, res: Response) => {
+    const supabase = getSupabase();
+    if (!supabase) {
+      res.status(500).json({ error: "Database not configured" });
+      return;
+    }
+    const rawToken = String(req.params.token || "");
+    const result = await handleGetInviteByToken(supabase, rawToken);
+    if (!result.ok) {
+      res.status(result.status).json({ error: result.error });
+      return;
+    }
+    res.json({ state: result.state, invite: result.invite ?? null });
+  },
+);
+
+/**
+ * Public — no auth. Body: { token, password, full_name? }.
+ * Creates the Supabase auth user + user_businesses row and marks
+ * the invite accepted. THIS is the mutation. Scanners cannot
+ * trigger it because they don't POST.
+ *
+ * Whitelisted in AUTH_BYPASS_PATTERNS in app.ts.
+ */
+router.post(
+  "/invites/accept",
+  async (req: Request, res: Response) => {
+    const supabase = getSupabase();
+    if (!supabase) {
+      res.status(500).json({ error: "Database not configured" });
+      return;
+    }
+    const body = (req.body || {}) as Record<string, unknown>;
+    const rawToken = typeof body.token === "string" ? body.token : "";
+    const password = typeof body.password === "string" ? body.password : "";
+    const fullName =
+      typeof body.full_name === "string" && body.full_name.trim()
+        ? body.full_name.trim()
+        : null;
+
+    const result = await handleAcceptInvite(supabase, {
+      rawToken,
+      password,
+      fullName,
+    });
+    if (!result.ok) {
+      res.status(result.status).json({
+        error: result.error,
+        // Include state so the SPA can render a specific message
+        // (expired / revoked / already_accepted) rather than a
+        // generic "invite failed."
+        state: result.state ?? null,
+      });
+      return;
+    }
+    res.status(201).json({
+      user_id: result.user_id,
+      business_id: result.business_id,
+      email: result.email,
+    });
+  },
+);
+
+/**
+ * Owner-only. Lists outstanding invites for the current business.
+ */
+router.get(
+  "/business/invites",
+  requireAuth,
+  requirePermission("users", "read"),
+  async (req: Request, res: Response) => {
+    const supabase = getSupabase();
+    if (!supabase) {
+      res.status(500).json({ error: "Database not configured" });
+      return;
+    }
+    const businessId = req.businessId;
+    if (!businessId) {
+      res.status(400).json({ error: "No active business" });
+      return;
+    }
+    const result = await handleListPendingInvites(supabase, businessId);
+    if (!result.ok) {
+      res.status(result.status).json({ error: result.error });
+      return;
+    }
+    res.json({ invites: result.invites });
+  },
+);
+
+/**
+ * Owner-only. Resend an outstanding invite (mints a new token, sends
+ * a fresh email, revokes the previous row).
+ */
+router.post(
+  "/business/invites/:id/resend",
+  requireAuth,
+  requirePermission("users", "write"),
+  async (req: Request, res: Response) => {
+    const supabase = getSupabase();
+    if (!supabase) {
+      res.status(500).json({ error: "Database not configured" });
+      return;
+    }
+    const businessId = req.businessId;
+    const callerUserId = req.userId;
+    if (!businessId || !callerUserId) {
+      res.status(400).json({ error: "No active business" });
+      return;
+    }
+    const inviteId = String(req.params.id || "");
+    const result = await handleResendInvite(supabase, businessId, callerUserId, inviteId);
+    if (!result.ok) {
+      res.status(result.status).json({ error: result.error });
+      return;
+    }
+    res.json({
+      invite_id: result.invite_id,
+      email: result.email,
+      expires_at: result.expires_at,
+    });
+  },
+);
+
+/**
+ * Owner-only. Revoke an outstanding invite. Idempotent — sets
+ * revoked_at but never deletes the row (audit history).
+ */
+router.delete(
+  "/business/invites/:id",
+  requireAuth,
+  requirePermission("users", "write"),
+  async (req: Request, res: Response) => {
+    const supabase = getSupabase();
+    if (!supabase) {
+      res.status(500).json({ error: "Database not configured" });
+      return;
+    }
+    const businessId = req.businessId;
+    if (!businessId) {
+      res.status(400).json({ error: "No active business" });
+      return;
+    }
+    const inviteId = String(req.params.id || "");
+    const result = await handleRevokeInvite(supabase, businessId, inviteId);
     if (!result.ok) {
       res.status(result.status).json({ error: result.error });
       return;

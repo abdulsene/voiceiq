@@ -100,23 +100,86 @@ function formatOnDutySince(iso: string | null): string {
   return `${hours}h ${remMins}m`;
 }
 
+// Phase 3.17 — pending invites from GET /business/invites. Rendered
+// as a separate table above active members so the "who hasn't
+// accepted yet" state is scannable at a glance. Aligns with the
+// audit finding that pending members were previously indistinguishable
+// from active ones.
+interface PendingInvite {
+  id: string;
+  email: string;
+  role: string;
+  callback_ring_number: string | null;
+  topics: string[];
+  invited_by_user_id: string | null;
+  expires_at: string;
+  created_at: string;
+}
+
 export default function TeamPage() {
   const { t } = useTranslation();
   const [members, setMembers] = useState<TeamMember[] | null>(null);
+  const [pendingInvites, setPendingInvites] = useState<PendingInvite[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [inviteOpen, setInviteOpen] = useState(false);
   const [removingId, setRemovingId] = useState<string | null>(null);
+  const [inviteActionId, setInviteActionId] = useState<string | null>(null);
   const [selfUserId, setSelfUserId] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     try {
-      const data = await fetchApi("/business/team");
-      setMembers((data?.members as TeamMember[] | undefined) ?? []);
+      const [membersData, invitesData] = await Promise.all([
+        fetchApi("/business/team"),
+        fetchApi("/business/invites").catch(() => ({ invites: [] })),
+      ]);
+      setMembers((membersData?.members as TeamMember[] | undefined) ?? []);
+      setPendingInvites((invitesData?.invites as PendingInvite[] | undefined) ?? []);
       setError(null);
     } catch (e: any) {
       setError(e?.message || "load failed");
     }
   }, []);
+
+  const handleResendInvite = useCallback(
+    async (inv: PendingInvite) => {
+      setInviteActionId(inv.id);
+      try {
+        const res = await fetch(`/api/business/invites/${encodeURIComponent(inv.id)}/resend`, {
+          method: "POST",
+          headers: getAuthHeaders(),
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        toast.success(`Fresh invite sent to ${inv.email}`);
+        await load();
+      } catch (e: any) {
+        toast.error(e?.message || "Could not resend invite");
+      } finally {
+        setInviteActionId(null);
+      }
+    },
+    [load],
+  );
+
+  const handleRevokeInvite = useCallback(
+    async (inv: PendingInvite) => {
+      if (!window.confirm(`Revoke pending invite for ${inv.email}? The link in their email will stop working immediately.`)) return;
+      setInviteActionId(inv.id);
+      try {
+        const res = await fetch(`/api/business/invites/${encodeURIComponent(inv.id)}`, {
+          method: "DELETE",
+          headers: getAuthHeaders(),
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        toast.success(`Invite for ${inv.email} revoked`);
+        await load();
+      } catch (e: any) {
+        toast.error(e?.message || "Could not revoke invite");
+      } finally {
+        setInviteActionId(null);
+      }
+    },
+    [load],
+  );
 
   // Resolve the caller's own user_id once so the row for "me" hides
   // the Remove action (backend also blocks self-remove with 403, but
@@ -188,6 +251,82 @@ export default function TeamPage() {
           {t("team.loadError")}
         </div>
       )}
+
+      {/* Phase 3.17 — pending invites section. Rendered ABOVE the
+          active members table so ops can immediately see who hasn't
+          accepted yet. Only shows when there are outstanding
+          invites; disappears otherwise. */}
+      {pendingInvites && pendingInvites.length > 0 ? (
+        <div className="mb-6 bg-white rounded-2xl border border-amber-200 overflow-hidden">
+          <div className="bg-amber-50 border-b border-amber-200 px-4 py-3 flex items-center gap-2">
+            <AlertTriangle className="w-4 h-4 text-amber-700" />
+            <h2 className="text-sm font-semibold text-amber-900">
+              Pending invites ({pendingInvites.length})
+            </h2>
+          </div>
+          <div className="overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="bg-white border-b border-amber-100 text-left text-xs uppercase tracking-wide text-slate-700">
+                  <th className="px-4 py-3 font-semibold">Email</th>
+                  <th className="px-4 py-3 font-semibold">Role</th>
+                  <th className="px-4 py-3 font-semibold">Sent</th>
+                  <th className="px-4 py-3 font-semibold">Expires</th>
+                  <th className="px-4 py-3 font-semibold text-right">Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {pendingInvites.map((inv) => {
+                  const expiresIn = Math.max(
+                    0,
+                    Math.floor((Date.parse(inv.expires_at) - Date.now()) / (24 * 3600 * 1000)),
+                  );
+                  const sentAgo = formatOnDutySince(inv.created_at);
+                  const isBusy = inviteActionId === inv.id;
+                  return (
+                    <tr key={inv.id} className="border-b border-amber-50 last:border-0">
+                      <td className="px-4 py-3 font-medium text-slate-900">{inv.email}</td>
+                      <td className="px-4 py-3">
+                        <span className="inline-flex items-center rounded-md bg-slate-100 text-slate-700 text-[11px] font-medium px-2 py-0.5">
+                          {ROLE_LABEL[inv.role] || inv.role}
+                        </span>
+                      </td>
+                      <td className="px-4 py-3 text-slate-600 text-xs">
+                        {sentAgo || "just now"} ago
+                      </td>
+                      <td className="px-4 py-3 text-xs">
+                        {expiresIn > 0 ? (
+                          <span className="text-slate-600">in {expiresIn}d</span>
+                        ) : (
+                          <span className="text-red-700 font-medium">today</span>
+                        )}
+                      </td>
+                      <td className="px-4 py-3 text-right whitespace-nowrap">
+                        <button
+                          type="button"
+                          onClick={() => handleResendInvite(inv)}
+                          disabled={isBusy}
+                          className="text-xs px-2.5 py-1 text-blue-700 hover:bg-blue-50 rounded-md disabled:opacity-50"
+                        >
+                          {isBusy ? <Loader2 className="w-3 h-3 animate-spin" /> : "Resend"}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleRevokeInvite(inv)}
+                          disabled={isBusy}
+                          className="text-xs px-2.5 py-1 text-red-600 hover:bg-red-50 rounded-md disabled:opacity-50 ml-1"
+                        >
+                          Revoke
+                        </button>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      ) : null}
 
       <div className="bg-white rounded-2xl border border-gray-200 overflow-hidden">
         {members === null ? (

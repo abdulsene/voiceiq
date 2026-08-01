@@ -58,6 +58,7 @@ import TeamPage from "./pages/Team/TeamPage";
 // Phase 3.3c: softphone as a first-class page.
 import PhonePage from "./pages/Phone";
 import ActivateAccount from "./pages/ActivateAccount";
+import AcceptInvite from "./pages/AcceptInvite";
 import SmsOptInPage from "./pages/SmsOptInPage";
 import VerifyEmail from "./pages/VerifyEmail";
 import ForgotPassword from "./pages/ForgotPassword";
@@ -824,6 +825,13 @@ function App() {
         <Route path="/mfa-setup" component={MfaSetup} />
         <Route path="/mfa-verify" component={MfaVerify} />
         <Route path="/activate" component={ActivateAccount} />
+        {/* Phase 3.17 — first-class business invite acceptance. Public,
+            outside AuthGuard. The token in the URL is the credential
+            AT REST but GET is side-effect free — a scanner prefetching
+            this route hits the SPA HTML + a read-only lookup endpoint,
+            no DB state changes. Acceptance requires the human to POST
+            from the form. See routes/team.ts Phase 3.17 header. */}
+        <Route path="/invite/:token" component={AcceptInvite} />
         {/* Sprint 2 STEP 4 / BUG-18: standalone verification page reached
             from the verify@neverr.ai email link. Sits OUTSIDE
             DashboardLayout so a logged-out user clicking the link still
