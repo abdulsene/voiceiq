@@ -218,6 +218,11 @@ const AUTH_BYPASS_PATTERNS = [
   /^\/api\/twilio\/outbound-voice\/status$/,
   /^\/api\/twilio\/outbound-voice\/voicemail$/,
   /^\/api\/business\/disclosure-audio\/[^/]+\/(staff|customer)$/,
+  // Phase 4.2 — disclosure-audio whisper wrapper. Twilio's <Number url>
+  // fetches this for TwiML when the callee answers, before bridging.
+  // Fixes the Phase 3.6 audit bug where <Number url> pointed at the
+  // raw audio endpoint (GET-only, returned audio/mpeg not TwiML).
+  /^\/api\/business\/disclosure-audio\/[^/]+\/(staff|customer)\/whisper$/,
   /^\/api\/auth\/google/,
   /^\/api\/auth\/microsoft/,
   /^\/api\/twilio\//,
@@ -1092,6 +1097,14 @@ app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), async
     res.status(400).json({ error: "Webhook signature verification failed" });
   }
 });
+
+// Phase 4.2 — ElevenLabs post-call webhook signature verification
+// requires the RAW request body. Attaching express.raw() BEFORE
+// express.json() means the handler at /api/webhook/elevenlabs sees
+// req.body as a Buffer we can HMAC directly. The handler is
+// responsible for JSON.parse() after the signature check passes.
+// Same pattern as the Stripe webhook above.
+app.use("/api/webhook/elevenlabs", express.raw({ type: "*/*", limit: "10mb" }));
 
 app.use(express.json({
   limit: "10mb",

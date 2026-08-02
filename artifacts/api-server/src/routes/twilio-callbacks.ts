@@ -134,7 +134,11 @@ router.post("/twilio/voice/lead-bridge", async (req: Request, res: Response) => 
 
     const recordingStatusUrl = `${publicBase()}/api/twilio/recording-status`;
     const staffDisclosureUrl = `${publicBase()}/api/business/disclosure-audio/${encodeURIComponent(businessId)}/staff`;
-    const customerDisclosureUrl = `${publicBase()}/api/business/disclosure-audio/${encodeURIComponent(businessId)}/customer`;
+    // Phase 4.2 — customer disclosure goes through the /whisper wrapper
+    // that returns TwiML with <Play> around the audio URL. Directly
+    // wiring the raw audio URL to <Number url> was the Phase 3.6 audit
+    // bug: <Number url> defaults to POST and expects TwiML, not MP3.
+    const customerDisclosureWhisperUrl = `${publicBase()}/api/business/disclosure-audio/${encodeURIComponent(businessId)}/customer/whisper`;
 
     // Mark the call in_progress so the dashboard polling reflects the
     // bridge phase before the bridge actually connects.
@@ -150,7 +154,7 @@ router.post("/twilio/voice/lead-bridge", async (req: Request, res: Response) => 
 <Response>
   <Play>${xmlEscape(staffDisclosureUrl)}</Play>
   <Dial answerOnBridge="true" callerId="${xmlEscape(callerId)}" record="record-from-ringing-dual" recordingStatusCallback="${xmlEscape(recordingStatusUrl)}" recordingStatusCallbackEvent="completed" recordingStatusCallbackMethod="POST">
-    <Number url="${xmlEscape(customerDisclosureUrl)}">${xmlEscape(customerPhone)}</Number>
+    <Number url="${xmlEscape(customerDisclosureWhisperUrl)}" method="POST">${xmlEscape(customerPhone)}</Number>
   </Dial>
 </Response>`;
     res.type("text/xml").send(twiml);
@@ -460,5 +464,60 @@ router.get("/business/disclosure-audio/:businessId/:leg", async (req: Request, r
     res.status(500).json({ error: "TTS failed" });
   }
 });
+
+// ── /api/business/disclosure-audio/:businessId/:leg/whisper ───────────
+//
+// Phase 4.2 fix for the Phase 3.6 audit bug.
+//
+// The bug: twilio-callbacks.ts:153 used the raw disclosure-audio URL
+// as the value of `<Number url="...">`. Twilio's `<Number url>` is a
+// TwiML-fetch attribute (fires when the callee answers, expects
+// TwiML to <Play>/say to them BEFORE bridging), and it defaults to
+// POST. The old wiring failed in two compounding ways:
+//   (a) The audio route was GET-only; Twilio's POST 404'd.
+//   (b) Even if POST were accepted, the route returned audio/mpeg;
+//       Twilio would fail to parse audio as XML and error the call.
+//
+// The fix: this endpoint returns TwiML that wraps <Play> around the
+// audio URL. Same pattern as the whisper endpoint in routing.ts
+// (Phase 3.5–3.6). Accepts BOTH GET and POST so a Twilio default-verb
+// change can never resurface the 3.6 verb-surprise.
+//
+// Nothing here mutates DB state, so `router.route().get().post()`
+// with the same handler is safe. Same public / auth-bypass posture
+// as the audio endpoint.
+router
+  .route("/business/disclosure-audio/:businessId/:leg/whisper")
+  .get(disclosureWhisperHandler)
+  .post(disclosureWhisperHandler);
+
+async function disclosureWhisperHandler(req: Request, res: Response): Promise<void> {
+  const businessId = String(req.params.businessId);
+  const leg = String(req.params.leg) as DisclosureLeg;
+  if (leg !== "staff" && leg !== "customer") {
+    // Return TwiML even for the error case so Twilio doesn't error
+    // the call — no disclosure but at least the bridge proceeds.
+    res.status(400).type("text/xml").send('<?xml version="1.0" encoding="UTF-8"?><Response/>');
+    return;
+  }
+  // We do NOT re-verify the business exists here — the audio
+  // endpoint will 404 on invalid id when Twilio fetches it, and
+  // that failure is already Sentry-logged. Cheaper to skip the
+  // extra DB hit on this per-call path.
+  const audioPath = `/api/business/disclosure-audio/${encodeURIComponent(businessId)}/${leg}`;
+  const audioUrl = `${publicBase()}${audioPath}`;
+  // Escape < & > " ' in the URL (safety even though we control the
+  // shape). Same escape logic as the whisper builder in dial-builder.ts.
+  const escaped = audioUrl
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
+  res
+    .status(200)
+    .type("text/xml")
+    .send(`<?xml version="1.0" encoding="UTF-8"?><Response><Play>${escaped}</Play></Response>`);
+}
 
 export default router;

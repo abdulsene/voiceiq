@@ -27,6 +27,11 @@ import { auditLog, extractRequestMeta } from "../middlewares/audit";
 // rationale and the deferred business_configs.pii_handling decision.
 import { redactCallTranscript } from "../lib/pii-redact-transcript.js";
 import { ipRateLimit, tryAcquireLock, releaseLock, costlyLimiter } from "../rateLimiter";
+// Phase 4.2 — ElevenLabs post-call webhook signature verification.
+// Prior to this the endpoint was public + bypass-listed AND
+// unauthenticated, so anyone who guessed the URL could POST fake
+// transcripts against any tenant. See lib/elevenlabs-signature.ts.
+import { verifyElevenLabsSignature } from "../lib/elevenlabs-signature";
 
 // Sprint 3 Stage 3: prompt rendering machinery was extracted to
 // src/lib/prompt-renderer.ts. We re-export buildSystemPrompt as a
@@ -748,7 +753,55 @@ router.post("/lead", async (req: Request, res: Response) => {
 
 router.post("/webhook/elevenlabs", async (req: Request, res: Response) => {
   try {
-    const payload = req.body;
+    // Phase 4.2 — signature verification FIRST, before touching any DB
+    // or Claude call. req.body arrives as a Buffer here because
+    // app.ts mounts express.raw() for this specific path BEFORE
+    // express.json(). Do NOT read req.body.type until after we've
+    // parsed the JSON below — until then it's raw bytes.
+    const rawBody: Buffer = Buffer.isBuffer(req.body)
+      ? req.body
+      : Buffer.from(typeof req.body === "string" ? req.body : JSON.stringify(req.body ?? {}), "utf8");
+    const sigHeader = req.headers["elevenlabs-signature"] as string | undefined;
+    const secret = process.env.ELEVENLABS_WEBHOOK_SECRET;
+    const verify = verifyElevenLabsSignature({
+      rawBody,
+      signatureHeader: sigHeader,
+      secret,
+    });
+    if (!verify.ok) {
+      // Retry semantics: ElevenLabs does NOT retry 4xx per their
+      // published behaviour (5xx retried, 4xx treated as terminal
+      // config errors). Returning 401 here is the correct choice:
+      // no retry storms, and the intruder gets no signal about
+      // WHICH check failed (all failure modes → same 401 body).
+      Sentry.captureMessage("elevenlabs_webhook_signature_rejected", {
+        level: "warning",
+        extra: {
+          reason: verify.reason,
+          has_header: !!sigHeader,
+          has_secret: !!secret,
+          body_bytes: rawBody.length,
+        },
+      });
+      console.warn(
+        `[Webhook] ElevenLabs signature verification failed (reason=${verify.reason}); rejecting`,
+      );
+      res.status(401).json({ error: "signature verification failed" });
+      return;
+    }
+
+    // Signature OK — safe to parse.
+    let payload: any;
+    try {
+      payload = rawBody.length === 0 ? {} : JSON.parse(rawBody.toString("utf8"));
+    } catch (e: any) {
+      // A valid signature over unparseable JSON is a shape bug on
+      // ElevenLabs' end. 400 (not 500) so they don't retry.
+      Sentry.captureException(e, { extra: { where: "elevenlabs_webhook_body_parse", body_bytes: rawBody.length } });
+      res.status(400).json({ error: "malformed JSON body" });
+      return;
+    }
+
     console.log("[Webhook] ElevenLabs call received:", payload?.data?.conversation_id);
 
     if (payload?.type !== "post_call_transcription") {
