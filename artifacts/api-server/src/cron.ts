@@ -229,6 +229,89 @@ export async function runScheduledRetention(): Promise<{
   return summary;
 }
 
+// ===== Phase 4.5: analysis coverage watchdog =====
+//
+// The prior analysis job silently stopped for seven weeks and nobody
+// noticed because every failure was swallowed as return-null. Fixed
+// upstream (lib/call-analysis.ts + api.ts runAnalysisForCall now
+// Sentry-log every failure), but a single-request log is easy to
+// miss too. This watchdog is the belt-and-suspenders: every 6h,
+// compute the analysis coverage rate over the last 24h and page
+// Sentry if it drops below threshold.
+//
+// Threshold: 60%. The 40% headroom absorbs 0-duration hangups (no
+// transcript to analyze), empty-transcript edge cases, and the
+// occasional API blip. Below 60% for 24h is a real regression.
+//
+// Runs 24h after boot (first tick), then every 6h. This gives new
+// tenants time to accumulate enough calls for the rate to be
+// statistically meaningful before we start alerting.
+export function scheduleAnalysisCoverageWatchdog() {
+  const SIX_HOURS_MS = 6 * 60 * 60 * 1000;
+  const FIRST_RUN_DELAY_MS = 24 * 60 * 60 * 1000; // 24h post-boot
+  const MIN_CALLS = 5;        // don't alert on tiny samples
+  const MIN_COVERAGE = 0.60;  // 60% threshold
+
+  async function tick() {
+    try {
+      const supa = getSupabase();
+      if (!supa) return;
+      const sinceIso = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+      // Only count calls that actually had a transcript worth
+      // analyzing. 0-duration and empty-transcript rows are excluded
+      // so a spike of hangups can't fake a coverage dip.
+      const { data, error } = await supa
+        .from("calls")
+        .select("id, sentiment, transcript, business_id")
+        .neq("business_id", "demo-business")
+        .not("transcript", "is", null)
+        .gte("created_at", sinceIso);
+      if (error) {
+        console.error("[AnalysisCoverage] query failed:", error.message);
+        return;
+      }
+      const rows = ((data ?? []) as Array<{ transcript: string | null; sentiment: string | null; business_id: string; id: string }>)
+        .filter((r) => (r.transcript ?? "").trim().length > 0)
+        .filter((r) => r.business_id !== "demo-business");
+      const total = rows.length;
+      if (total < MIN_CALLS) {
+        console.log(`[AnalysisCoverage] 24h sample too small (${total} < ${MIN_CALLS}) — skipping alert check`);
+        return;
+      }
+      const analyzed = rows.filter((r) => r.sentiment !== null && r.sentiment !== "").length;
+      const rate = analyzed / total;
+      console.log(`[AnalysisCoverage] 24h: ${analyzed}/${total} = ${(rate * 100).toFixed(0)}% (threshold ${(MIN_COVERAGE * 100).toFixed(0)}%)`);
+      if (rate < MIN_COVERAGE) {
+        Sentry.captureMessage("analysis_coverage_below_threshold", {
+          level: "warning",
+          extra: {
+            window_hours: 24,
+            total_calls_with_transcript: total,
+            analyzed_calls: analyzed,
+            coverage_rate: Number(rate.toFixed(3)),
+            threshold: MIN_COVERAGE,
+            // First 5 IDs so ops can hand-inspect what's failing.
+            sample_unanalyzed_ids: rows
+              .filter((r) => !r.sentiment)
+              .slice(0, 5)
+              .map((r) => r.id),
+          },
+        });
+      }
+    } catch (err: any) {
+      Sentry.captureException(err, { extra: { where: "scheduleAnalysisCoverageWatchdog.tick" } });
+      console.error("[AnalysisCoverage] tick failed:", err?.message ?? err);
+    }
+  }
+
+  setTimeout(() => {
+    void tick();
+    setInterval(() => void tick(), SIX_HOURS_MS);
+  }, FIRST_RUN_DELAY_MS);
+
+  console.log(`[AnalysisCoverage] Watchdog registered (every 6h, first check in ${FIRST_RUN_DELAY_MS / 3600000}h; threshold ${MIN_COVERAGE * 100}% coverage of transcripted calls in a 24h window)`);
+}
+
 export function scheduleRetentionCron() {
   // Match scheduleBriefings()'s setTimeout+setInterval pattern.
   // First run: 60s after boot (lets app finish init + handle traffic spikes).

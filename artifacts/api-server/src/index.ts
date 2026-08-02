@@ -28,6 +28,7 @@ import {
   scheduleRetentionCron,
   scheduleOutboundCallWorker,
   scheduleCampaignExpansionWorker,
+  scheduleAnalysisCoverageWatchdog,
 } from "./cron";
 import { runReconciliation } from "./lib/twilio-reconciliation";
 import { assertVoiceEnvOrThrow } from "./routes/voice";
@@ -121,6 +122,7 @@ app.listen(port, () => {
   scheduleRetentionCron();
   scheduleOutboundCallWorker();
   scheduleCampaignExpansionWorker();
+  scheduleAnalysisCoverageWatchdog();
   // Fire-and-forget — scheduleTwilioReconciliation logs internally
   // and never throws to the caller.
   scheduleTwilioReconciliation().catch((err) => {

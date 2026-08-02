@@ -32,6 +32,17 @@ import { ipRateLimit, tryAcquireLock, releaseLock, costlyLimiter } from "../rate
 // unauthenticated, so anyone who guessed the URL could POST fake
 // transcripts against any tenant. See lib/elevenlabs-signature.ts.
 import { verifyElevenLabsSignature } from "../lib/elevenlabs-signature";
+// Phase 4.5 — post-call analysis rebuilt. The prior inline
+// analyzeWithClaude pointed at a deprecated model and swallowed
+// every failure; 7 weeks of sentiment/summary/intent coverage went
+// silently to zero. New lib fails LOUD and populates the extended
+// schema (sentiment_score, dominant_emotion, emotion_journey,
+// urgency, satisfaction_inferred). See lib/call-analysis.ts.
+import {
+  analyzeCallTranscript,
+  getAnalysisModel,
+  type CallAnalysis,
+} from "../lib/call-analysis";
 
 // Sprint 3 Stage 3: prompt rendering machinery was extracted to
 // src/lib/prompt-renderer.ts. We re-export buildSystemPrompt as a
@@ -164,46 +175,43 @@ async function resolveBusinessFromAgentId(
   }
 }
 
-async function analyzeWithClaude(transcript: string, businessId: string) {
-  try {
-    const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-    const response = await anthropic.messages.create({
-      model: "claude-sonnet-4-20250514",
-      max_tokens: 1024,
-      messages: [
-        {
-          role: "user",
-          content: `Analyze the following phone call transcript for the business "${businessId}".
+/**
+ * Phase 4.5 — run + persist analysis for one call. Loud on failure.
+ *
+ * Each callsite wraps this in a try/catch that Sentry-logs the
+ * error with call context; NEVER swallow. The prior implementation
+ * did `catch { return null }` which is exactly how 7 weeks of
+ * missing analysis went unnoticed. Any change to this contract
+ * MUST preserve loud failure.
+ *
+ * Returns:
+ *   { ok: true, analysis } — persisted + downstream side-effects done
+ *   throws                 — API failure, JSON parse failure, or DB write failure
+ */
+async function runAnalysisForCall(
+  supabase: any,
+  callId: string,
+  transcript: string,
+  businessId: string,
+): Promise<{ ok: true; analysis: CallAnalysis }> {
+  const t0 = Date.now();
+  const { analysis, coercions, model } = await analyzeCallTranscript(transcript, businessId);
+  const elapsedMs = Date.now() - t0;
 
-Transcript:
-${transcript}
-
-Return a JSON object with the following fields:
-- summary: A brief summary of the call
-- callerName: The caller's name if mentioned, otherwise "Unknown"
-- callerIntent: What the caller wanted
-- sentiment: The overall sentiment (positive, neutral, negative)
-- actionItems: An array of action items, each with "task" (string), "priority" (high/medium/low), and "assignTo" (string or null)
-- followUpRequired: Boolean indicating if follow-up is needed
-- callOutcome: The outcome of the call (resolved, transferred, voicemail, callback_requested, unresolved)
-
-Return ONLY valid JSON, no other text.`,
-        },
-      ],
+  console.log(
+    `[Analysis] callId=${callId} businessId=${businessId} model=${model} elapsed_ms=${elapsedMs} coercions=${coercions.length}`,
+  );
+  if (coercions.length > 0) {
+    // Coercions are recoverable (analysis is safe to persist) but
+    // signal a prompt/model drift we want visibility on.
+    Sentry.addBreadcrumb({
+      category: "call.analysis",
+      level: "warning",
+      message: "analysis_output_coerced",
+      data: { callId, businessId, coercions: coercions.slice(0, 5) },
     });
-
-    let text = (response.content[0] as any).text.trim();
-    if (text.startsWith("```")) {
-      text = text.replace(/^```(?:json)?\s*/, "").replace(/\s*```$/, "");
-    }
-    return JSON.parse(text);
-  } catch (err) {
-    console.error("[Claude] Failed to analyze call:", err);
-    return null;
   }
-}
 
-async function saveAnalysis(supabase: any, callId: string, analysis: any, businessId?: string) {
   const { error: updateError } = await supabase
     .from("calls")
     .update({
@@ -211,78 +219,120 @@ async function saveAnalysis(supabase: any, callId: string, analysis: any, busine
       caller_name: analysis.callerName,
       caller_intent: analysis.callerIntent,
       sentiment: analysis.sentiment,
+      sentiment_score: analysis.sentimentScore,
+      dominant_emotion: analysis.dominantEmotion,
+      emotion_journey: analysis.emotionJourney,
+      urgency: analysis.urgency,
+      // MACHINE column ONLY — never touch satisfaction_rating (that's
+      // reserved for surveyed ground truth). See migration 048 header
+      // and Phase 3.12's call_outcome vs disposition discipline.
+      satisfaction_inferred: analysis.satisfactionInferred,
       call_outcome: analysis.callOutcome,
       follow_up_required: analysis.followUpRequired,
     })
     .eq("id", callId);
 
   if (updateError) {
-    console.error("[API] Error saving call analysis:", updateError);
-    return;
+    // DB write failure surfaces to caller as a thrown error so the
+    // Sentry.captureException at the callsite fires with call context.
+    throw new Error(`saveAnalysis update failed for callId=${callId}: ${updateError.message}`);
   }
 
+  await persistActionItemsAndSideEffects(supabase, callId, analysis, businessId);
+
+  return { ok: true, analysis };
+}
+
+/**
+ * Action-item insert + webhook fire + email trigger + sequence
+ * enrollment. Extracted from the old inline saveAnalysis body so
+ * runAnalysisForCall's control flow stays legible. Non-fatal —
+ * failures here are logged but do NOT roll back the analysis write
+ * (transcript + summary + sentiment persisted regardless).
+ */
+async function persistActionItemsAndSideEffects(
+  supabase: any,
+  callId: string,
+  analysis: CallAnalysis,
+  businessId: string | undefined,
+): Promise<void> {
   const actionItemTasks: string[] = [];
 
   if (analysis.actionItems && analysis.actionItems.length > 0) {
-    const rows = analysis.actionItems
-      .filter((item: any) => item && (item.task || item.description))
-      .map((item: any) => {
-        const task = item.task || item.description || "Follow up required";
-        actionItemTasks.push(task);
-        return {
-          call_id: callId,
-          task,
-          priority: item.priority || "medium",
-          assign_to: item.assignTo || item.assign_to || null,
-          status: "open",
-        };
-      });
-
+    const rows = analysis.actionItems.map((item) => {
+      actionItemTasks.push(item.task);
+      return {
+        call_id: callId,
+        task: item.task,
+        priority: item.priority,
+        assign_to: item.assignTo,
+        status: "open",
+      };
+    });
     if (rows.length > 0) {
       const { error } = await supabase.from("action_items").insert(rows);
-      if (error) console.error("[API] Error saving action items:", error);
+      if (error) console.error("[Analysis] action_items insert failed:", error.message);
     }
   }
 
-  if (businessId) {
-    triggerCallSummaryEmail(supabase, callId, businessId, analysis, actionItemTasks).catch(
-      (err) => console.error("[Email] Notification failed:", err.message)
-    );
+  if (!businessId) return;
 
-    const { data: callRow } = await supabase
-      .from("calls")
-      .select("caller_number, caller_name, duration_seconds, call_outcome, start_time, language")
-      .eq("id", callId)
-      .single();
+  // Kept as the old triggerCallSummaryEmail signature so the email
+  // template + payload shape don't change. Non-fatal.
+  triggerCallSummaryEmail(supabase, callId, businessId, analysis, actionItemTasks).catch(
+    (err) => console.error("[Email] Notification failed:", err.message),
+  );
 
-    if (callRow) {
-      const sentiment = analysis.sentiment || "neutral";
-      let ls: "hot" | "warm" | "cold" = "cold";
-      if (analysis.followUpRequired || sentiment === "positive") ls = "warm";
-      if (analysis.callOutcome === "appointment_booked" || (analysis.followUpRequired && sentiment === "positive")) ls = "hot";
+  const { data: callRow } = await supabase
+    .from("calls")
+    .select("caller_number, caller_name, duration_seconds, call_outcome, start_time, language")
+    .eq("id", callId)
+    .single();
 
-      const webhookCallData = {
-        id: callId,
-        caller_phone: callRow.caller_number || "unknown",
-        caller_name: callRow.caller_name || analysis.callerName || "Unknown",
-        duration_seconds: callRow.duration_seconds || 0,
-        summary: analysis.summary || "",
-        lead_score: ls,
-        appointment_booked: analysis.callOutcome === "appointment_booked",
-        language: callRow.language || "en",
-        transcript_url: `https://neverr.ai/calls/${callId}`,
-      };
+  if (!callRow) return;
 
-      fireWebhook(businessId, "call.completed", webhookCallData).catch(() => {});
-      if (ls === "hot") fireWebhook(businessId, "lead.hot", webhookCallData).catch(() => {});
-      if (analysis.callOutcome === "appointment_booked") fireWebhook(businessId, "appointment.booked", webhookCallData).catch(() => {});
+  const sentiment = analysis.sentiment;
+  let ls: "hot" | "warm" | "cold" = "cold";
+  if (analysis.followUpRequired || sentiment === "positive") ls = "warm";
+  if (analysis.callOutcome === "appointment_booked" || (analysis.followUpRequired && sentiment === "positive")) ls = "hot";
 
-      enrollInSequences(businessId, callRow.caller_number, analysis.callOutcome || "", ls).catch(
-        (err) => console.error("[Sequences] Enrollment failed:", err.message)
-      );
-    }
-  }
+  const webhookCallData = {
+    id: callId,
+    caller_phone: callRow.caller_number || "unknown",
+    caller_name: callRow.caller_name || analysis.callerName || "Unknown",
+    duration_seconds: callRow.duration_seconds || 0,
+    summary: analysis.summary || "",
+    lead_score: ls,
+    appointment_booked: analysis.callOutcome === "appointment_booked",
+    language: callRow.language || "en",
+    transcript_url: `https://neverr.ai/calls/${callId}`,
+  };
+
+  fireWebhook(businessId, "call.completed", webhookCallData).catch(() => {});
+  if (ls === "hot") fireWebhook(businessId, "lead.hot", webhookCallData).catch(() => {});
+  if (analysis.callOutcome === "appointment_booked") fireWebhook(businessId, "appointment.booked", webhookCallData).catch(() => {});
+
+  enrollInSequences(businessId, callRow.caller_number, analysis.callOutcome || "", ls).catch(
+    (err) => console.error("[Sequences] Enrollment failed:", err.message),
+  );
 }
+
+/**
+ * DEPRECATED — pre-4.5 signatures. Kept as unused stubs so anything
+ * importing them from api.ts (there are no such imports today, but
+ * defensive) fails loudly at call time rather than at import time.
+ * Delete once the codebase is verified clean.
+ */
+async function analyzeWithClaude(_transcript: string, _businessId: string): Promise<null> {
+  throw new Error("analyzeWithClaude is deprecated in Phase 4.5 — use analyzeCallTranscript from lib/call-analysis.ts");
+}
+async function saveAnalysis(_supabase: any, _callId: string, _analysis: any, _businessId?: string): Promise<void> {
+  throw new Error("saveAnalysis is deprecated in Phase 4.5 — use runAnalysisForCall (this file)");
+}
+
+// Silence "declared but never used" — the stubs are intentional guards.
+void analyzeWithClaude;
+void saveAnalysis;
 
 async function triggerCallSummaryEmail(
   supabase: any,
@@ -603,9 +653,22 @@ router.post("/lead", async (req: Request, res: Response) => {
       trackCallUsage(businessId, duration);
 
       if (transcriptText && savedId) {
-        analyzeWithClaude(transcriptText, businessId)
-          .then((a) => { if (a && supabase) saveAnalysis(supabase, savedId!, a, businessId); })
-          .catch((err) => console.error("[Lead] Claude error:", err));
+        // Phase 4.5 — LOUD failure. Prior code did .catch(console.error) which
+        // is exactly how 7 weeks of missing analysis went unnoticed. Sentry
+        // captures with call context; retry is via the polling sync fallback
+        // (transcript stays; next successful run picks it up).
+        runAnalysisForCall(supabase, savedId, transcriptText, businessId).catch((err: any) => {
+          Sentry.captureException(err, {
+            tags: { where: "runAnalysisForCall", source: "lead_post_call" },
+            extra: {
+              callId: savedId,
+              businessId,
+              transcript_len: transcriptText.length,
+              model: getAnalysisModel(),
+            },
+          });
+          console.error("[Analysis] failed callId=" + savedId + " err=" + (err?.message ?? err));
+        });
       }
 
       res.json({ success: true, callId: savedId });
@@ -893,14 +956,20 @@ router.post("/webhook/elevenlabs", async (req: Request, res: Response) => {
 
     if (transcriptText && savedId) {
       const id = savedId;
-      analyzeWithClaude(transcriptText, businessId)
-        .then((analysis) => {
-          if (analysis && supabase) {
-            saveAnalysis(supabase, id, analysis, businessId);
-            console.log("[Webhook] Claude analysis saved for call:", id);
-          }
-        })
-        .catch((err) => console.error("[Webhook] Claude analysis error:", err));
+      // Phase 4.5 — LOUD failure. See runAnalysisForCall's file
+      // header on why silent-null was banned.
+      runAnalysisForCall(supabase, id, transcriptText, businessId).catch((err: any) => {
+        Sentry.captureException(err, {
+          tags: { where: "runAnalysisForCall", source: "elevenlabs_webhook" },
+          extra: {
+            callId: id,
+            businessId,
+            transcript_len: transcriptText.length,
+            model: getAnalysisModel(),
+          },
+        });
+        console.error("[Analysis] failed callId=" + id + " err=" + (err?.message ?? err));
+      });
     }
 
     res.json({ received: true, callId: savedId });
@@ -1043,10 +1112,24 @@ async function syncElevenLabsConversations() {
         trackCallUsage(businessId, duration || 0);
 
         if (transcriptText && saved.id) {
-          const analysis = await analyzeWithClaude(transcriptText, businessId);
-          if (analysis) {
-            await saveAnalysis(supabase, saved.id, analysis, businessId);
-            console.log("[Sync] Claude analysis saved for:", saved.id);
+          // Phase 4.5 — LOUD failure. Sync runs every 2 min so a
+          // failure here means the NEXT tick will try again; no
+          // permanent data loss unless the model is truly down.
+          try {
+            await runAnalysisForCall(supabase, saved.id, transcriptText, businessId);
+            console.log("[Sync] Analysis saved for:", saved.id);
+          } catch (analyzeErr: any) {
+            Sentry.captureException(analyzeErr, {
+              tags: { where: "runAnalysisForCall", source: "polling_sync" },
+              extra: {
+                callId: saved.id,
+                businessId,
+                conversationId: conv.conversation_id,
+                transcript_len: transcriptText.length,
+                model: getAnalysisModel(),
+              },
+            });
+            console.error("[Analysis] sync failed callId=" + saved.id + " err=" + (analyzeErr?.message ?? analyzeErr));
           }
         }
       } catch (err: any) {
