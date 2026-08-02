@@ -260,9 +260,15 @@ export function scheduleAnalysisCoverageWatchdog() {
       // Only count calls that actually had a transcript worth
       // analyzing. 0-duration and empty-transcript rows are excluded
       // so a spike of hangups can't fake a coverage dip.
+      //
+      // Phase 4.6 — pull analyzed_at + analysis_skipped_reason too.
+      // Rows that were intentionally skipped by the gate (thin
+      // transcripts) MUST NOT count against coverage — they were
+      // "correctly handled" and paging ops for them would be noise.
+      // The coverage denominator now excludes analyzer-skipped rows.
       const { data, error } = await supa
         .from("calls")
-        .select("id, sentiment, transcript, business_id")
+        .select("id, sentiment, transcript, business_id, analyzed_at, analysis_skipped_reason")
         .neq("business_id", "demo-business")
         .not("transcript", "is", null)
         .gte("created_at", sinceIso);
@@ -270,14 +276,31 @@ export function scheduleAnalysisCoverageWatchdog() {
         console.error("[AnalysisCoverage] query failed:", error.message);
         return;
       }
-      const rows = ((data ?? []) as Array<{ transcript: string | null; sentiment: string | null; business_id: string; id: string }>)
+      type Row = {
+        transcript: string | null;
+        sentiment: string | null;
+        business_id: string;
+        id: string;
+        analyzed_at: string | null;
+        analysis_skipped_reason: string | null;
+      };
+      const rowsWithTranscript = ((data ?? []) as Row[])
         .filter((r) => (r.transcript ?? "").trim().length > 0)
         .filter((r) => r.business_id !== "demo-business");
+      // Exclude gate-skipped rows from BOTH numerator and denominator.
+      // A row where the gate said "too_short" was correctly handled;
+      // dragging coverage below threshold for skipped rows would fire
+      // false alarms for a normal Monday-morning hangup spike.
+      const rows = rowsWithTranscript.filter((r) => !r.analysis_skipped_reason);
       const total = rows.length;
       if (total < MIN_CALLS) {
-        console.log(`[AnalysisCoverage] 24h sample too small (${total} < ${MIN_CALLS}) — skipping alert check`);
+        console.log(`[AnalysisCoverage] 24h sample too small (${total} < ${MIN_CALLS} eligible — total_with_tx=${rowsWithTranscript.length}, gate_skips=${rowsWithTranscript.length - total}) — skipping alert check`);
         return;
       }
+      // A row is "analyzed" when analyzed_at is set AND either the
+      // model produced a sentiment OR the skip check ran. Since we
+      // already excluded skip rows above, sentiment-set IS the
+      // completion signal.
       const analyzed = rows.filter((r) => r.sentiment !== null && r.sentiment !== "").length;
       const rate = analyzed / total;
       console.log(`[AnalysisCoverage] 24h: ${analyzed}/${total} = ${(rate * 100).toFixed(0)}% (threshold ${(MIN_COVERAGE * 100).toFixed(0)}%)`);

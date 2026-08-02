@@ -355,3 +355,63 @@ export async function analyzeCallTranscript(
 export function getAnalysisModel(): string {
   return ANALYSIS_MODEL;
 }
+
+// ── Phase 4.6: minimum viable transcript gate ────────────────────────
+
+/**
+ * Reason for skipping analysis. Kept as string literal union so both
+ * the DB column (CHECK constraint values 'empty' | 'too_short') and
+ * the code refer to the same vocabulary. See migration 049.
+ */
+export const SKIP_REASONS = ["empty", "too_short"] as const;
+export type SkipReason = (typeof SKIP_REASONS)[number];
+
+/**
+ * Minimum caller turns required to run analysis.
+ *
+ * Chosen from the length distribution over 33 real prod inbound
+ * calls in production (Phase 4.6 audit):
+ *   0 caller turns: 18 rows (54%) — hangups
+ *   1 caller turn:   3 rows        — one utterance then hangup
+ *   2+ caller turns: 12 rows       — actual conversations
+ *
+ * 2 is the natural cliff. Below 2 the model has no exchange to
+ * reason about and Haiku falls back to mid-scale defaults
+ * (sentiment=neutral, sentiment_score=3, dominant_emotion=indifferent,
+ * satisfaction_inferred=3). Those fabricated defaults are what
+ * inflated the aggregate satisfaction average from 2.43 to 2.72 in
+ * the Phase 4.5 backfill. Never again.
+ */
+export const MIN_CALLER_TURNS = 2;
+
+/**
+ * Detect caller turns in a transcript, tolerant of both known
+ * production formats:
+ *   "Caller: ..."    — the format written by api.ts:788 (ElevenLabs
+ *                      post-call webhook mapper)
+ *   "[caller]: ..."  — the ElevenLabs streaming format sometimes
+ *                      captured when the connection drops mid-call
+ *
+ * Case-insensitive. Whole-line prefix required (^ anchor) so
+ * "the Caller: X" inside a message body doesn't false-match.
+ */
+const CALLER_TURN_RE = /^(?:caller|\[caller\]):/gim;
+
+export function countCallerTurns(transcript: string): number {
+  return (transcript.match(CALLER_TURN_RE) ?? []).length;
+}
+
+/**
+ * Should this transcript be analyzed? Returns the skip reason if
+ * it should NOT be, or null if analysis should proceed.
+ *
+ * MUST be called by both the live analyzer (runAnalysisForCall in
+ * routes/api.ts) AND the backfill script before invoking Haiku.
+ * Calling one without the other is the exact regression this
+ * function exists to prevent.
+ */
+export function shouldSkipAnalysis(transcript: string | null | undefined): SkipReason | null {
+  if (!transcript || transcript.trim().length === 0) return "empty";
+  if (countCallerTurns(transcript) < MIN_CALLER_TURNS) return "too_short";
+  return null;
+}

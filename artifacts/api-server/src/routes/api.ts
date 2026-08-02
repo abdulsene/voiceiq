@@ -41,6 +41,7 @@ import { verifyElevenLabsSignature } from "../lib/elevenlabs-signature";
 import {
   analyzeCallTranscript,
   getAnalysisModel,
+  shouldSkipAnalysis,
   type CallAnalysis,
 } from "../lib/call-analysis";
 
@@ -193,7 +194,37 @@ async function runAnalysisForCall(
   callId: string,
   transcript: string,
   businessId: string,
-): Promise<{ ok: true; analysis: CallAnalysis }> {
+): Promise<{ ok: true; analysis: CallAnalysis } | { ok: true; skipped: true; reason: "empty" | "too_short" }> {
+  // Phase 4.6 — gate BEFORE model call. If the transcript is empty
+  // or below the caller-turns threshold, do not burn a model call
+  // that will just fabricate mid-scale defaults. Write analyzed_at
+  // + analysis_skipped_reason and NULL any analysis fields (defensive
+  // — should already be NULL, but idempotent under re-processing).
+  const skipReason = shouldSkipAnalysis(transcript);
+  if (skipReason) {
+    const { error: skipErr } = await supabase
+      .from("calls")
+      .update({
+        analyzed_at: new Date().toISOString(),
+        analysis_skipped_reason: skipReason,
+        // Defensive NULLing in case a prior run polluted the row.
+        sentiment: null,
+        sentiment_score: null,
+        dominant_emotion: null,
+        emotion_journey: null,
+        urgency: null,
+        satisfaction_inferred: null,
+      })
+      .eq("id", callId);
+    if (skipErr) {
+      throw new Error(`runAnalysisForCall skip-write failed callId=${callId}: ${skipErr.message}`);
+    }
+    console.log(
+      `[Analysis] SKIP callId=${callId} businessId=${businessId} reason=${skipReason} transcript_len=${transcript?.length ?? 0}`,
+    );
+    return { ok: true, skipped: true, reason: skipReason };
+  }
+
   const t0 = Date.now();
   const { analysis, coercions, model } = await analyzeCallTranscript(transcript, businessId);
   const elapsedMs = Date.now() - t0;
@@ -229,6 +260,10 @@ async function runAnalysisForCall(
       satisfaction_inferred: analysis.satisfactionInferred,
       call_outcome: analysis.callOutcome,
       follow_up_required: analysis.followUpRequired,
+      // Phase 4.6 — stamp analyzed_at + clear any prior skip marker.
+      // This is the idempotency signal the backfill predicate keys on.
+      analyzed_at: new Date().toISOString(),
+      analysis_skipped_reason: null,
     })
     .eq("id", callId);
 
