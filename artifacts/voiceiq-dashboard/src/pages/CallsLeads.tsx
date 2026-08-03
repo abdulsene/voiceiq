@@ -1,6 +1,8 @@
 import { useEffect, useState, useMemo } from "react";
-import { getRecentCalls, getCoachingForCall } from "../lib/api";
+import { useLocation } from "wouter";
+import { getRecentCalls } from "../lib/api";
 import { useLocation as useLocationCtx } from "../components/LocationContext";
+import { DirectionFilter, useDirectionFilter, matchesDirection } from "../components/DirectionFilter";
 import {
   Search,
   Phone,
@@ -65,8 +67,9 @@ export default function CallsLeads() {
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState("all");
-  const [selectedCall, setSelectedCall] = useState<any>(null);
-  const [coachingData, setCoachingData] = useState<any>(null);
+  // Phase 4.4 — direction filter shared with other list surfaces.
+  const [directionFilter, setDirectionFilter] = useDirectionFilter("calls_leads_list");
+  const [, navigate] = useLocation();
 
   const locParam = selectedLocationId === "all" ? undefined : selectedLocationId;
 
@@ -90,8 +93,9 @@ export default function CallsLeads() {
     if (statusFilter !== "all") {
       result = result.filter((c: any) => c.status === statusFilter);
     }
+    result = result.filter((c: any) => matchesDirection(directionFilter, c.direction));
     setFiltered(result);
-  }, [search, statusFilter, calls]);
+  }, [search, statusFilter, directionFilter, calls]);
 
   const scoreSummary = useMemo(() => {
     let hot = 0, warm = 0, cold = 0;
@@ -170,6 +174,8 @@ export default function CallsLeads() {
               </button>
             ))}
           </div>
+          {/* Phase 4.4 — shared direction filter. */}
+          <DirectionFilter value={directionFilter} onChange={setDirectionFilter} size="md" />
         </div>
 
         <div className="overflow-x-auto">
@@ -197,16 +203,10 @@ export default function CallsLeads() {
               ) : (
                 filtered.map((call: any) => {
                   const score = calcScore(call);
+                  // Phase 4.4 — row navigates to canonical detail
+                  // page instead of opening a local modal.
                   return (
-                    <tr key={call.id} className="hover:bg-gray-50 cursor-pointer" onClick={() => {
-                      setSelectedCall(call);
-                      setCoachingData(null);
-                      if (call.call_sid) {
-                        getCoachingForCall(call.call_sid).then(d => {
-                          if (d.coached) setCoachingData(d);
-                        }).catch(() => {});
-                      }
-                    }}>
+                    <tr key={call.id} className="hover:bg-gray-50 cursor-pointer" onClick={() => navigate(`/calls/${call.id}`)}>
                       <td className="px-5 py-3">
                         <div className="flex items-center gap-2">
                           <div className="w-8 h-8 rounded-full bg-gray-100 flex items-center justify-center">
@@ -255,67 +255,10 @@ export default function CallsLeads() {
         </div>
       </div>
 
-      {selectedCall && (
-        <div className="fixed inset-0 bg-black/40 z-50 flex items-center justify-center p-4" onClick={() => setSelectedCall(null)}>
-          <div className="bg-white rounded-2xl w-full max-w-lg max-h-[80vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
-            <div className="p-6 border-b border-gray-100 flex items-center justify-between">
-              <h3 className="font-semibold text-lg">Call Details</h3>
-              <button onClick={() => setSelectedCall(null)}><XCircle className="w-5 h-5 text-gray-400" /></button>
-            </div>
-            <div className="p-6 space-y-4">
-              <div className="grid grid-cols-2 gap-4">
-                <div><p className="text-xs text-gray-500">Caller</p><p className="font-medium">{selectedCall.caller_name || "Unknown"}</p></div>
-                <div><p className="text-xs text-gray-500">Phone</p><p className="font-medium">{selectedCall.caller_number || "N/A"}</p></div>
-                <div><p className="text-xs text-gray-500">Status</p><p className="font-medium">{selectedCall.status}</p></div>
-                <div><p className="text-xs text-gray-500">Outcome</p><p className="font-medium">{selectedCall.call_outcome || "N/A"}</p></div>
-                <div><p className="text-xs text-gray-500">Lead Score</p><p className="font-medium"><ScoreBadge score={calcScore(selectedCall)} /></p></div>
-                <div><p className="text-xs text-gray-500">Score Value</p><p className="font-medium">{calcScore(selectedCall)}/100</p></div>
-              </div>
-              {selectedCall.transfer_status && (
-                <div className="bg-blue-50 border border-blue-100 rounded-xl p-3">
-                  <p className="text-xs font-medium text-blue-700 mb-1.5">Call Transfer</p>
-                  <div className="grid grid-cols-3 gap-2 text-xs">
-                    <div><span className="text-gray-500">Status:</span> <span className="font-medium text-gray-900">{selectedCall.transfer_status}</span></div>
-                    <div><span className="text-gray-500">Reason:</span> <span className="font-medium text-gray-900">{(selectedCall.transfer_reason || "N/A").replace(/_/g, " ")}</span></div>
-                    <div><span className="text-gray-500">Answered:</span> <span className={`font-medium ${selectedCall.transfer_answered ? "text-green-600" : "text-red-500"}`}>{selectedCall.transfer_answered ? "Yes" : "No"}</span></div>
-                  </div>
-                </div>
-              )}
-              {coachingData && coachingData.coached && (
-                <div className="bg-indigo-50 border border-indigo-100 rounded-xl p-3">
-                  <div className="flex items-center gap-1.5 mb-2">
-                    <Headphones className="w-3.5 h-3.5 text-indigo-700" />
-                    <p className="text-xs font-medium text-indigo-700">Live Coaching Session</p>
-                  </div>
-                  <div className="grid grid-cols-3 gap-2 text-xs mb-2">
-                    <div><span className="text-gray-500">Tips Sent:</span> <span className="font-medium text-gray-900">{coachingData.session.tips_sent}</span></div>
-                    <div><span className="text-gray-500">Duration:</span> <span className="font-medium text-gray-900">{coachingData.session.duration ? `${Math.floor(coachingData.session.duration / 60)}m ${coachingData.session.duration % 60}s` : "Active"}</span></div>
-                    <div><span className="text-gray-500">Status:</span> <span className={`font-medium ${coachingData.session.status === "active" ? "text-green-600" : "text-gray-600"}`}>{coachingData.session.status}</span></div>
-                  </div>
-                  {coachingData.tips && coachingData.tips.length > 0 && (
-                    <div className="space-y-1 mt-2 border-t border-indigo-200 pt-2">
-                      <p className="text-[10px] font-medium text-indigo-600 uppercase">Tips Sent During Call</p>
-                      {coachingData.tips.map((tip: any, i: number) => (
-                        <div key={i} className="flex items-start gap-2 text-xs">
-                          <span className="text-indigo-400 whitespace-nowrap">{new Date(tip.sent_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</span>
-                          <span className="px-1.5 py-0.5 rounded bg-indigo-100 text-indigo-700 text-[10px] font-medium whitespace-nowrap">{tip.trigger_type.replace(/_/g, " ")}</span>
-                          <span className="text-gray-700">{tip.tip_text}</span>
-                        </div>
-                      ))}
-                    </div>
-                  )}
-                </div>
-              )}
-              {selectedCall.summary && (
-                <div><p className="text-xs text-gray-500 mb-1">Summary</p><p className="text-sm text-gray-700 bg-gray-50 rounded-lg p-3">{selectedCall.summary}</p></div>
-              )}
-              {selectedCall.transcript && (
-                <div><p className="text-xs text-gray-500 mb-1">Transcript</p><pre className="text-xs bg-gray-50 rounded-lg p-3 whitespace-pre-wrap max-h-60 overflow-y-auto">{selectedCall.transcript}</pre></div>
-              )}
-            </div>
-          </div>
-        </div>
-      )}
+      {/* Phase 4.4 — inline call-detail modal removed. Rows
+          navigate to /calls/:id (pages/CallDetail.tsx). Coaching
+          data is deferred as a page-level enhancement rather than
+          duplicated here. */}
     </div>
   );
 }

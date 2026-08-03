@@ -39,6 +39,8 @@ import { PhoneOutgoing, PhoneIncoming, PhoneMissed } from "lucide-react";
 // UI. Same parse/format contract; server-side re-normalizes so any
 // gap here fails safely with a clear error rather than a doomed dial.
 import { parsePhoneToE164, formatPhoneAsTyped, formatPhoneForDisplay } from "../lib/phone";
+import { DISPOSITION_DISPLAY, displayOutcome, isDispositionableRow } from "../lib/call-display";
+import { DirectionFilter, useDirectionFilter, matchesDirection } from "../components/DirectionFilter";
 
 export default function PhonePage() {
   const sp = useSoftphone();
@@ -446,6 +448,10 @@ function RecentInAppCallsPanel({ refreshKey }: { refreshKey: string }) {
   const [calls, setCalls] = useState<RecentCall[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  // Phase 4.4 — direction filter for this panel. Same widget as the
+  // other list surfaces; per-surface storage key so a user's toggle
+  // here doesn't collide with the CommandCenter strip.
+  const [directionFilter, setDirectionFilter] = useDirectionFilter("phone_recent");
   // Phase 3.14 — surfaced when an optimistic disposition write is
   // reverted by a PATCH failure. Cleared on next successful load or
   // next manual dismiss. This is the ONLY error surface post-modal
@@ -551,19 +557,22 @@ function RecentInAppCallsPanel({ refreshKey }: { refreshKey: string }) {
 
   return (
     <section className="rounded-xl border border-neutral-200 bg-white p-5">
-      <div className="flex items-center justify-between mb-2">
+      <div className="flex items-center justify-between mb-2 gap-2 flex-wrap">
         <div className="flex items-center gap-2">
           <PhoneCall className="h-4 w-4 text-neutral-500" />
           <h2 className="text-sm font-semibold text-neutral-900">Recent in-app calls</h2>
         </div>
-        <button
-          type="button"
-          onClick={() => void load()}
-          disabled={loading}
-          className="text-xs text-blue-600 hover:underline disabled:opacity-50"
-        >
-          {loading ? "Loading…" : "Refresh"}
-        </button>
+        <div className="flex items-center gap-2">
+          <DirectionFilter value={directionFilter} onChange={setDirectionFilter} />
+          <button
+            type="button"
+            onClick={() => void load()}
+            disabled={loading}
+            className="text-xs text-blue-600 hover:underline disabled:opacity-50"
+          >
+            {loading ? "Loading…" : "Refresh"}
+          </button>
+        </div>
       </div>
 
       {revertNotice ? (
@@ -597,7 +606,8 @@ function RecentInAppCallsPanel({ refreshKey }: { refreshKey: string }) {
         </div>
       ) : (
         <ul className="divide-y divide-neutral-100">
-          {calls.map((c) => (
+          {/* Phase 4.4 — filter by shared direction toggle. */}
+          {calls.filter((c) => matchesDirection(directionFilter, c.direction)).map((c) => (
             <RecentCallRow key={c.id} call={c} />
           ))}
         </ul>
@@ -606,66 +616,9 @@ function RecentInAppCallsPanel({ refreshKey }: { refreshKey: string }) {
   );
 }
 
-/**
- * Phase 3.9 — outcome taxonomy rendering. Pre-3.9 every completed
- * call read as "answered" even when the row was actually a voicemail
- * (Twilio reports DialCallStatus=completed for voicemails). The new
- * mapDialOutcome enum + this display map keep the panel honest.
- *
- * Keep in sync with mapDialOutcome in routes/voice.ts. The API stores
- * the string form; a mapping bug here just shows the raw enum which
- * is grep-able.
- */
-const OUTCOME_DISPLAY: Record<string, { label: string; tone: "answered" | "missed" | "neutral" }> = {
-  answered_human: { label: "Answered", tone: "answered" },
-  voicemail: { label: "Voicemail", tone: "missed" },
-  no_answer: { label: "No answer", tone: "missed" },
-  busy: { label: "Busy", tone: "missed" },
-  failed: { label: "Failed", tone: "missed" },
-  canceled: { label: "Canceled", tone: "neutral" },
-  caller_hung_up_during_ring: { label: "You hung up", tone: "neutral" },
-  // Pre-3.9 rows keep their existing values — don't hide them.
-  answered: { label: "Answered", tone: "answered" },
-  completed: { label: "Answered", tone: "answered" },
-};
-
-function displayOutcome(call: RecentCall): { label: string; tone: "answered" | "missed" | "neutral" } {
-  const key = call.call_outcome || call.status || "";
-  return (
-    OUTCOME_DISPLAY[key] ||
-    (key === "initiated"
-      ? { label: "In progress", tone: "neutral" }
-      : { label: key || "unknown", tone: "neutral" })
-  );
-}
-
-/**
- * Phase 3.12 — human-readable disposition labels. Keep in sync with
- * the server's whitelist (CALL_DISPOSITIONS in routes/voice.ts).
- * Mismatch just falls through to the raw enum which is grep-able,
- * matching the OUTCOME_DISPLAY escape hatch.
- */
-const DISPOSITION_DISPLAY: Record<string, { label: string; tone: "answered" | "missed" | "neutral" }> = {
-  reached_person: { label: "Reached person", tone: "answered" },
-  voicemail_left_message: { label: "Voicemail — left message", tone: "missed" },
-  voicemail_no_message: { label: "Voicemail — no message", tone: "missed" },
-  wrong_number: { label: "Wrong number", tone: "missed" },
-  no_answer_bad_line: { label: "No answer / bad line", tone: "missed" },
-};
-
-/**
- * Phase 3.12 — is this a call we WOULD have shown the disposition
- * modal for (i.e., it connected and is outbound)? Used to render an
- * "Not dispositioned" hint on undispositioned rows that COULD have
- * been dispositioned — distinct from calls that never connected
- * (no_answer / busy / failed / caller_hung_up_during_ring), which
- * have accurate inferred outcomes and don't need staff input.
- */
-function isDispositionableRow(call: RecentCall): boolean {
-  if (call.direction !== "outbound") return false;
-  const inferred = call.call_outcome || call.status || "";
-  return inferred === "answered_human" || inferred === "answered" || inferred === "completed" || inferred === "voicemail";
-}
+// Phase 4.4 — outcome / disposition display maps live in
+// lib/call-display.ts so the detail page reuses them without
+// duplication. See that file's header.
 
 function RecentCallRow({ call }: { call: RecentCall }) {
   const outbound = call.direction === "outbound";
@@ -700,42 +653,50 @@ function RecentCallRow({ call }: { call: RecentCall }) {
       : null;
   const undispositioned = isDispositionableRow(call) && !call.disposition;
   return (
-    <li className="flex items-center gap-3 py-2.5">
-      <Icon className={`h-4 w-4 shrink-0 ${iconColor}`} />
-      <div className="flex-1 min-w-0">
-        <div className="text-sm font-medium text-neutral-900 truncate">
-          {formatPhoneForDisplay(call.caller_number) || call.caller_number || "(unknown)"}
+    // Phase 4.4 — row is a Link to the canonical detail page.
+    // Keeps the disposition modal working (disposition column stays
+    // editable via the softphone flow), while giving a path into the
+    // full call view for anything else.
+    <li>
+      <Link
+        href={`/calls/${call.id}`}
+        className="flex items-center gap-3 py-2.5 -mx-1 px-1 rounded-md hover:bg-neutral-50 focus:outline-none focus:ring-2 focus:ring-[#2E75B6]/30"
+      >
+        <Icon className={`h-4 w-4 shrink-0 ${iconColor}`} />
+        <div className="flex-1 min-w-0">
+          <div className="text-sm font-medium text-neutral-900 truncate">
+            {formatPhoneForDisplay(call.caller_number) || call.caller_number || "(unknown)"}
+          </div>
+          <div className="text-xs text-neutral-500 flex flex-wrap items-center gap-x-1.5">
+            <span>{outbound ? "Outbound" : "Inbound"}</span>
+            <span>·</span>
+            {dispositionMeta ? (
+              <>
+                <span className="font-medium text-neutral-700">{dispositionMeta.label}</span>
+                {dispositionMeta.label !== inferred.label ? (
+                  <span className="text-neutral-400">(Twilio: {inferred.label})</span>
+                ) : null}
+              </>
+            ) : (
+              <>
+                <span>{inferred.label}</span>
+                {undispositioned ? (
+                  <span className="rounded-full bg-amber-50 text-amber-800 text-[10px] font-medium px-1.5 py-0.5 border border-amber-200">
+                    Not dispositioned
+                  </span>
+                ) : null}
+              </>
+            )}
+            {duration ? (
+              <>
+                <span>·</span>
+                <span>{duration}</span>
+              </>
+            ) : null}
+          </div>
         </div>
-        <div className="text-xs text-neutral-500 flex flex-wrap items-center gap-x-1.5">
-          <span>{outbound ? "Outbound" : "Inbound"}</span>
-          <span>·</span>
-          {dispositionMeta ? (
-            // Disposition is the primary display when set.
-            <>
-              <span className="font-medium text-neutral-700">{dispositionMeta.label}</span>
-              {dispositionMeta.label !== inferred.label ? (
-                <span className="text-neutral-400">(Twilio: {inferred.label})</span>
-              ) : null}
-            </>
-          ) : (
-            <>
-              <span>{inferred.label}</span>
-              {undispositioned ? (
-                <span className="rounded-full bg-amber-50 text-amber-800 text-[10px] font-medium px-1.5 py-0.5 border border-amber-200">
-                  Not dispositioned
-                </span>
-              ) : null}
-            </>
-          )}
-          {duration ? (
-            <>
-              <span>·</span>
-              <span>{duration}</span>
-            </>
-          ) : null}
-        </div>
-      </div>
-      <div className="text-xs text-neutral-400 shrink-0">{when}</div>
+        <div className="text-xs text-neutral-400 shrink-0">{when}</div>
+      </Link>
     </li>
   );
 }

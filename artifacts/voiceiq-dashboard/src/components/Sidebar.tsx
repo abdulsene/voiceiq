@@ -47,6 +47,11 @@ type NavItem = {
   icon: typeof LayoutDashboard;
   external?: boolean;
   adminOnly?: boolean;
+  // Phase 4.4 — hide a nav item unless the caller's business
+  // membership role is in this list. Enforced client-side ONLY as
+  // a UX / anti-403 measure; the API endpoints remain the
+  // authoritative gate (users:write / users:read).
+  requiresBusinessRole?: string[];
 };
 
 const navItems: NavItem[] = [
@@ -76,7 +81,12 @@ const navItems: NavItem[] = [
   // Phase 3.1b: team management — staff on this business, role +
   // on-duty state + topic assignments. UsersRound (not Users) so it
   // reads distinct from Contacts below.
-  { path: "/team", labelKey: "nav.team", icon: UsersRound },
+  // Phase 4.4: gated on business role via the requiresBusinessRole
+  // filter below. Only owner / admin / manager / team_lead can
+  // actually manage the team (users:write on the API); hiding the
+  // link for other roles prevents "clicks into a 403" — Abdul's
+  // brief flagged this as the first thing new staff will click.
+  { path: "/team", labelKey: "nav.team", icon: UsersRound, requiresBusinessRole: ["owner", "admin", "manager", "team_lead"] },
   { path: "/contacts", labelKey: "nav.contacts", icon: Users },
   { path: "/appointments", labelKey: "nav.appointments", icon: Calendar },
   { path: "/sms", labelKey: "nav.sms", icon: MessageSquare },
@@ -103,6 +113,12 @@ export default function Sidebar() {
   // (no row in user_roles, or row exists but status !== 'active'). Same
   // value either way — the only meaningful gate is null vs non-null.
   const [staffRole, setStaffRole] = useState<string | null>(null);
+  // Phase 4.4 — business membership role for the currently-active
+  // business (owner / admin / manager / team_lead / agent_manager /
+  // analyst / user / readonly). Used to hide nav items whose API
+  // endpoints will 403 for this role (e.g. /team requires
+  // users:write which role='user' doesn't have).
+  const [businessRole, setBusinessRole] = useState<string | null>(null);
   const { t } = useTranslation();
 
   const pollUnread = useCallback(() => {
@@ -130,6 +146,10 @@ export default function Sidebar() {
         // etc.) for active staff. Stored as-is and used only as a null check
         // when filtering adminOnly nav items below.
         setStaffRole((d?.staff_role as string | null) ?? null);
+        // Phase 4.4 — business membership role for the active biz.
+        // The filter below uses this to hide /team from role='user'
+        // and 'readonly' so they don't click into a 403.
+        setBusinessRole((biz?.role as string | null) ?? null);
       })
       .catch(() => {});
     pollUnread();
@@ -168,7 +188,14 @@ export default function Sidebar() {
               but not Customer Businesses) — binary "any staff role" is the
               hot-fix for the EZ Rentals leak; per-resource is the follow-up.
               Default for null/unknown role = HIDE adminOnly items. */}
-          {navItems.filter((item) => !item.adminOnly || staffRole !== null).map((item) => {
+          {navItems
+            .filter((item) => !item.adminOnly || staffRole !== null)
+            // Phase 4.4 — business-role gate. Hide items whose
+            // requiresBusinessRole list doesn't include the current
+            // membership's role. Owner sees everything; role='user'
+            // and 'readonly' don't see /team (would 403).
+            .filter((item) => !item.requiresBusinessRole || (businessRole !== null && item.requiresBusinessRole.includes(businessRole)))
+            .map((item) => {
             const active =
               item.path === "/"
                 ? location === "/" || location === ""

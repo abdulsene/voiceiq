@@ -1,4 +1,5 @@
 import { useEffect, useState, useRef } from "react";
+import { Link } from "wouter";
 import { getContacts, getCallerHistory, setVipStatus, sendSms, updateContactNotes, fetchApi } from "../lib/api";
 import {
   Search, Star, Phone, MessageSquare, Clock, X, Download, User,
@@ -574,7 +575,13 @@ export default function Contacts() {
                     {callHistory.recent_calls.map((call: any) => {
                       const outcome = getOutcomeStyle(call.call_outcome || call.status);
                       return (
-                        <div key={call.id} className="border border-gray-100 rounded-lg p-3 hover:border-[#2E75B6]/20 transition-colors">
+                        // Phase 4.4 — each call row navigates to the
+                        // canonical detail page.
+                        <Link
+                          key={call.id}
+                          href={`/calls/${call.id}`}
+                          className="block border border-gray-100 rounded-lg p-3 hover:border-[#2E75B6]/40 hover:bg-[#2E75B6]/5 transition-colors"
+                        >
                           <div className="flex items-center justify-between mb-1">
                             <div className="flex items-center gap-2">
                               <span className={`px-2 py-0.5 rounded-full text-[10px] font-semibold ${outcome.bg} ${outcome.text}`}>
@@ -589,7 +596,7 @@ export default function Contacts() {
                           <p className="text-xs text-gray-600 line-clamp-2">
                             {call.summary || call.caller_intent?.replace(/_/g, " ") || "No summary"}
                           </p>
-                        </div>
+                        </Link>
                       );
                     })}
                   </div>

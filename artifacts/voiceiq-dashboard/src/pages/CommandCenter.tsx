@@ -1,5 +1,6 @@
-import { useEffect, useState, useCallback } from "react";
-import { Link } from "wouter";
+import { useEffect, useState, useCallback, useMemo } from "react";
+import { Link, useLocation } from "wouter";
+import { DirectionFilter, useDirectionFilter, matchesDirection } from "../components/DirectionFilter";
 import { useTranslation } from "react-i18next";
 import { getCallStats, getRecentCalls, getActionItems, callOutbound, sendSms, getLocationStats, getSurveyFollowups, getProfiles } from "../lib/api";
 import UsageSummary from "../components/UsageSummary";
@@ -262,119 +263,10 @@ function SmsModal({ call, onClose }: { call: any; onClose: () => void }) {
   );
 }
 
-function CallDetailModal({ call, onClose }: { call: any; onClose: () => void }) {
-  const { t } = useTranslation();
-  const timeAgo = useTimeAgo();
-  const [sending, setSending] = useState(false);
-
-  const handleCallBack = async () => {
-    if (!call.caller_number) return;
-    setSending(true);
-    try { await callOutbound(call.caller_number); } catch (e) { console.error(e); }
-    setSending(false);
-  };
-
-  const transcriptLines = (call.transcript || "").split("\n").filter((l: string) => l.trim());
-
-  return (
-    <div className="fixed inset-0 bg-black/50 backdrop-blur-sm z-50 flex items-center justify-center p-4" onClick={onClose}>
-      <div className="bg-white rounded-2xl w-full max-w-2xl max-h-[85vh] overflow-hidden shadow-2xl flex flex-col" onClick={(e) => e.stopPropagation()}>
-        <div className="flex items-center justify-between p-5 border-b border-gray-100 shrink-0">
-          <div className="flex items-center gap-3">
-            <div className="w-10 h-10 rounded-full bg-[#2E75B6] flex items-center justify-center text-white font-bold text-sm">
-              {(call.caller_name || "?")[0].toUpperCase()}
-            </div>
-            <div>
-              <h3 className="font-semibold text-gray-900">{call.caller_name || t("dashboard.unknownCaller")}</h3>
-              <p className="text-xs text-gray-500">{call.caller_number || t("dashboard.noNumber")} · {formatDuration(call.duration_seconds)} · {timeAgo(call.created_at)}</p>
-            </div>
-          </div>
-          <button onClick={onClose} className="p-1.5 hover:bg-gray-100 rounded-lg transition-colors"><X className="w-5 h-5 text-gray-400" /></button>
-        </div>
-
-        <div className="flex-1 overflow-y-auto p-5 space-y-4">
-          <div className="flex items-center gap-4">
-            <OutcomeBadge call={call} />
-            {(() => { const ls = getLeadScore(call); return <span className={`px-2 py-0.5 rounded-full text-[11px] font-semibold ${ls.color}`}>{ls.score}% {t("dashboard.lead")}</span>; })()}
-            <span className="text-xs text-gray-400">{call.direction || t("dashboard.inbound")}</span>
-          </div>
-
-          <div className="grid grid-cols-2 gap-3">
-            <div className="bg-gray-50 rounded-xl p-3">
-              <p className="text-[10px] font-medium text-gray-500 uppercase tracking-wider mb-1">{t("dashboard.caller")}</p>
-              <p className="text-sm font-semibold text-gray-900">{call.caller_name || t("dashboard.unknown")}</p>
-            </div>
-            <div className="bg-gray-50 rounded-xl p-3">
-              <p className="text-[10px] font-medium text-gray-500 uppercase tracking-wider mb-1">{t("dashboard.phone")}</p>
-              <p className="text-sm font-semibold text-gray-900">{call.caller_number || "N/A"}</p>
-            </div>
-            <div className="bg-gray-50 rounded-xl p-3">
-              <p className="text-[10px] font-medium text-gray-500 uppercase tracking-wider mb-1">{t("dashboard.intent")}</p>
-              <p className="text-sm font-semibold text-gray-900">{call.caller_intent || t("dashboard.notCaptured")}</p>
-            </div>
-            <div className="bg-gray-50 rounded-xl p-3">
-              <p className="text-[10px] font-medium text-gray-500 uppercase tracking-wider mb-1">{t("dashboard.urgency")}</p>
-              <p className="text-sm font-semibold text-gray-900">{call.call_outcome === "callback_requested" ? t("dashboard.urgent") : t("dashboard.normal")}</p>
-            </div>
-          </div>
-
-          {call.summary && (
-            <div className="bg-[#2E75B6]/5 border border-[#2E75B6]/10 rounded-xl p-4">
-              <div className="flex items-center gap-2 mb-2">
-                <Sparkles className="w-4 h-4 text-[#2E75B6]" />
-                <p className="text-xs font-semibold text-[#2E75B6] uppercase tracking-wider">{t("dashboard.aiSummary")}</p>
-              </div>
-              <p className="text-sm text-gray-700 leading-relaxed">{call.summary}</p>
-            </div>
-          )}
-
-          {call.follow_up_required && (
-            <div className="bg-amber-50 border border-amber-100 rounded-xl p-4">
-              <div className="flex items-center gap-2 mb-1">
-                <AlertCircle className="w-4 h-4 text-amber-600" />
-                <p className="text-xs font-semibold text-amber-700 uppercase tracking-wider">{t("dashboard.actionRequired")}</p>
-              </div>
-              <p className="text-sm text-amber-800">{call.caller_intent || call.summary || t("dashboard.followUpWithCaller")}</p>
-            </div>
-          )}
-
-          {transcriptLines.length > 0 && (
-            <div>
-              <p className="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-3">{t("dashboard.transcript")}</p>
-              <div className="bg-gray-50 rounded-xl p-4 space-y-2.5 max-h-64 overflow-y-auto">
-                {transcriptLines.map((line: string, i: number) => {
-                  const isAI = line.startsWith("AI:") || line.startsWith("Alex:");
-                  const isCaller = line.startsWith("Caller:");
-                  const text = line.replace(/^(AI|Alex|Caller):\s*/, "");
-                  return (
-                    <div key={i} className={`flex gap-2 ${isAI ? "" : ""}`}>
-                      <span className={`text-[10px] font-bold uppercase mt-0.5 shrink-0 w-12 ${isAI ? "text-[#2E75B6]" : isCaller ? "text-gray-600" : "text-gray-400"}`}>
-                        {isAI ? "Alex" : isCaller ? t("dashboard.caller") : ""}
-                      </span>
-                      <p className="text-xs text-gray-600 leading-relaxed">{text}</p>
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
-          )}
-        </div>
-
-        <div className="p-4 border-t border-gray-100 flex gap-2 shrink-0">
-          <button onClick={handleCallBack} disabled={!call.caller_number || sending} className="flex-1 flex items-center justify-center gap-2 px-4 py-2.5 bg-[#2E75B6] text-white rounded-xl text-sm font-semibold hover:bg-[#245d94] disabled:opacity-40 transition-all">
-            <PhoneOutgoing className="w-4 h-4" />{t("dashboard.callBack")}
-          </button>
-          <button onClick={() => { onClose(); }} className="flex-1 flex items-center justify-center gap-2 px-4 py-2.5 bg-emerald-600 text-white rounded-xl text-sm font-semibold hover:bg-emerald-700 transition-all">
-            <MessageSquare className="w-4 h-4" />{t("dashboard.sendSms")}
-          </button>
-          <button className="flex-1 flex items-center justify-center gap-2 px-4 py-2.5 bg-purple-600 text-white rounded-xl text-sm font-semibold hover:bg-purple-700 transition-all">
-            <Calendar className="w-4 h-4" />{t("dashboard.bookAppt")}
-          </button>
-        </div>
-      </div>
-    </div>
-  );
-}
+// Phase 4.4 — CallDetailModal removed. Every consumer navigates to
+// /calls/:id (pages/CallDetail.tsx) instead. Modal-only detail was
+// not deep-linkable; the page is. Field rendering + gate-skipped
+// analysis states live in the canonical page component now.
 
 export default function CommandCenter() {
   const { t } = useTranslation();
@@ -384,8 +276,10 @@ export default function CommandCenter() {
   const [calls, setCalls] = useState<any[]>([]);
   const [actions, setActions] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
-  const [selectedCall, setSelectedCall] = useState<any>(null);
   const [smsCall, setSmsCall] = useState<any>(null);
+  // Phase 4.4 — direction filter for the recent-calls strip.
+  // Persisted per user via localStorage.
+  const [directionFilter, setDirectionFilter] = useDirectionFilter("command_center_strip");
   const [completedActions, setCompletedActions] = useState<Set<string>>(new Set());
   const [locationStats, setLocationStats] = useState<any[]>([]);
   const [surveyFollowups, setSurveyFollowups] = useState<any[]>([]);
@@ -441,6 +335,15 @@ export default function CommandCenter() {
   const callsToday = calls.filter((c) => new Date(c.created_at) >= todayStart);
   const callsThisMonth = calls.filter((c) => new Date(c.created_at) >= monthStart);
   const callsLast30 = calls.filter((c) => new Date(c.created_at) >= thirtyDaysAgo);
+
+  // Phase 4.4 — filter the recent-calls strip by direction. Stats
+  // above (callsToday etc.) intentionally do NOT filter — headline
+  // numbers should always reflect the full data set regardless of
+  // the user's list-view preference.
+  const filteredCalls = useMemo(
+    () => calls.filter((c) => matchesDirection(directionFilter, c.direction)),
+    [calls, directionFilter],
+  );
 
   const leadsMonth = callsThisMonth.filter((c) => c.caller_name && c.caller_name !== "Unknown" && c.caller_number).length;
   const apptsMonth = callsThisMonth.filter((c) => c.call_outcome?.includes("book") || c.call_outcome?.includes("appoint")).length;
@@ -691,7 +594,12 @@ export default function CommandCenter() {
                 <PhoneCall className="w-4 h-4 text-gray-400" />
                 <h2 className="font-semibold text-gray-900 text-sm">{t("dashboard.recentCalls")}</h2>
               </div>
-              <span className="text-[11px] text-gray-400 font-medium bg-gray-50 px-2 py-0.5 rounded-full">{t("dashboard.callsCount", { count: calls.length })}</span>
+              {/* Phase 4.4 — shared direction filter. Same widget on
+                  every list surface, persisted per-user. */}
+              <div className="flex items-center gap-2">
+                <DirectionFilter value={directionFilter} onChange={setDirectionFilter} />
+                <span className="text-[11px] text-gray-400 font-medium bg-gray-50 px-2 py-0.5 rounded-full">{t("dashboard.callsCount", { count: filteredCalls.length })}</span>
+              </div>
             </div>
 
             <div className="overflow-x-auto">
@@ -708,7 +616,7 @@ export default function CommandCenter() {
                   </tr>
                 </thead>
                 <tbody>
-                  {calls.length === 0 ? (
+                  {filteredCalls.length === 0 ? (
                     <tr><td colSpan={7} className="px-5 py-16 text-center">
                       <div className="flex flex-col items-center">
                         <Phone className="w-8 h-8 text-gray-200 mb-3" />
@@ -717,7 +625,7 @@ export default function CommandCenter() {
                       </div>
                     </td></tr>
                   ) : (
-                    calls.map((call: any) => {
+                    filteredCalls.map((call: any) => {
                       const ls = getLeadScore(call);
                       return (
                         <tr key={call.id} className="border-b border-gray-50 last:border-0 hover:bg-gray-50/70 transition-colors group/row">
@@ -754,13 +662,15 @@ export default function CommandCenter() {
                               >
                                 <MessageSquare className="w-3.5 h-3.5 text-emerald-600" />
                               </button>
-                              <button
+                              {/* Phase 4.4 — Eye button now navigates to the canonical
+                                  detail page instead of opening the local modal. */}
+                              <Link
                                 title={t("dashboard.viewDetails")}
+                                href={`/calls/${call.id}`}
                                 className="w-7 h-7 rounded-lg hover:bg-purple-50 flex items-center justify-center transition-colors"
-                                onClick={() => setSelectedCall(call)}
                               >
                                 <Eye className="w-3.5 h-3.5 text-purple-600" />
-                              </button>
+                              </Link>
                             </div>
                           </td>
                         </tr>
@@ -914,7 +824,9 @@ export default function CommandCenter() {
         </div>
       </div>
 
-      {selectedCall && <CallDetailModal call={selectedCall} onClose={() => setSelectedCall(null)} />}
+      {/* Phase 4.4 — CallDetailModal removed. Rows navigate to
+          /calls/:id via the Eye icon Link above. Detail rendering
+          lives in pages/CallDetail.tsx. */}
       {smsCall && <SmsModal call={smsCall} onClose={() => setSmsCall(null)} />}
     </div>
   );

@@ -59,6 +59,7 @@ import TeamPage from "./pages/Team/TeamPage";
 import PhonePage from "./pages/Phone";
 import ActivateAccount from "./pages/ActivateAccount";
 import AcceptInvite from "./pages/AcceptInvite";
+import CallDetailPage from "./pages/CallDetail";
 import SmsOptInPage from "./pages/SmsOptInPage";
 import VerifyEmail from "./pages/VerifyEmail";
 import ForgotPassword from "./pages/ForgotPassword";
@@ -655,7 +656,11 @@ function DashboardLayout() {
                   the URL param is a follow-up. Routing it here so the
                   link lands on a real page instead of the catch-all
                   "page not found". */}
-              <Route path="/calls/:callId" component={CallsLeads} />
+              {/* Phase 4.4 — canonical detail page. Route param
+                  was previously unused (CallsLeads ignored :callId
+                  and rendered the list view). Now routes to the
+                  real detail component. */}
+              <Route path="/calls/:callId" component={CallDetailPage} />
               {/* Leads epic Slice 1: callback queue. Sits next to
                   /calls so the leads list lives alongside the call
                   list it escalates from. AuthGuard already wraps
@@ -862,6 +867,11 @@ function App() {
         <Route path="/r/:token" component={TrustPortalPage} />
         <Route path="/dashboard" component={() => <DashboardLayout />} />
         <Route path="/calls" component={() => <DashboardLayout />} />
+        {/* Phase 4.4 — /calls/:callId dispatches to DashboardLayout
+            just like /calls. The DashboardLayout switch then routes
+            to CallDetailPage. Registering here keeps AuthGuard on
+            the path. */}
+        <Route path="/calls/:callId" component={() => <DashboardLayout />} />
         <Route path="/leads" component={() => <DashboardLayout />} />
         <Route path="/leads/:id" component={() => <DashboardLayout />} />
         <Route path="/campaigns" component={() => <DashboardLayout />} />

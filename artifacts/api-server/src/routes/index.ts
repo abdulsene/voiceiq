@@ -33,6 +33,11 @@ import routingRouter from "./routing";
 //   POST /api/voice/heartbeat  (requireAuth)
 // Outbound path is bypass-listed in app.ts.
 import voiceRouter from "./voice";
+// Phase 4.4 — canonical /api/calls/:id detail endpoint + resolver.
+//   GET  /api/calls/:id
+//   GET  /api/calls/resolve?sid=<call_sid or twilio_call_sid>
+// Both requireAuth + business-scoped; cross-tenant returns 404.
+import callsRouter from "./calls";
 // Phase 3.3c — explicit AI-receptionist resync + tool inspector.
 //   POST /api/business/agent/resync
 //   GET  /api/business/agent/tools
@@ -134,6 +139,10 @@ router.use(routingRouter);
 // Phase 3.3: in-app calling. Mounted alongside routingRouter — same
 // slice, extends (does not replace) Phase 3.2.
 router.use(voiceRouter);
+// Phase 4.4: canonical call detail + resolver. Must mount BEFORE the
+// catch-all apiRouter so /api/calls/:id claims the route (not a
+// generic apiRouter path).
+router.use(callsRouter);
 // Phase 3.3c: mounted alongside prompt/voices — same customer-settings
 // slice, same requireAuth + requirePermission gating pattern.
 router.use(agentSyncRouter);
