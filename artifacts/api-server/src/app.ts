@@ -177,6 +177,12 @@ const AUTH_BYPASS_PATTERNS = [
   // callback wired in 3.2b. Bypass now so the URL is claimable when the
   // handler ships. Signature verification happens inside the handler.
   /^\/api\/routing\/dial-status$/,
+  // Phase 5.1: /api/routing/opt-out is the record_opt_out
+  // ElevenLabs tool endpoint (registered unconditionally on every
+  // agent). Bearer-authed via ELEVENLABS_TOOL_SECRET — same
+  // discipline as route_to_topic. Bypass listed here because the
+  // tool has no JWT, only the shared bearer token.
+  /^\/api\/routing\/opt-out$/,
   // Phase 3.3: /api/voice/outbound is the TwiML App webhook Twilio hits
   // when the browser Device places an outbound call. Signature verified
   // inside the handler. /api/voice/token and /api/voice/heartbeat are

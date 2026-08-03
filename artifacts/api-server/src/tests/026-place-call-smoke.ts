@@ -262,14 +262,16 @@ function setupSuccessfulOutboundFake(fake: FakeSupabaseClient, opts: { scheduled
     (c) => c.op === "select" && c.table === "business_configs" && c.selectColumns.includes("outbound_calling_hours_start"),
     { data: bizConfigDataForCompliance() },
   );
-  // checkVoiceConsent fallback path also reads business_configs.
-  fake.on(
-    (c) => c.op === "select" && c.table === "business_configs" && c.selectColumns.includes("voice_consent_default"),
-    { data: { voice_consent_default: true } },
-  );
-  // dnc + voice_consent_records — empty / not blocked.
+  // Phase 5.1 — voice_opt_outs (internal DNC) + voice_consent_records.
+  // The tenant-default bypass on business_configs.voice_consent_default
+  // was retired in Phase 5.1, so successful paths now require an
+  // explicit granted+unrevoked consent row.
+  fake.on((c) => c.op === "select" && c.table === "voice_opt_outs", { data: null });
   fake.on((c) => c.op === "select" && c.table === "dnc_list", { data: null });
-  fake.on((c) => c.op === "select" && c.table === "voice_consent_records", { data: null });
+  fake.on(
+    (c) => c.op === "select" && c.table === "voice_consent_records",
+    { data: { id: "consent_026_stub", revoked_at: null } },
+  );
   // Idempotency check for scheduled.
   if (!opts.scheduledFor) {
     // no scheduled query expected
@@ -421,7 +423,7 @@ async function T5() {
   fake.on((c) => c.op === "select" && c.table === "dnc_list", {
     data: { source: "manual", reason: "customer_request", created_at: "2026-06-01T00:00:00Z" },
   });
-  fake.on((c) => c.op === "select" && c.table === "voice_consent_records", { data: null });
+  fake.on((c) => c.op === "select" && c.table === "voice_consent_records", { data: { id: "consent_stub_026", revoked_at: null } });
 
   const r = await placeCall(asClient(fake), {
     businessId: BIZ,
@@ -456,7 +458,7 @@ async function T6() {
     { data: { voice_consent_default: true } },
   );
   fake.on((c) => c.op === "select" && c.table === "dnc_list", { data: null });
-  fake.on((c) => c.op === "select" && c.table === "voice_consent_records", { data: null });
+  fake.on((c) => c.op === "select" && c.table === "voice_consent_records", { data: { id: "consent_stub_026", revoked_at: null } });
 
   // Use a fixed future time when we know we'll be outside the 1-minute window.
   const probableOutside = new Date("2026-06-15T15:00:00Z");
@@ -486,11 +488,8 @@ async function T7() {
     (c) => c.op === "select" && c.table === "business_configs" && c.selectColumns.includes("outbound_calling_hours_start"),
     { data: bizConfigDataForCompliance() },
   );
-  // consent default FALSE + no explicit record → blocked by no_record
-  fake.on(
-    (c) => c.op === "select" && c.table === "business_configs" && c.selectColumns.includes("voice_consent_default"),
-    { data: { voice_consent_default: false } },
-  );
+  // Phase 5.1 — no explicit consent record → blocked_by=no_record.
+  // (Tenant default was retired; consent = explicit record only.)
   fake.on((c) => c.op === "select" && c.table === "dnc_list", { data: null });
   fake.on((c) => c.op === "select" && c.table === "voice_consent_records", { data: null });
 
@@ -617,7 +616,7 @@ async function T13() {
     { data: { voice_consent_default: true } },
   );
   fake.on((c) => c.op === "select" && c.table === "dnc_list", { data: null });
-  fake.on((c) => c.op === "select" && c.table === "voice_consent_records", { data: null });
+  fake.on((c) => c.op === "select" && c.table === "voice_consent_records", { data: { id: "consent_stub_026", revoked_at: null } });
   // Idempotency match — return existing row.
   fake.on(
     (c) => c.op === "select" && c.table === "lead_calls" && c.eqFilters.some((f) => f.column === "scheduled_for"),
@@ -800,7 +799,7 @@ async function T19() {
     { data: { voice_consent_default: true } },
   );
   fake.on((c) => c.op === "select" && c.table === "dnc_list", { data: null });
-  fake.on((c) => c.op === "select" && c.table === "voice_consent_records", { data: null });
+  fake.on((c) => c.op === "select" && c.table === "voice_consent_records", { data: { id: "consent_stub_026", revoked_at: null } });
   // Cooperative-lock SELECT — return the locked row.
   fake.on(
     (c) =>
@@ -867,7 +866,7 @@ async function T20() {
   fake.on((c) => c.op === "select" && c.table === "dnc_list", {
     data: { source: "manual", reason: "customer_request", created_at: "2026-06-15T00:00:00Z" },
   });
-  fake.on((c) => c.op === "select" && c.table === "voice_consent_records", { data: null });
+  fake.on((c) => c.op === "select" && c.table === "voice_consent_records", { data: { id: "consent_stub_026", revoked_at: null } });
   fake.on((c) => c.op === "update" && c.table === "lead_calls", { data: null });
 
   const r = await placeCall(asClient(fake), {
@@ -1142,7 +1141,7 @@ async function T26() {
     { data: { voice_consent_default: true } },
   );
   fake.on((c) => c.op === "select" && c.table === "dnc_list", { data: null });
-  fake.on((c) => c.op === "select" && c.table === "voice_consent_records", { data: null });
+  fake.on((c) => c.op === "select" && c.table === "voice_consent_records", { data: { id: "consent_stub_026", revoked_at: null } });
   // Cap is FULL.
   stageCapCount(fake, new Date(), { scheduledCount: 50, immediateCount: 50 });
   // Wrapper UPDATE to terminal failed.
@@ -1231,7 +1230,7 @@ async function T28() {
     { data: { voice_consent_default: true } },
   );
   fake.on((c) => c.op === "select" && c.table === "dnc_list", { data: null });
-  fake.on((c) => c.op === "select" && c.table === "voice_consent_records", { data: null });
+  fake.on((c) => c.op === "select" && c.table === "voice_consent_records", { data: { id: "consent_stub_026", revoked_at: null } });
   // DO NOT stage cap count — verifying it's never invoked.
 
   const r = await placeCall(asClient(fake), {
@@ -1285,7 +1284,7 @@ async function T29() {
     { data: { voice_consent_default: true } },
   );
   fake.on((c) => c.op === "select" && c.table === "dnc_list", { data: null });
-  fake.on((c) => c.op === "select" && c.table === "voice_consent_records", { data: null });
+  fake.on((c) => c.op === "select" && c.table === "voice_consent_records", { data: { id: "consent_stub_026", revoked_at: null } });
   // Idempotency match — existing scheduled row.
   fake.on(
     (c) => c.op === "select" && c.table === "lead_calls" && c.eqFilters.some((f) => f.column === "scheduled_for"),

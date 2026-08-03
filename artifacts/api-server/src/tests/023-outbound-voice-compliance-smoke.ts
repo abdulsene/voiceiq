@@ -46,7 +46,7 @@
 import { checkDnc } from "../lib/dnc-check";
 import { checkCallingHours } from "../lib/calling-hours";
 import { checkVoiceConsent } from "../lib/voice-consent";
-import { checkCompliance } from "../lib/outbound-voice/compliance";
+import { checkCompliance, enforceOutboundEligibility } from "../lib/outbound-voice/compliance";
 import type { SupabaseClient } from "@supabase/supabase-js";
 
 interface TestResult { name: string; pass: boolean; details: string; }
@@ -84,6 +84,13 @@ class FakeBuilder {
     return this;
   }
   eq(col: string, val: any) {
+    this.call.eqFilters.push({ column: col, value: val });
+    return this;
+  }
+  // Phase 5.1 — voice-opt-out check uses .is('resubscribed_at', null).
+  // Treat as an eqFilter marker for test purposes; consumers only key
+  // on table + eqFilters when matching a fake response.
+  is(col: string, val: any) {
     this.call.eqFilters.push({ column: col, value: val });
     return this;
   }
@@ -306,10 +313,17 @@ async function runVoiceConsentTests() {
       JSON.stringify(r),
     );
   }
-  // T12
+  // T12 (Phase 5.1) — no record, tenant default TRUE → STILL BLOCKED.
+  // The Phase 5.1 retirement of the voice_consent_default bypass
+  // means the tenant-wide flag is no longer consulted. Even if
+  // an ops user flipped voice_consent_default=true on a business,
+  // consent must now be per-phone in voice_consent_records.
   {
     const fake = new FakeSupabaseClient();
     fake.on((c) => c.table === "voice_consent_records", { data: null });
+    // Deliberately still stub business_configs to prove the code
+    // does NOT read the column anymore — if it did, this test's
+    // `voice_consent_default: true` would flip the assertion.
     fake.on((c) => c.table === "business_configs", { data: { voice_consent_default: true } });
     const r = await checkVoiceConsent(asClient(fake), {
       businessId: BIZ,
@@ -317,8 +331,8 @@ async function runVoiceConsentTests() {
       consentType: "appointment_reminder",
     });
     record(
-      "T12 no record + tenant default TRUE → allowed via_tenant_default",
-      r.allowed && r.via_tenant_default === true && !r.consent_record_id,
+      "T12 (Phase 5.1) no record + tenant default TRUE → STILL blocked_by=no_record (bypass retired)",
+      !r.allowed && r.blocked_by === "no_record" && !r.via_tenant_default,
       JSON.stringify(r),
     );
   }
@@ -354,6 +368,8 @@ async function runOrchestratorTests() {
     fake.on((c) => c.table === "business_configs" && c.selectColumns.includes("outbound_voice_enabled"),
       bizConfigResponse({ enabled: false }));
     fake.on((c) => c.table === "voice_consent_records", { data: { id: "consent_x", revoked_at: null } });
+    // Phase 5.1: voice_opt_outs stub (empty).
+    fake.on((c) => c.table === "voice_opt_outs", { data: null });
     const r = await checkCompliance(asClient(fake), {
       businessId: BIZ,
       phone: PHONE,
@@ -367,9 +383,10 @@ async function runOrchestratorTests() {
       r.blocked_by === "dnc" &&
       r.checks.dnc.allowed === false &&
       r.checks.calling_hours.allowed === false &&
-      r.checks.consent.allowed === true;
+      r.checks.consent.allowed === true &&
+      r.checks.voice_opt_out.allowed === true;
     record("T14 DNC priority over calling_hours, full checks surfaced", ok, JSON.stringify({
-      blocked_by: r.blocked_by, dnc: r.checks.dnc.allowed, ch: r.checks.calling_hours.allowed, c: r.checks.consent.allowed,
+      blocked_by: r.blocked_by, dnc: r.checks.dnc.allowed, ch: r.checks.calling_hours.allowed, c: r.checks.consent.allowed, oo: r.checks.voice_opt_out.allowed,
     }));
   }
   // T15: all pass → allowed, consent_record_id propagated
@@ -385,6 +402,7 @@ async function runOrchestratorTests() {
       (c) => c.table === "voice_consent_records",
       { data: { id: "consent_z", revoked_at: null } },
     );
+    fake.on((c) => c.table === "voice_opt_outs", { data: null });
     const r = await checkCompliance(asClient(fake), {
       businessId: BIZ,
       phone: PHONE,
@@ -395,6 +413,111 @@ async function runOrchestratorTests() {
     });
     const ok = r.allowed && !r.blocked_by && r.checks.consent.consent_record_id === "consent_z";
     record("T15 all pass → allowed with consent_record_id", ok, JSON.stringify({ allowed: r.allowed, cid: r.checks.consent.consent_record_id }));
+  }
+  // T16 (Phase 5.1) — voice_opt_out hit → highest priority, blocks everything else
+  {
+    const fake = new FakeSupabaseClient();
+    fake.on((c) => c.table === "leads", { data: { do_not_call: false } });
+    fake.on((c) => c.table === "dnc_list", { data: null });
+    fake.on((c) => c.table === "business_configs" && c.selectColumns.includes("outbound_voice_enabled"),
+      bizConfigResponse({}));
+    fake.on((c) => c.table === "voice_consent_records",
+      { data: { id: "consent_q", revoked_at: null } });
+    fake.on((c) => c.table === "voice_opt_outs",
+      { data: { id: "opt_out_1", source: "mid_call_verbal", resubscribed_at: null } });
+    const r = await checkCompliance(asClient(fake), {
+      businessId: BIZ,
+      phone: PHONE,
+      leadId: LEAD,
+      consentType: "appointment_reminder",
+      recipientTimezone: "America/New_York",
+      now: new Date("2026-06-15T15:00:00Z"),
+    });
+    const ok =
+      !r.allowed &&
+      r.blocked_by === "voice_opt_out" &&
+      r.checks.voice_opt_out.opt_out_id === "opt_out_1";
+    record("T16 (Phase 5.1) voice_opt_out beats DNC + consent + hours", ok, JSON.stringify({
+      blocked_by: r.blocked_by, oo_id: r.checks.voice_opt_out.opt_out_id,
+    }));
+  }
+  // T17 (Phase 5.1) — staff_manual_dial bypasses ONLY consent.
+  // In-hours + no opt-out + no DNC → allowed even with no consent record.
+  {
+    const fake = new FakeSupabaseClient();
+    fake.on((c) => c.table === "leads", { data: { do_not_call: false } });
+    fake.on((c) => c.table === "dnc_list", { data: null });
+    fake.on((c) => c.table === "business_configs" && c.selectColumns.includes("outbound_voice_enabled"),
+      bizConfigResponse({}));
+    // NO consent record — would normally block. staff_manual_dial bypass allows it.
+    fake.on((c) => c.table === "voice_consent_records", { data: null });
+    fake.on((c) => c.table === "voice_opt_outs", { data: null });
+    const r = await checkCompliance(asClient(fake), {
+      businessId: BIZ,
+      phone: PHONE,
+      leadId: LEAD,
+      consentType: "staff_manual_dial",   // <-- the exemption
+      recipientTimezone: "America/New_York",
+      now: new Date("2026-06-15T15:00:00Z"), // 11am ET Mon — inside default 08-21
+    });
+    const ok = r.allowed && !r.blocked_by;
+    record("T17 (Phase 5.1) staff_manual_dial bypasses consent (person-to-person, not autodialer)", ok, JSON.stringify({
+      allowed: r.allowed, blocked_by: r.blocked_by,
+    }));
+  }
+  // T17b (Phase 5.1) — staff_manual_dial does NOT bypass voice_opt_out.
+  // A customer who explicitly asked to be removed means it, even for a
+  // person-to-person dial. This is the strongest "no" — no exceptions.
+  {
+    const fake = new FakeSupabaseClient();
+    fake.on((c) => c.table === "leads", { data: { do_not_call: false } });
+    fake.on((c) => c.table === "dnc_list", { data: null });
+    fake.on((c) => c.table === "business_configs" && c.selectColumns.includes("outbound_voice_enabled"),
+      bizConfigResponse({}));
+    fake.on((c) => c.table === "voice_consent_records", { data: null });
+    // Customer has an ACTIVE opt-out on file.
+    fake.on((c) => c.table === "voice_opt_outs",
+      { data: { id: "opt_out_manual_block", source: "mid_call_verbal", resubscribed_at: null } });
+    const r = await checkCompliance(asClient(fake), {
+      businessId: BIZ,
+      phone: PHONE,
+      leadId: LEAD,
+      consentType: "staff_manual_dial",   // manual dial — bypass consent only
+      recipientTimezone: "America/New_York",
+      now: new Date("2026-06-15T15:00:00Z"),
+    });
+    const ok = !r.allowed && r.blocked_by === "voice_opt_out" && r.checks.voice_opt_out.opt_out_id === "opt_out_manual_block";
+    record("T17b (Phase 5.1) staff_manual_dial STILL blocked by voice_opt_out (no exceptions)", ok, JSON.stringify({
+      allowed: r.allowed, blocked_by: r.blocked_by, oo_id: r.checks.voice_opt_out.opt_out_id,
+    }));
+  }
+  // T18 (Phase 5.1) — enforceOutboundEligibility throws on block
+  {
+    const fake = new FakeSupabaseClient();
+    fake.on((c) => c.table === "leads", { data: { do_not_call: false } });
+    fake.on((c) => c.table === "dnc_list", { data: null });
+    fake.on((c) => c.table === "business_configs" && c.selectColumns.includes("outbound_voice_enabled"),
+      bizConfigResponse({}));
+    fake.on((c) => c.table === "voice_consent_records", { data: null });
+    fake.on((c) => c.table === "voice_opt_outs", { data: null });
+    let threw = false;
+    let attachedDecision: any = null;
+    try {
+      await enforceOutboundEligibility(asClient(fake), {
+        businessId: BIZ,
+        phone: PHONE,
+        leadId: LEAD,
+        consentType: "marketing",  // will fail consent check
+        recipientTimezone: "America/New_York",
+        now: new Date("2026-06-15T15:00:00Z"),
+      });
+    } catch (e: any) {
+      threw = true;
+      attachedDecision = e.decision;
+    }
+    const ok = threw && attachedDecision?.blocked_by === "consent";
+    record("T18 (Phase 5.1) enforceOutboundEligibility THROWS on block with decision attached", ok,
+      JSON.stringify({ threw, blocked_by: attachedDecision?.blocked_by }));
   }
 }
 

@@ -34,15 +34,18 @@ import type { SupabaseClient } from "@supabase/supabase-js";
 import { checkDnc, type DncCheckResult } from "../dnc-check";
 import { checkCallingHours, type CallingHoursCheckResult } from "../calling-hours";
 import { checkVoiceConsent, type VoiceConsentCheckResult } from "../voice-consent";
+import { checkVoiceOptOut, type VoiceOptOutCheckResult } from "../voice-opt-out";
 
 export interface ComplianceDecision {
   allowed: boolean;
   checks: {
+    /** Phase 5.1 — internal DNC (§64.1200(d)) — highest priority. */
+    voice_opt_out: VoiceOptOutCheckResult;
     dnc: DncCheckResult;
     calling_hours: CallingHoursCheckResult;
     consent: VoiceConsentCheckResult;
   };
-  blocked_by?: "dnc" | "calling_hours" | "consent";
+  blocked_by?: "voice_opt_out" | "dnc" | "calling_hours" | "consent";
 }
 
 export interface CheckComplianceOptions {
@@ -51,7 +54,15 @@ export interface CheckComplianceOptions {
   phone: string;
   /** Optional. When set, lead-level do_not_call flag is checked. */
   leadId?: string;
-  /** appointment_reminder | callback | marketing | survey | ... */
+  /**
+   * appointment_reminder | callback | marketing | survey | ...
+   *
+   * Phase 5.1 — pass 'staff_manual_dial' for softphone/manually-
+   * initiated calls where TCPA §227(b)(1)(A) does NOT apply
+   * (person-to-person, no autodialer). In that mode the consent
+   * check is bypassed (voice_opt_out + DNC + calling_hours still
+   * gate). Any other value goes through the full consent check.
+   */
   consentType: string;
   /** IANA name e.g. 'America/New_York'. REQUIRED. */
   recipientTimezone: string;
@@ -59,11 +70,39 @@ export interface CheckComplianceOptions {
   now?: Date;
 }
 
+/**
+ * The literal consentType value that means "human at a keyboard
+ * clicked Dial." Kept as a const so the check is grep-able + can't
+ * drift by accidental string edit.
+ */
+export const STAFF_MANUAL_DIAL_CONSENT_TYPE = "staff_manual_dial" as const;
+
 export async function checkCompliance(
   supabase: SupabaseClient,
   opts: CheckComplianceOptions,
 ): Promise<ComplianceDecision> {
-  const [dnc, calling_hours, consent] = await Promise.all([
+  // Phase 5.1 — four gates in parallel now (added voice_opt_out).
+  // Order-independent at execution; PRIORITY is applied on the return
+  // side so `blocked_by` is stable regardless of check completion order.
+  //
+  // For staff_manual_dial (person-initiated, not autodialer per TCPA
+  // §227(b)(1)(A) after Facebook v. Duguid), ONLY the consent gate is
+  // bypassed. The consent requirement targets autodialers; a person
+  // clicking Dial is outside that regime. Everything else STILL gates:
+  //   - voice_opt_out — a customer who said "never call me" means it,
+  //     even for a person-to-person call. The strongest possible "no."
+  //   - dnc — regulatory registry / do-not-call lead flag apply
+  //     regardless of dialer type.
+  //   - calling_hours — tenant-configured window; a manual dial outside
+  //     hours is still an operationally-suspect call. If a staff member
+  //     needs an after-hours emergency exception, that's a per-tenant
+  //     policy call, not a compliance bypass.
+  const isStaffManual = opts.consentType === STAFF_MANUAL_DIAL_CONSENT_TYPE;
+  const [voice_opt_out, dnc, calling_hours, consent] = await Promise.all([
+    checkVoiceOptOut(supabase, {
+      businessId: opts.businessId,
+      phone: opts.phone,
+    }),
     checkDnc(supabase, {
       businessId: opts.businessId,
       phone: opts.phone,
@@ -74,20 +113,69 @@ export async function checkCompliance(
       recipientTimezone: opts.recipientTimezone,
       now: opts.now,
     }),
-    checkVoiceConsent(supabase, {
-      businessId: opts.businessId,
-      phone: opts.phone,
-      consentType: opts.consentType,
-    }),
+    isStaffManual
+      ? Promise.resolve<VoiceConsentCheckResult>({ allowed: true, via_tenant_default: false })
+      : checkVoiceConsent(supabase, {
+          businessId: opts.businessId,
+          phone: opts.phone,
+          consentType: opts.consentType,
+        }),
   ]);
 
-  const checks = { dnc, calling_hours, consent };
+  const checks = { voice_opt_out, dnc, calling_hours, consent };
 
+  // Phase 5.1 — priority: voice_opt_out > dnc > consent > calling_hours.
+  // voice_opt_out is now the highest-priority signal because a customer
+  // who explicitly asked to be removed is the strongest possible "no."
+  // DNC is next (regulatory registry / do-not-call lead flag), then
+  // consent (never call without it), then calling_hours (retryable at
+  // a different time).
+  if (!voice_opt_out.allowed) return { allowed: false, checks, blocked_by: "voice_opt_out" };
   if (!dnc.allowed) return { allowed: false, checks, blocked_by: "dnc" };
   if (!consent.allowed) return { allowed: false, checks, blocked_by: "consent" };
   if (!calling_hours.allowed) return { allowed: false, checks, blocked_by: "calling_hours" };
 
   return { allowed: true, checks };
+}
+
+// ── Phase 5.1: enforceOutboundEligibility — THROWING gate ────────────
+//
+// Every outbound call path (campaign expansion, softphone dial, lead-
+// bridge, future manual buttons) MUST route through here or through
+// placeCall (which internally runs the same checks). This function
+// exists specifically for the "manual dial" paths that don't currently
+// go through placeCall — softphone /voice/outbound in particular.
+//
+// Throws (not returns boolean) so a caller cannot silently ignore the
+// result. On block, throws OutboundEligibilityError with the
+// ComplianceDecision attached so the caller can log the reason.
+//
+// Callers that need a soft/silent check (e.g. UI preview of a campaign
+// segment's expected pass rate) should call checkCompliance directly.
+
+export class OutboundEligibilityError extends Error {
+  constructor(
+    message: string,
+    public readonly decision: ComplianceDecision,
+  ) {
+    super(message);
+    this.name = "OutboundEligibilityError";
+  }
+}
+
+export async function enforceOutboundEligibility(
+  supabase: SupabaseClient,
+  opts: CheckComplianceOptions,
+): Promise<ComplianceDecision> {
+  const decision = await checkCompliance(supabase, opts);
+  if (!decision.allowed) {
+    const err = new OutboundEligibilityError(
+      `outbound blocked: ${decision.blocked_by}`,
+      decision,
+    );
+    throw err;
+  }
+  return decision;
 }
 
 // ── Phase 2.3: checkCampaignEligibility ──────────────────────────────
@@ -111,6 +199,7 @@ export async function checkCompliance(
 // it. The state CHECK includes it for future-proofing.
 
 export type CampaignSkipReason =
+  | "voice_opt_out"
   | "dnc"
   | "consent"
   | "calling_hours"

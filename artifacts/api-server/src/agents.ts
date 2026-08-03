@@ -42,6 +42,13 @@ const ROUTE_TO_TOPIC_TOOL_NAME = 'route_to_topic';
 const DEFAULT_LEADS_CAPTURE_URL = 'https://voice-i-q.replit.app/api/leads/capture';
 const DEFAULT_RECORD_APPOINTMENT_URL = 'https://voice-i-q.replit.app/api/leads/record-appointment';
 const DEFAULT_ROUTE_TO_TOPIC_URL = 'https://voice-i-q.replit.app/api/routing/route-to-topic';
+// Phase 5.1 — mid-call opt-out. Registered UNCONDITIONALLY on every
+// agent (no per-tenant toggle) — non-honoring of a stated opt-out is
+// the fastest path to a TCPA action.
+const DEFAULT_RECORD_OPT_OUT_URL = 'https://voice-i-q.replit.app/api/routing/opt-out';
+const RECORD_OPT_OUT_TOOL_NAME = 'record_opt_out';
+const RECORD_OPT_OUT_DESCRIPTION =
+  "Record that the caller has asked to be removed from future calls (\"take me off your list\", \"stop calling me\", \"do not call\", \"unsubscribe\"). ALWAYS call this tool BEFORE the caller hangs up if they say any variation of stop-calling. Do NOT try to talk them out of it. Do NOT ask why. Confirm briefly, then end the call.";
 
 // Phase 3.2b — description shown to the LLM. Tells it WHEN to invoke
 // route_to_topic and what to say before the tool fires. The tool takes
@@ -442,6 +449,86 @@ export function buildRouteToTopicTool(opts: {
   };
 }
 
+/**
+ * Phase 5.1 — record_opt_out tool.
+ *
+ * ALWAYS registered on every agent (no per-tenant toggle). TCPA
+ * §64.1200(d) requires that a company maintain a do-not-call list
+ * and honor requests to be added to it. Not honoring is the fastest
+ * path to a class-action suit; the tool exists to make honoring
+ * mechanical in the moment.
+ *
+ * Similar plumbing to route_to_topic:
+ *   - Bearer auth via ELEVENLABS_TOOL_SECRET (single shared secret).
+ *   - `phone` uses `system__caller_id` dynamic variable so the LLM
+ *     never has to remember or repeat the phone (avoids "which
+ *     number should I opt out?" branch).
+ *   - `conversation_id` dynamic variable ties the opt-out row to
+ *     the specific call — the endpoint resolves it via calls.call_sid
+ *     for the evidence_call_id column.
+ *   - `pre_tool_speech: 'force'` so Alex acknowledges BEFORE the
+ *     round-trip. Prevents dead air; caller hears "of course, I'll
+ *     take you off the list right away" while the write happens.
+ *   - `tool_error_handling_mode: 'summarized'` so if the endpoint
+ *     500s (shouldn't — we do 200-always) Alex says "I've recorded
+ *     that but there may be a delay" rather than repeating the tool.
+ *   - `execution_mode: 'immediate'` so the tool fires as soon as Alex
+ *     recognizes the intent, without waiting for the caller to finish
+ *     unrelated speech.
+ *
+ * NO business-id enum, NO topic_slug — this is a universal action.
+ * business_id is baked as constant_value per-agent.
+ */
+export function buildRecordOptOutTool(opts: {
+  businessId: string;
+  recordOptOutUrl: string;
+  toolSecret: string;
+}): unknown {
+  return {
+    type: 'webhook',
+    name: RECORD_OPT_OUT_TOOL_NAME,
+    description: RECORD_OPT_OUT_DESCRIPTION,
+    response_timeout_secs: 10,
+    disable_interruptions: false,
+    pre_tool_speech: 'force',
+    tool_error_handling_mode: 'summarized',
+    execution_mode: 'immediate',
+    api_schema: {
+      url: opts.recordOptOutUrl,
+      method: 'POST',
+      content_type: 'application/json',
+      request_headers: {
+        Authorization: `Bearer ${opts.toolSecret}`,
+        'Content-Type': 'application/json',
+      },
+      request_body_schema: {
+        type: 'object',
+        required: ['business_id', 'phone', 'conversation_id'],
+        properties: {
+          business_id: {
+            type: 'string',
+            constant_value: opts.businessId,
+          },
+          phone: {
+            type: 'string',
+            // Auto-injected from SIP caller-ID. LLM never touches this.
+            dynamic_variable: 'system__caller_id',
+          },
+          conversation_id: {
+            type: 'string',
+            dynamic_variable: 'system__conversation_id',
+          },
+          reason_verbatim: {
+            type: 'string',
+            description:
+              "The caller's exact words asking to opt out, in one short quote. Used as evidence for the compliance record. Do NOT paraphrase; use the caller's words. If the caller didn't give words (rare), use \"caller requested removal\".",
+          },
+        },
+      },
+    },
+  };
+}
+
 export async function createAgentForBusiness(opts: {
   businessId: string;
   businessName: string;
@@ -772,6 +859,22 @@ export async function updateAgentTools(
       );
     }
 
+    // Phase 5.1 — record_opt_out tool. UNCONDITIONALLY registered on
+    // every agent. NOT per-tenant configurable. TCPA §64.1200(d)
+    // requires honoring opt-outs; making this a config option would
+    // mean an ops mistake becomes a class-action suit. If a tenant
+    // needs to disable it, they need to file a support ticket and
+    // we edit their agent by hand — but we don't want the UI making
+    // that trivial.
+    const recordOptOutUrl = process.env.RECORD_OPT_OUT_URL || DEFAULT_RECORD_OPT_OUT_URL;
+    nextTools.push(
+      buildRecordOptOutTool({
+        businessId,
+        recordOptOutUrl,
+        toolSecret,
+      }),
+    );
+
     const promptBody: any = { tools: nextTools };
     if (typeof currentPromptText === 'string') {
       promptBody.prompt = currentPromptText;
@@ -829,4 +932,5 @@ export default {
   buildTransferTool,
   buildRequestCallbackTool,
   buildRouteToTopicTool,
+  buildRecordOptOutTool,
 };

@@ -226,7 +226,7 @@ export type PlaceCallResponse =
   | { ok: false; reason: "caller_id_unresolvable" }
   | { ok: false; reason: "tenant_outbound_disabled" }
   | { ok: false; reason: "non_nanp_number_no_tz_inference" }
-  | { ok: false; reason: "compliance_blocked"; blocked_by: "dnc" | "consent" | "calling_hours"; checks: ComplianceDecision["checks"] }
+  | { ok: false; reason: "compliance_blocked"; blocked_by: "voice_opt_out" | "dnc" | "consent" | "calling_hours"; checks: ComplianceDecision["checks"] }
   | { ok: false; reason: "provider_failed"; provider: CallProvider; providerError: string; twilioCode?: number }
   | { ok: false; reason: "db_error"; step: string; error: string }
   /**
@@ -512,6 +512,7 @@ async function placeCallCore(
         reason: "compliance_blocked",
         blocked_by: "dnc",
         checks: {
+          voice_opt_out: { allowed: true },
           dnc: { allowed: false, blocked_by: "tenant_dnc_list" },
           calling_hours: { allowed: false, blocked_by: "tenant_disabled" },
           consent: { allowed: false, blocked_by: "no_record" },

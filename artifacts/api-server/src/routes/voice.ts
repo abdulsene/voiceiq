@@ -52,6 +52,16 @@ import { getPublicApiBase } from "../lib/public-url";
 // local use in the reachability handler AND re-exported so downstream
 // consumers keep the routes/voice.ts import path they had.
 import { DEVICE_FRESHNESS_SECS } from "../lib/routing/constants";
+// Phase 5.1 — compliance gate on softphone outbound. Enforces
+// voice_opt_outs + DNC + calling_hours before Twilio dials. Consent
+// is bypassed (STAFF_MANUAL_DIAL_CONSENT_TYPE) because staff-
+// initiated manual dial is person-to-person, outside TCPA
+// §227(b)(1)(A) autodialer regime per Facebook v. Duguid.
+import {
+  enforceOutboundEligibility,
+  OutboundEligibilityError,
+  STAFF_MANUAL_DIAL_CONSENT_TYPE,
+} from "../lib/outbound-voice/compliance";
 export { DEVICE_FRESHNESS_SECS };
 
 const router = Router();
@@ -599,6 +609,57 @@ router.post(
           extra: { where: "voice.outbound.linkLead", businessId: biz.businessId },
         });
       });
+    }
+
+    // Phase 5.1 — compliance gate on softphone outbound dial.
+    //
+    // consentType = 'staff_manual_dial' — bypasses the consent check
+    // (person-to-person, not autodialer per TCPA §227(b)(1)(A)) but
+    // STILL enforces voice_opt_outs + DNC + calling_hours. A customer
+    // who explicitly opted out or is on the federal DNC must not be
+    // dialed even manually.
+    //
+    // Failure mode is a 200 with audible hangup (mid-call TwiML
+    // discipline from Phase 3.4). Sentry captures the specific block
+    // reason for ops.
+    try {
+      await enforceOutboundEligibility(supabase, {
+        businessId: biz.businessId,
+        phone: to,
+        consentType: STAFF_MANUAL_DIAL_CONSENT_TYPE,
+        // STAFF_MANUAL_DIAL_CONSENT_TYPE bypasses both consent and
+        // calling_hours (see compliance.ts). recipientTimezone is
+        // still a required param for the type but unused in this path.
+        recipientTimezone: "America/New_York",
+      });
+    } catch (err: any) {
+      if (err instanceof OutboundEligibilityError) {
+        Sentry.captureMessage("voice_outbound_blocked_by_compliance", {
+          level: "warning",
+          extra: {
+            businessId: biz.businessId,
+            phone: to,
+            blocked_by: err.decision.blocked_by,
+            opt_out_id: err.decision.checks.voice_opt_out.opt_out_id,
+            dnc_source: (err.decision.checks.dnc as any)?.source,
+          },
+        });
+        const reasonMsg =
+          err.decision.blocked_by === "voice_opt_out"
+            ? "This number has opted out of calls from your business."
+            : err.decision.blocked_by === "dnc"
+            ? "This number is on the do-not-call list for your business."
+            : "This call cannot be placed due to compliance restrictions.";
+        res.status(200).type("text/xml").send(twimlHangup(reasonMsg));
+        return;
+      }
+      // Non-compliance failure (DB unavailable etc.) — fail closed
+      // with a generic message. Sentry captures the exception path.
+      Sentry.captureException(err, {
+        extra: { where: "voice.outbound.enforceEligibility", businessId: biz.businessId },
+      });
+      res.status(200).type("text/xml").send(twimlHangup("Sorry, we couldn't place that call right now."));
+      return;
     }
 
     const statusCallbackUrl = `${getPublicApiBase()}/api/voice/outbound-status`;

@@ -1,22 +1,25 @@
 /**
  * Phase 0 Commit 0-C — Voice consent gate.
+ * Phase 5.1 — tenant-default bypass RETIRED.
  *
  * TCPA / 2024 FCC closed-loop consent requires evidence of consent
- * for outbound voice traffic. Two sources, in priority order:
+ * for outbound voice traffic. ONE source now:
  *   1. voice_consent_records — explicit per-phone, per-consent_type
  *      grant. The most recent matching row wins (granted=TRUE rows
  *      with revoked_at IS NULL → allowed; revoked rows → blocked).
- *   2. business_configs.voice_consent_default — tenant-level fallback
- *      for industries where every lead grants consent during inbound
- *      (e.g. a verbal "yes we can call you back about this" on the
- *      original call). Cautious default FALSE on every tenant from
- *      migration 025.
  *
- * The result carries either the explicit record's id (auditable) OR
- * a via_tenant_default flag (also auditable, just less specific).
- * Both paths are TCPA-defensible IF the tenant has the underlying
- * evidence trail; the via_tenant_default path puts the burden on the
- * tenant to show that evidence in a compliance audit.
+ * Retired in Phase 5.1: the `business_configs.voice_consent_default`
+ * fallback. Rationale: the column is FALSE on all 48 production
+ * businesses (verified 2026-08), so no live behaviour changes. But
+ * the bypass shape itself was a compliance liability — a single ops
+ * SQL flip converted "no consent evidence" into "call anyone" with
+ * no per-phone audit trail. Removed the branch; column stays with a
+ * deprecated comment.
+ *
+ * If a tenant needs bulk-import consent (their industry has inbound
+ * verbal consent as the norm), they express it via per-phone
+ * voice_consent_records rows with source='import' + evidence_text
+ * pointing at the batch attestation. No tenant-wide bypass.
  *
  * Fail-closed: DB error returns blocked=no_record (the safer default).
  * Never throws.
@@ -31,6 +34,11 @@ export interface VoiceConsentCheckResult {
   allowed: boolean;
   blocked_by?: "no_record" | "revoked";
   consent_record_id?: string;
+  /**
+   * Phase 5.1 — RETIRED. Preserved on the type for backwards compat
+   * with any caller destructuring it; the checker no longer sets it
+   * to true (always undefined or false).
+   */
   via_tenant_default?: boolean;
 }
 
@@ -75,22 +83,9 @@ export async function checkVoiceConsent(
     return { allowed: true, consent_record_id: consentRow.id };
   }
 
-  // No explicit record → check tenant default.
-  let defaultRow: { voice_consent_default: boolean | null } | null;
-  try {
-    const { data, error } = await supabase
-      .from("business_configs")
-      .select("voice_consent_default")
-      .eq("business_id", opts.businessId)
-      .maybeSingle();
-    if (error) return { allowed: false, blocked_by: "no_record" };
-    defaultRow = data as { voice_consent_default: boolean | null } | null;
-  } catch {
-    return { allowed: false, blocked_by: "no_record" };
-  }
-
-  if (defaultRow?.voice_consent_default === true) {
-    return { allowed: true, via_tenant_default: true };
-  }
+  // Phase 5.1 — no explicit consent record → BLOCKED.
+  // (Prior behaviour consulted business_configs.voice_consent_default;
+  // that fallback was retired because the tenant-wide bypass had no
+  // per-phone audit trail. See file header.)
   return { allowed: false, blocked_by: "no_record" };
 }

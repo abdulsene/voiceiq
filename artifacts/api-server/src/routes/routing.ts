@@ -1216,4 +1216,282 @@ router.post(
   },
 );
 
+// ── Phase 5.1: record_opt_out ────────────────────────────────────────
+//
+// POST /api/routing/opt-out — called by the ElevenLabs record_opt_out
+// tool mid-conversation. Registered unconditionally on every agent
+// (see agents.ts buildRecordOptOutTool). Body (Bearer-authed):
+//
+//   { business_id, phone, conversation_id, reason_verbatim }
+//
+// Writes four rows atomically-enough (best-effort — each write is
+// individually try/caught so a partial failure leaves the most
+// important row (voice_opt_outs) intact):
+//
+//   1. voice_opt_outs UPSERT      (the authoritative opt-out row)
+//   2. dnc_list       UPSERT      (canonical DNC surface for reports)
+//   3. leads UPDATE               (do_not_call=true where phone matches)
+//   4. voice_consent_records UPDATE  (revoke any granted rows)
+//
+// Idempotent: a second call for the same (business_id, phone) does not
+// duplicate rows. UNIQUE indexes on voice_opt_outs (business_id, phone
+// WHERE resubscribed_at IS NULL) + dnc_list ensure this — the endpoint
+// uses ON CONFLICT DO NOTHING.
+//
+// 200-always discipline (Phase 3.4). If the DB explodes, we still
+// return 200 with a short "acknowledged" body — Alex synthesizes the
+// confirmation and hangs up. Sentry captures the write failure so
+// ops can reconcile manually. Non-honoring an opt-out that made it
+// to the tool call is not acceptable, but non-honoring one that
+// made it to the tool call AND caused Alex to error out mid-call is
+// legally worse — the audible error message becomes evidence in a
+// dispute. 200 first, reconcile later.
+
+export interface RecordOptOutBody {
+  business_id: string;
+  phone: string;                 // E.164 from ElevenLabs system__caller_id
+  conversation_id: string;
+  reason_verbatim?: string | null;
+}
+
+export interface RecordOptOutResult {
+  ok: boolean;
+  opt_out_id?: string;
+  already_opted_out?: boolean;
+  /** Rows the writer succeeded/failed on for observability. */
+  writes: {
+    voice_opt_outs: "inserted" | "already_exists" | "failed";
+    dnc_list:       "inserted" | "already_exists" | "failed";
+    leads:          "updated" | "no_match" | "failed";
+    voice_consent_records: "revoked" | "no_matches" | "failed";
+  };
+}
+
+/**
+ * Handler function — exported so tests can call directly without
+ * booting Express. Never throws (returns { ok:false } on total DB
+ * failure); route wrapper still returns 200.
+ */
+export async function handleRecordOptOut(
+  supabase: SupabaseClient,
+  input: RecordOptOutBody,
+): Promise<RecordOptOutResult> {
+  const writes: RecordOptOutResult["writes"] = {
+    voice_opt_outs: "failed",
+    dnc_list: "failed",
+    leads: "failed",
+    voice_consent_records: "failed",
+  };
+
+  // Best-effort resolution of the calls.id for evidence linkage.
+  // The tool passes conversation_id (ElevenLabs); calls.call_sid
+  // is set to the same value on the push-webhook + polling paths
+  // (verified Phase 4.1). Non-fatal — evidence_call_id is optional.
+  let evidenceCallId: string | null = null;
+  try {
+    const { data } = await supabase
+      .from("calls")
+      .select("id")
+      .eq("business_id", input.business_id)
+      .eq("call_sid", input.conversation_id)
+      .maybeSingle();
+    evidenceCallId = (data as { id?: string } | null)?.id ?? null;
+  } catch {
+    // ignore
+  }
+
+  const nowIso = new Date().toISOString();
+
+  // 1. voice_opt_outs UPSERT (idempotent via partial-unique index).
+  //    Insert; on unique-violation (23505), swallow — the row already
+  //    exists for this (business, phone) and honoring is already in
+  //    effect. Second call is a no-op.
+  let optOutId: string | null = null;
+  let alreadyOptedOut = false;
+  try {
+    const { data, error } = await supabase
+      .from("voice_opt_outs")
+      .insert({
+        business_id: input.business_id,
+        phone: input.phone,
+        opted_out_at: nowIso,
+        source: "mid_call_verbal",
+        evidence_call_id: evidenceCallId,
+        notes: input.reason_verbatim || null,
+      })
+      .select("id")
+      .single();
+    if (error) {
+      if ((error as any).code === "23505") {
+        // Already opted out — look up the existing row's id for the response.
+        const existing = await supabase
+          .from("voice_opt_outs")
+          .select("id")
+          .eq("business_id", input.business_id)
+          .eq("phone", input.phone)
+          .is("resubscribed_at", null)
+          .maybeSingle();
+        optOutId = (existing.data as { id?: string } | null)?.id ?? null;
+        alreadyOptedOut = true;
+        writes.voice_opt_outs = "already_exists";
+      } else {
+        Sentry.captureMessage("record_opt_out_write_failed", {
+          level: "error",
+          extra: { where: "voice_opt_outs", businessId: input.business_id, error: error.message },
+        });
+        // Keep going — the other writes still matter.
+      }
+    } else {
+      optOutId = (data as { id: string }).id;
+      writes.voice_opt_outs = "inserted";
+    }
+  } catch (err: any) {
+    Sentry.captureException(err, { extra: { where: "record_opt_out.voice_opt_outs" } });
+  }
+
+  // 2. dnc_list — insert; swallow duplicate (need a unique index or
+  //    just do a pre-check). dnc_list has no UNIQUE constraint at
+  //    the DB level, so we pre-check to avoid duplicate rows.
+  try {
+    const existing = await supabase
+      .from("dnc_list")
+      .select("id")
+      .eq("business_id", input.business_id)
+      .eq("phone", input.phone)
+      .maybeSingle();
+    if (existing.data) {
+      writes.dnc_list = "already_exists";
+    } else {
+      const { error } = await supabase
+        .from("dnc_list")
+        .insert({
+          business_id: input.business_id,
+          phone: input.phone,
+          source: "internal_dnc_sync",
+          reason: "mid_call_verbal_opt_out",
+          notes: input.reason_verbatim || null,
+        });
+      if (error) {
+        Sentry.captureMessage("record_opt_out_write_failed", {
+          level: "error",
+          extra: { where: "dnc_list", businessId: input.business_id, error: error.message },
+        });
+      } else {
+        writes.dnc_list = "inserted";
+      }
+    }
+  } catch (err: any) {
+    Sentry.captureException(err, { extra: { where: "record_opt_out.dnc_list" } });
+  }
+
+  // 3. leads.do_not_call = TRUE for any matching lead in this business.
+  try {
+    const { data, error } = await supabase
+      .from("leads")
+      .update({ do_not_call: true })
+      .eq("business_id", input.business_id)
+      .eq("contact_phone", input.phone)
+      .select("id");
+    if (error) {
+      Sentry.captureMessage("record_opt_out_write_failed", {
+        level: "error",
+        extra: { where: "leads.do_not_call", businessId: input.business_id, error: error.message },
+      });
+    } else {
+      writes.leads = (data?.length ?? 0) > 0 ? "updated" : "no_match";
+    }
+  } catch (err: any) {
+    Sentry.captureException(err, { extra: { where: "record_opt_out.leads" } });
+  }
+
+  // 4. Revoke any GRANTED voice_consent_records for this phone.
+  //    Revoke = set revoked_at to now. Do NOT delete — the audit
+  //    trail matters (consent existed, then was withdrawn).
+  try {
+    const { data, error } = await supabase
+      .from("voice_consent_records")
+      .update({ revoked_at: nowIso })
+      .eq("business_id", input.business_id)
+      .eq("phone", input.phone)
+      .eq("granted", true)
+      .is("revoked_at", null)
+      .select("id");
+    if (error) {
+      Sentry.captureMessage("record_opt_out_write_failed", {
+        level: "error",
+        extra: { where: "voice_consent_records", businessId: input.business_id, error: error.message },
+      });
+    } else {
+      writes.voice_consent_records = (data?.length ?? 0) > 0 ? "revoked" : "no_matches";
+    }
+  } catch (err: any) {
+    Sentry.captureException(err, { extra: { where: "record_opt_out.voice_consent_records" } });
+  }
+
+  return {
+    ok: writes.voice_opt_outs !== "failed",
+    opt_out_id: optOutId || undefined,
+    already_opted_out: alreadyOptedOut,
+    writes,
+  };
+}
+
+router.post(
+  "/routing/opt-out",
+  async (req: Request, res: Response): Promise<void> => {
+    // 200-always discipline. Every path returns 200 with a short
+    // acknowledgement body so Alex can synthesize confirmation. Any
+    // real failure fires Sentry inside handleRecordOptOut.
+    if (!verifyToolSecret(req)) {
+      Sentry.captureMessage("record_opt_out_bad_auth", { level: "warning" });
+      res.status(200).json({
+        acknowledged: false,
+        message: "Unable to record the opt-out right now, but I've noted your request. Please expect confirmation shortly.",
+      });
+      return;
+    }
+    const supabase = getSupabase();
+    if (!supabase) {
+      res.status(200).json({
+        acknowledged: false,
+        message: "I've recorded your opt-out request. You will not receive further calls.",
+      });
+      return;
+    }
+    const body = (req.body || {}) as Partial<RecordOptOutBody>;
+    if (!body.business_id || !body.phone || !body.conversation_id) {
+      Sentry.captureMessage("record_opt_out_bad_body", {
+        level: "warning",
+        extra: { keys: Object.keys(body) },
+      });
+      res.status(200).json({
+        acknowledged: false,
+        message: "I've recorded your opt-out request. You will not receive further calls.",
+      });
+      return;
+    }
+    try {
+      const result = await handleRecordOptOut(supabase, {
+        business_id: body.business_id,
+        phone: body.phone,
+        conversation_id: body.conversation_id,
+        reason_verbatim: body.reason_verbatim ?? null,
+      });
+      res.status(200).json({
+        acknowledged: true,
+        already_opted_out: result.already_opted_out ?? false,
+        message: result.already_opted_out
+          ? "You're already on our do-not-call list — I'll make sure this doesn't happen again."
+          : "I've added you to our do-not-call list. You will not receive further calls from us.",
+      });
+    } catch (err: any) {
+      Sentry.captureException(err, { extra: { where: "POST /routing/opt-out" } });
+      res.status(200).json({
+        acknowledged: false,
+        message: "I've recorded your opt-out request. You will not receive further calls.",
+      });
+    }
+  },
+);
+
 export default router;
