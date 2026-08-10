@@ -593,7 +593,7 @@ async function performRegenerate(
   const { data: cfg, error: cfgErr } = await ctx.supabase
     .from("business_configs")
     .select(
-      "business_id, business_name, industry, business_hours, timezone, owner_name, services, website, phone_number, languages, spanish_enabled, french_enabled, custom_faqs, objection_handling, tone_preference, never_say_list, website_context_text, agent_id, system_prompt, departments",
+      "business_id, business_name, industry, business_hours, timezone, owner_name, services, website, phone_number, languages, spanish_enabled, french_enabled, custom_faqs, objection_handling, tone_preference, never_say_list, website_context_text, agent_id, system_prompt, departments, transfer_enabled, record_appointment_enabled",
     )
     .eq("business_id", ctx.businessId)
     .maybeSingle();
@@ -657,6 +657,15 @@ async function performRegenerate(
           (t) => t && typeof t === "object" && typeof t.slug === "string" && typeof t.name === "string",
         )
       : null,
+    // Phase 5.3 — gate prose that references transfer_to_number or
+    // record_appointment on those tools actually being registered on
+    // the agent. Renderer defaults to legacy-include when
+    // toolsAvailable is undefined, so passing explicit booleans here
+    // is what unlocks the sanitized output.
+    toolsAvailable: {
+      transfer: !!cfgRow.transfer_enabled,
+      record_appointment: !!cfgRow.record_appointment_enabled,
+    },
   });
 
   return performSaveAndSync({

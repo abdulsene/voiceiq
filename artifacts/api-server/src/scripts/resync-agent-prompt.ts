@@ -86,13 +86,19 @@ interface BusinessConfigRow {
   never_say_list: string[] | null;
   website_context_text: string | null;
   agent_id: string | null;
+  // Phase 5.3 — tool flags passed to the renderer so tool references
+  // are gated on actual registration state.
+  transfer_enabled: boolean | null;
+  record_appointment_enabled: boolean | null;
+  departments: unknown;
 }
 
 const SELECT_COLUMNS =
   "business_id, business_name, industry, business_hours, timezone, " +
   "owner_name, services, website, phone_number, languages, " +
   "spanish_enabled, french_enabled, custom_faqs, objection_handling, " +
-  "tone_preference, never_say_list, website_context_text, agent_id";
+  "tone_preference, never_say_list, website_context_text, agent_id, " +
+  "transfer_enabled, record_appointment_enabled, departments";
 
 async function fetchIndustryTemplate(
   supabase: SupabaseClient,
@@ -182,6 +188,15 @@ async function main(): Promise<void> {
     objectionHandlersFromTable: null,
     tonePreference: row.tone_preference,
     neverSayList: row.never_say_list,
+    topics: Array.isArray(row.departments)
+      ? (row.departments as any[]).filter(
+          (t) => t && typeof t === "object" && typeof t.slug === "string" && typeof t.name === "string",
+        )
+      : null,
+    toolsAvailable: {
+      transfer: !!row.transfer_enabled,
+      record_appointment: !!row.record_appointment_enabled,
+    },
   });
   const mentionsRequestCallback = newPrompt.includes("request_callback");
   const mentionsSaveLead = newPrompt.includes("save_lead");

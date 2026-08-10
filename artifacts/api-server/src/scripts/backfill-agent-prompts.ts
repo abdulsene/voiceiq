@@ -112,6 +112,11 @@ interface BusinessConfigRow {
   website_context_text: string | null;
   agent_id: string | null;
   system_prompt: string | null;
+  // Phase 5.3 — tool flags passed to the renderer so tool references
+  // are gated on actual registration state.
+  transfer_enabled: boolean | null;
+  record_appointment_enabled: boolean | null;
+  departments: unknown;
 }
 
 const SELECT_COLUMNS =
@@ -119,7 +124,7 @@ const SELECT_COLUMNS =
   "owner_name, services, website, phone_number, languages, " +
   "spanish_enabled, french_enabled, custom_faqs, objection_handling, " +
   "tone_preference, never_say_list, website_context_text, agent_id, " +
-  "system_prompt";
+  "system_prompt, transfer_enabled, record_appointment_enabled, departments";
 
 async function fetchIndustryTemplate(
   supabase: SupabaseClient,
@@ -182,6 +187,15 @@ async function processBusiness(
     objectionHandlersFromTable: null,
     tonePreference: row.tone_preference,
     neverSayList: row.never_say_list,
+    topics: Array.isArray(row.departments)
+      ? (row.departments as any[]).filter(
+          (t) => t && typeof t === "object" && typeof t.slug === "string" && typeof t.name === "string",
+        )
+      : null,
+    toolsAvailable: {
+      transfer: !!row.transfer_enabled,
+      record_appointment: !!row.record_appointment_enabled,
+    },
   });
 
   if (!newPrompt.includes("request_callback") || newPrompt.includes("save_lead")) {

@@ -27,6 +27,8 @@
  * delete the shim.
  */
 
+import { cleanScrapedText } from "./scrape-clean";
+
 export interface IndustryTemplate {
   industry_id: string;
   name: string;
@@ -35,6 +37,107 @@ export interface IndustryTemplate {
   value_props?: string[] | null;
   call_scripts?: Array<{ name: string; trigger: string; script: string }> | null;
   appointment_types?: string[] | null;
+}
+
+// ───────────────────────────────────────────────────────────────────────
+// Phase 5.3 — content-safety sanitizers.
+//
+// The Supabase-hosted `industry_templates.call_scripts` JSONB is
+// populated by ops out-of-band. Two live defects observed in the
+// car_rental row:
+//
+//   (a) Unresolved template placeholders leaked into rendered prompts —
+//       "$X/day", "$Y/day", "$Z/day", "{quotes}". Alex will speak these
+//       aloud (mid-2026 GPT-class models don't semantically recognize
+//       them as gaps). Rather than trust every ops author to keep
+//       templates clean, the renderer refuses to emit prose with
+//       unfilled placeholders and substitutes a request_callback
+//       fallback so Alex captures the caller's ask instead of quoting
+//       fake figures.
+//
+//   (b) Capability claims about integrations we don't have — "live
+//       inventory", "real-time availability". These invite the LLM to
+//       hallucinate rates. Same fix path: detect, replace with a
+//       callback fallback that captures caller intent so the human
+//       team can quote accurately.
+//
+// Both defects are systemic in the sense that any of the ~200 ops-
+// authored templates can drift into either shape. Sanitizing at the
+// renderer means all 200+ verticals inherit the fix — no data
+// backfill needed. When ops does clean up an offending row, the
+// sanitizer becomes a no-op automatically.
+
+// Placeholders we treat as unresolved:
+//   \$[A-Z](?![a-z])   — $X, $Y, $Z, $XX, but NOT $150 or $Xavier
+//   \{[a-z_][\w]*\}    — {quotes}, {business_name}, {price}
+//   \[[A-Z][A-Z_ ]{1,}\] — [BUSINESS NAME], [X], [PROVIDER_NAME]
+const UNRESOLVED_PLACEHOLDER_RE =
+  /(\$[A-Z](?![a-z])|\{[a-z_][\w]*\}|\[[A-Z][A-Z_ ]{1,}\])/;
+
+// Capability claims that require an integration we don't have. Kept
+// short + literal because false positives (stripping legit prose) are
+// much less costly than false negatives (Alex quoting hallucinated
+// live pricing). If we ever ship a real integration, the flag is
+// what unlocks the language, not editing this list.
+const FALSE_CAPABILITY_PHRASES: readonly RegExp[] = [
+  /\blive\s+inventory\b/i,
+  /\breal[-\s]?time\s+inventory\b/i,
+  /\bcurrent\s+inventory\b/i,
+  /\bfrom\s+live\s+(?:pricing|rates?)\b/i,
+  /\breal[-\s]?time\s+(?:pricing|availability|rates?)\b/i,
+  /\blive\s+(?:pricing|availability|rates?)\b/i,
+];
+
+function hasUnresolvedPlaceholder(s: string): boolean {
+  return UNRESOLVED_PLACEHOLDER_RE.test(s);
+}
+
+function hasFalseCapabilityClaim(s: string): boolean {
+  return FALSE_CAPABILITY_PHRASES.some((re) => re.test(s));
+}
+
+/**
+ * Fallback prose we substitute for any script whose body fails
+ * sanitization. Deliberately steers Alex toward request_callback (the
+ * always-registered tool) rather than trying to salvage the caller
+ * with a partial script. Trigger heading remains intact upstream, so
+ * Alex still recognizes the situation — she just handles it by
+ * capture-and-hand-off instead of quoting fake data.
+ */
+const CALLBACK_FALLBACK_SCRIPT =
+  "You cannot quote specific figures or check live availability for this. Capture the caller's " +
+  "name, phone number, and their specific request using the request_callback tool so the team " +
+  "can follow up with accurate details. Do NOT invent numbers, dates, or availability.";
+
+interface SanitizeResult {
+  script: string;
+  redacted: boolean;
+  reason?: "placeholder" | "false_capability";
+}
+
+/** @internal exported for unit tests. */
+export function sanitizeScriptBody(raw: string): SanitizeResult {
+  const trimmed = (raw || "").trim();
+  if (!trimmed) return { script: "", redacted: false };
+  if (hasUnresolvedPlaceholder(trimmed)) {
+    return { script: CALLBACK_FALLBACK_SCRIPT, redacted: true, reason: "placeholder" };
+  }
+  if (hasFalseCapabilityClaim(trimmed)) {
+    return { script: CALLBACK_FALLBACK_SCRIPT, redacted: true, reason: "false_capability" };
+  }
+  return { script: trimmed, redacted: false };
+}
+
+/** @internal exported for unit tests. */
+export function sanitizeValueProp(raw: string): string | null {
+  const trimmed = (raw || "").trim();
+  if (!trimmed) return null;
+  // Value props are advertised capabilities. Anything unresolved or
+  // hallucinatory is dropped entirely — there's no "fallback prose"
+  // for a bullet in a HOW YOU HELP CALLERS list.
+  if (hasUnresolvedPlaceholder(trimmed)) return null;
+  if (hasFalseCapabilityClaim(trimmed)) return null;
+  return trimmed;
 }
 
 const LANGUAGE_BLOCKS: Record<string, { header: string; block: (biz: string) => string; greeting: (biz: string) => string }> = {
@@ -313,7 +416,28 @@ export function renderPromptFromHelpers(opts: {
     description?: string | null;
     example_utterances?: string[] | null;
   }> | null;
+  // Phase 5.3 — the tool set actually registered on this business's
+  // ElevenLabs agent (from business_configs.transfer_enabled +
+  // record_appointment_enabled). Gates prose that references tools
+  // that aren't attached — the renderer must NEVER tell Alex to "use
+  // record_appointment for scheduling" if that tool isn't registered,
+  // and must NEVER promise "warm-transfer to a human" if transfer is
+  // off. request_callback is always registered so it's not gated.
+  //
+  // Undefined = legacy behavior (keep all language). All new callers
+  // should pass the real flags; the legacy default is preserved so
+  // the byte-perfect regression test and any older callers don't
+  // regress.
+  toolsAvailable?: {
+    record_appointment?: boolean;
+    transfer?: boolean;
+  };
 }): string {
+  // Phase 5.3 gates. `undefined` treated as legacy true — see the
+  // toolsAvailable JSDoc above.
+  const recordAppointmentAvailable =
+    opts.toolsAvailable?.record_appointment !== false;
+  const transferAvailable = opts.toolsAvailable?.transfer !== false;
   const tmpl = opts.industryTemplate;
   const industryLabel = tmpl?.name || opts.industry;
 
@@ -329,10 +453,19 @@ BUSINESS INFORMATION:
 ${opts.services ? "- Services: " + opts.services : ""}`;
 
   if (opts.websiteContext && opts.websiteContext.trim().length > 0) {
-    prompt += `
+    // Phase 5.3 — dedup + boilerplate strip in-place. The scraper
+    // (scraping.ts) applies the same cleaner on ingest, but
+    // business_configs rows that were populated before that shipped
+    // still carry raw nav-repeat noise. Rendering-time cleaning is a
+    // cheap safety net that catches those without a data backfill;
+    // idempotent on already-clean text.
+    const cleaned = cleanScrapedText(opts.websiteContext);
+    if (cleaned.length > 0) {
+      prompt += `
 
 BUSINESS WEBSITE CONTEXT (specific details about THIS business pulled from their website — use these facts over generic assumptions, and never contradict what's here):
-${opts.websiteContext.trim()}`;
+${cleaned}`;
+    }
   }
 
   if (tmpl?.description) {
@@ -350,13 +483,33 @@ ${tmpl.pain_points.map(p => `- ${p}`).join("\n")}`;
   }
 
   if (tmpl?.value_props && tmpl.value_props.length > 0) {
-    prompt += `
+    // Phase 5.3 — filter value props for unresolved placeholders and
+    // hallucinated-capability claims. See sanitizeValueProp above.
+    const cleanValueProps = tmpl.value_props
+      .map((v) => sanitizeValueProp(v))
+      .filter((v): v is string => v !== null);
+    if (cleanValueProps.length > 0) {
+      prompt += `
 
 HOW YOU HELP CALLERS (the specific value you provide — use these to guide your responses):
-${tmpl.value_props.map(v => `- ${v}`).join("\n")}`;
+${cleanValueProps.map((v) => `- ${v}`).join("\n")}`;
+    }
   }
 
   if (tmpl?.call_scripts && tmpl.call_scripts.length > 0) {
+    // Phase 5.3 — sanitize each script's body. Placeholder-carrying or
+    // false-capability scripts get their body replaced with a
+    // request_callback fallback; the trigger heading stays so Alex
+    // still recognizes the situation.
+    const cleanedScripts = tmpl.call_scripts
+      .filter((s) => s && s.name && s.trigger && typeof s.script === "string")
+      .map((s) => ({
+        name: s.name,
+        trigger: s.trigger,
+        ...sanitizeScriptBody(s.script),
+      }));
+    const anyRedacted = cleanedScripts.some((s) => s.redacted);
+
     prompt += `
 
 CALL PLAYBOOK — Use these scripts when the situation matches the trigger.
@@ -364,7 +517,16 @@ These are calibrated specifically for ${industryLabel} businesses. Adapt the
 phrasing to the caller's tone but follow the structure and information gathering
 steps closely.
 `;
-    for (const s of tmpl.call_scripts) {
+    if (anyRedacted) {
+      prompt += `
+Note: some scripts below have been intentionally redacted to a callback-capture
+fallback because the source material contained unfilled data placeholders or
+claims of capabilities you do not have. When the situation applies, capture the
+caller with request_callback rather than invent specifics — the team will
+follow up with accurate figures.
+`;
+    }
+    for (const s of cleanedScripts) {
       prompt += `
 ### ${s.name}
 When this happens: ${s.trigger}
@@ -410,9 +572,17 @@ DEPARTMENTS & TOPIC EXPERTISE (when a caller's request matches one of these topi
   Example utterances the caller might say: ${utterances.map((u) => `"${u.trim()}"`).join(", ")}`;
       }
     }
+    // Phase 5.3 — gate the "use record_appointment for scheduling"
+    // hint on the tool actually being registered. When it's off, tell
+    // Alex to route scheduling intent through request_callback (the
+    // always-registered fallback) instead — otherwise she'll invoke a
+    // tool that isn't attached and the LLM will hallucinate around it.
+    const schedulingGuidance = recordAppointmentAvailable
+      ? "Do NOT invoke it for scheduling — use record_appointment for that."
+      : "Do NOT invoke it for scheduling — you cannot check the calendar live; capture scheduling requests with request_callback so the team can confirm the time.";
     prompt += `
 
-Do NOT invoke route_to_topic for simple questions you can answer yourself (business hours, address, general policies). Do NOT invoke it for scheduling — use record_appointment for that. Only invoke when the caller needs a specialist right now.`;
+Do NOT invoke route_to_topic for simple questions you can answer yourself (business hours, address, general policies). ${schedulingGuidance} Only invoke when the caller needs a specialist right now.`;
   }
 
   if (opts.tonePreference && opts.tonePreference.trim().length > 0) {
@@ -484,6 +654,19 @@ ${cleanList.join("\n")}`;
     }
   }
 
+  // Phase 5.3 — gate transfer language on the transfer tool actually
+  // being registered. When transfer is off, item 5 collapses to a
+  // callback-only responsibility and the BUSINESS HOURS block drops
+  // "transfer to the team". Prevents Alex from promising a warm
+  // transfer that will never fire (transfer_to_number tool isn't in
+  // her tool set → LLM hallucinates the transfer motion).
+  const responsibility5 = transferAvailable
+    ? "Route urgent matters appropriately — warm-transfer to a human when appropriate, or capture a callback request when transfer is not the right call"
+    : "Route urgent matters by capturing a callback request with the request_callback tool — you do NOT have the ability to transfer calls to a human on this line";
+  const businessHoursInService = transferAvailable
+    ? "Full service — answer questions, route, transfer to the team, and capture callback requests as needed"
+    : "Full service — answer questions and capture callback requests as needed; you cannot transfer callers to a human on this line";
+
   prompt += `
 
 YOUR ROLE:
@@ -494,7 +677,7 @@ YOUR RESPONSIBILITIES:
 2. Understand why they are calling and how you can help
 3. Capture their name, phone number, and reason for calling
 4. Answer common questions about the business
-5. Route urgent matters appropriately — warm-transfer to a human when appropriate, or capture a callback request when transfer is not the right call
+5. ${responsibility5}
 6. Use the request_callback tool to capture a follow-up request whenever you cannot fully resolve the caller's need in the moment
 
 CONVERSATION STYLE:
@@ -505,7 +688,7 @@ CONVERSATION STYLE:
 - Always confirm important details before ending the call
 
 BUSINESS HOURS:
-- During hours (${opts.business_hours}): Full service — answer questions, route, transfer to the team, and capture callback requests as needed
+- During hours (${opts.business_hours}): ${businessHoursInService}
 - After hours: Take a detailed message via the request_callback tool, confirm when the caller can expect a response, and let them know the team will reach back
 
 CAPTURING CALLBACK REQUESTS:
@@ -513,7 +696,11 @@ You have one tool for follow-up: request_callback. Use it whenever you cannot fu
 - The caller asks for a callback, a text, an email, or "have someone get in touch"
 - The business is closed or the team isn't reachable right now
 - The caller wants to schedule something — you cannot check the calendar live, so capture the request as a callback and let the team confirm the time
-- The caller asks a question you don't have an answer for and warm-transfer isn't appropriate (caller declines, or no operator is available)
+- The caller asks a question you don't have an answer for${
+    transferAvailable
+      ? " and warm-transfer isn't appropriate (caller declines, or no operator is available)"
+      : " (you cannot transfer on this line, so callback is the correct handoff)"
+  }
 - A non-urgent follow-up where the caller doesn't need real-time help
 
 Before invoking the tool, confirm these out loud with the caller, one item at a time:

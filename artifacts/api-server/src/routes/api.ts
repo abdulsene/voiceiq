@@ -3927,6 +3927,22 @@ router.patch("/business/:businessId/agent", requireAuth, async (req: Request, re
       languages: body.languages || config.languages || [],
       spanish_enabled: body.spanish_enabled ?? config.spanish_enabled ?? false,
       french_enabled: body.french_enabled ?? config.french_enabled ?? false,
+      // Phase 5.3 — gate tool references on actual registration.
+      // config-save reflects the just-persisted body plus the pre-
+      // existing DB row; prefer the incoming body when set. The
+      // as-any casts are unfortunate but tsc infers `body`/`config`
+      // as narrower types further up this handler due to prior
+      // guards; the runtime shape is a JSONB row so string keys work.
+      toolsAvailable: {
+        transfer: !!(
+          (body as any).transfer_enabled ??
+          (config as any).transfer_enabled
+        ),
+        record_appointment: !!(
+          (body as any).record_appointment_enabled ??
+          (config as any).record_appointment_enabled
+        ),
+      },
     });
 
     const langOpts = {

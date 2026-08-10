@@ -1,5 +1,6 @@
 import * as cheerio from "cheerio";
 import { globalDailyCap } from "./rateLimiter";
+import { cleanScrapedText } from "./lib/scrape-clean";
 
 export interface ScrapedData {
   success: boolean;
@@ -197,7 +198,13 @@ async function scrapeCheerio(homepageUrl: string): Promise<ScrapedData> {
 
   combinedStructured.pages_scraped = pagesScraped;
 
-  const contextText = allText.join("\n\n").substring(0, MAX_CONTEXT_CHARS);
+  // Phase 5.3 — clean BEFORE capping to MAX_CONTEXT_CHARS so we spend
+  // the char budget on signal (facts, positioning) rather than nav
+  // repeats. Capping after clean also lets us drop the mid-word tail
+  // that a naive substring produced.
+  const rawJoined = allText.join("\n\n");
+  const cleaned = cleanScrapedText(rawJoined);
+  const contextText = cleaned.substring(0, MAX_CONTEXT_CHARS);
 
   if (contextText.length < 400) {
     return { success: false, reason: "insufficient_content", tier_used: "cheerio" };
@@ -279,11 +286,17 @@ async function scrapeFirecrawl(homepageUrl: string): Promise<ScrapedData> {
       .slice(0, 15);
     if (services.length > 0) structured.services = services;
 
+    // Phase 5.3 — even Firecrawl's onlyMainContent markdown carries
+    // duplicate hero blocks on sites with heavy above-fold repetition.
+    // Same cleaner as the Cheerio path; dedup + boilerplate strip
+    // before the char cap.
+    const cleanedMarkdown = cleanScrapedText(markdown);
+
     return {
       success: true,
       tier_used: "firecrawl",
       structured,
-      context_text: markdown.substring(0, MAX_CONTEXT_CHARS),
+      context_text: cleanedMarkdown.substring(0, MAX_CONTEXT_CHARS),
       scraped_at: new Date().toISOString(),
     };
   } catch (e: any) {
