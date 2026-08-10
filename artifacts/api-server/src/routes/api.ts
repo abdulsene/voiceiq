@@ -4945,10 +4945,13 @@ router.get("/sms/usage-check", requireAuth, async (req: Request, res: Response) 
     if (supabase) {
       const { data: biz } = await supabase
         .from("business_configs")
-        .select("plan")
+        .select("plan_id, plan")
         .eq("business_id", bid)
         .single();
-      if (biz?.plan) planId = biz.plan;
+      // Phase 5.2: plan_id is authoritative (Stripe webhook writes),
+      // legacy `plan` column may be stale/null on tenants onboarded via
+      // Stripe checkout. Prefer plan_id, fall back to plan, then default.
+      planId = (biz as any)?.plan_id || (biz as any)?.plan || planId;
     }
 
     const now = new Date();
@@ -5033,10 +5036,10 @@ router.post("/sms/campaign", requireAuth, async (req: Request, res: Response) =>
     let planId = "starter";
     const { data: biz } = await supabase
       .from("business_configs")
-      .select("plan")
+      .select("plan_id, plan")
       .eq("business_id", bid)
       .single();
-    if (biz?.plan) planId = biz.plan;
+    planId = (biz as any)?.plan_id || (biz as any)?.plan || planId;
 
     const now = new Date();
     const monthStart = new Date(now.getFullYear(), now.getMonth(), 1).toISOString().split("T")[0];
@@ -5196,8 +5199,8 @@ router.get("/sms/conversations", requireAuth, async (req: Request, res: Response
   const bid = req.businessId || "";
   const supabaseCheck = getSupabase();
   if (supabaseCheck) {
-    const { data: planData } = await supabaseCheck.from("business_configs").select("plan").eq("business_id", bid).single();
-    const plan = planData?.plan || "starter";
+    const { data: planData } = await supabaseCheck.from("business_configs").select("plan_id, plan").eq("business_id", bid).single();
+    const plan = (planData as any)?.plan_id || (planData as any)?.plan || "starter";
     if (!["growth", "business", "enterprise"].includes(plan)) {
       res.status(403).json({ error: "Two-way SMS conversations require Growth plan or above." });
       return;
@@ -5260,8 +5263,8 @@ router.get("/sms/conversations/:phone", requireAuth, async (req: Request, res: R
   const bid = req.businessId || "";
   const supabaseCheck = getSupabase();
   if (supabaseCheck) {
-    const { data: planData } = await supabaseCheck.from("business_configs").select("plan").eq("business_id", bid).single();
-    const plan = planData?.plan || "starter";
+    const { data: planData } = await supabaseCheck.from("business_configs").select("plan_id, plan").eq("business_id", bid).single();
+    const plan = (planData as any)?.plan_id || (planData as any)?.plan || "starter";
     if (!["growth", "business", "enterprise"].includes(plan)) {
       res.status(403).json({ error: "Two-way SMS conversations require Growth plan or above." });
       return;
@@ -5385,8 +5388,8 @@ router.get("/sms/sequences", requireAuth, async (req: Request, res: Response) =>
   const bid = req.businessId || "";
   const supabaseCheck = getSupabase();
   if (supabaseCheck) {
-    const { data: planData } = await supabaseCheck.from("business_configs").select("plan").eq("business_id", bid).single();
-    const plan = planData?.plan || "starter";
+    const { data: planData } = await supabaseCheck.from("business_configs").select("plan_id, plan").eq("business_id", bid).single();
+    const plan = (planData as any)?.plan_id || (planData as any)?.plan || "starter";
     if (!["professional", "growth", "business", "enterprise"].includes(plan)) {
       res.status(403).json({ error: "Sequences require Professional plan or above." });
       return;
@@ -5426,8 +5429,8 @@ router.post("/sms/sequences", requireAuth, async (req: Request, res: Response) =
   const bid = req.businessId || "";
   const supabaseCheck = getSupabase();
   if (supabaseCheck) {
-    const { data: planData } = await supabaseCheck.from("business_configs").select("plan").eq("business_id", bid).single();
-    const plan = planData?.plan || "starter";
+    const { data: planData } = await supabaseCheck.from("business_configs").select("plan_id, plan").eq("business_id", bid).single();
+    const plan = (planData as any)?.plan_id || (planData as any)?.plan || "starter";
     if (!["professional", "growth", "business", "enterprise"].includes(plan)) {
       res.status(403).json({ error: "Sequences require Professional plan or above." });
       return;
@@ -5474,8 +5477,8 @@ router.put("/sms/sequences/:id", requireAuth, async (req: Request, res: Response
   const bid = req.businessId || "";
   const supabaseCheck = getSupabase();
   if (supabaseCheck) {
-    const { data: planData } = await supabaseCheck.from("business_configs").select("plan").eq("business_id", bid).single();
-    const plan = planData?.plan || "starter";
+    const { data: planData } = await supabaseCheck.from("business_configs").select("plan_id, plan").eq("business_id", bid).single();
+    const plan = (planData as any)?.plan_id || (planData as any)?.plan || "starter";
     if (!["professional", "growth", "business", "enterprise"].includes(plan)) {
       res.status(403).json({ error: "Sequences require Professional plan or above." });
       return;
@@ -5509,8 +5512,8 @@ router.delete("/sms/sequences/:id", requireAuth, async (req: Request, res: Respo
   const bid = req.businessId || "";
   const supabaseCheck = getSupabase();
   if (supabaseCheck) {
-    const { data: planData } = await supabaseCheck.from("business_configs").select("plan").eq("business_id", bid).single();
-    const plan = planData?.plan || "starter";
+    const { data: planData } = await supabaseCheck.from("business_configs").select("plan_id, plan").eq("business_id", bid).single();
+    const plan = (planData as any)?.plan_id || (planData as any)?.plan || "starter";
     if (!["professional", "growth", "business", "enterprise"].includes(plan)) {
       res.status(403).json({ error: "Sequences require Professional plan or above." });
       return;
@@ -5895,6 +5898,16 @@ router.get("/business/configure", requireAuth, async (req: Request, res: Respons
         config = { ...config, transfer_config: rows[0].transfer_config };
       }
     } catch {}
+    // Phase 5.2 — plan gating fix. Multiple front-end gates read
+    // `config.plan` (SettingsPage transfer triggers, webhook section,
+    // SmsCampaigns, SequencesTab) but Stripe onboarding writes
+    // business_configs.plan_id, leaving the legacy `plan` column null
+    // or stale. Normalize server-side so `config.plan` is always the
+    // canonical value; leave `config.plan_id` intact for callers that
+    // already read it.
+    const canonicalPlan =
+      (config as any).plan_id || (config as any).plan || "starter";
+    config = { ...config, plan: canonicalPlan };
   }
 
   res.json({
@@ -5946,8 +5959,8 @@ router.post("/locations", requireAuth, async (req: Request, res: Response) => {
   const supabase = getSupabase();
   if (!supabase) { res.status(500).json({ error: "Database unavailable" }); return; }
 
-  const { data: planData } = await supabase.from("business_configs").select("plan").eq("business_id", bid).single();
-  const plan = planData?.plan || "starter";
+  const { data: planData } = await supabase.from("business_configs").select("plan_id, plan").eq("business_id", bid).single();
+  const plan = (planData as any)?.plan_id || (planData as any)?.plan || "starter";
   const maxLocations = PLAN_LOCATION_LIMITS[plan] || 1;
 
   const { rows: existing } = await contactPool.query(
@@ -6078,11 +6091,15 @@ router.get("/webhooks/config", requireAuth, async (req: Request, res: Response) 
   const bid = req.businessId || "";
   const { data } = await supabase
     .from("business_configs")
-    .select("webhook_config, plan")
+    .select("webhook_config, plan_id, plan")
     .eq("business_id", bid)
     .single();
 
-  const plan = data?.plan || "starter";
+  // Phase 5.2: plan_id is authoritative (Stripe webhooks + admin surfaces
+  // write there). Fall back to legacy `plan` column for pre-migration
+  // tenants, then to "starter". Front-end reads `.plan` so we keep that
+  // key name in the response shape.
+  const plan = data?.plan_id || data?.plan || "starter";
   let wh = data?.webhook_config || null;
   if (typeof wh === "string") { try { wh = JSON.parse(wh); } catch { wh = null; } }
 
@@ -6096,11 +6113,11 @@ router.post("/webhooks/config", requireAuth, async (req: Request, res: Response)
   const bid = req.businessId || "";
   const { data: bizData } = await supabase
     .from("business_configs")
-    .select("plan")
+    .select("plan_id, plan")
     .eq("business_id", bid)
     .single();
 
-  const plan = bizData?.plan || "starter";
+  const plan = bizData?.plan_id || bizData?.plan || "starter";
   const allowedPlans = ["professional", "business", "enterprise"];
   if (!allowedPlans.includes(plan)) {
     res.status(403).json({ error: "Webhooks are available on Professional plan and above." });
@@ -7172,10 +7189,10 @@ router.get("/usage/:businessId", requireAuth, async (req: Request, res: Response
     if (supabase) {
       const { data: biz } = await supabase
         .from("business_configs")
-        .select("plan")
+        .select("plan_id, plan")
         .eq("business_id", businessId)
         .single();
-      if (biz?.plan) planId = biz.plan;
+      planId = (biz as any)?.plan_id || (biz as any)?.plan || planId;
     }
 
     const { rows: planRows } = await contactPool.query(

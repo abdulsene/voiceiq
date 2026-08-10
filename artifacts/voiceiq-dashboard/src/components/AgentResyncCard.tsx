@@ -32,6 +32,15 @@ interface ResyncResponse extends AgentToolsResponse {
   resync_ok: boolean;
   started_at: string;
   finished_at: string;
+  // Phase 5.2 — resync now regenerates + pushes the system prompt
+  // alongside the tools array. When the prompt path is skipped (e.g.
+  // missing business_name/industry, or no agent yet), prompt_synced is
+  // false and prompt_skipped_reason explains why.
+  prompt_synced?: boolean;
+  prompt_chars?: number | null;
+  prompt_sync_error?: string | null;
+  prompt_skipped_reason?: string | null;
+  tools_sync_error?: string | null;
 }
 
 export default function AgentResyncCard() {
@@ -41,6 +50,11 @@ export default function AgentResyncCard() {
   const [error, setError] = useState<string | null>(null);
   const [resyncing, setResyncing] = useState(false);
   const [lastResyncAt, setLastResyncAt] = useState<string | null>(null);
+  const [lastPromptStatus, setLastPromptStatus] = useState<
+    | { synced: true; chars: number | null }
+    | { synced: false; reason: string }
+    | null
+  >(null);
 
   const refresh = async () => {
     setLoading(true);
@@ -77,6 +91,15 @@ export default function AgentResyncCard() {
       setTools(data.registered_tools);
       setAgentId(data.agent_id);
       setLastResyncAt(data.finished_at);
+      if (data.prompt_synced) {
+        setLastPromptStatus({ synced: true, chars: data.prompt_chars ?? null });
+      } else if (data.prompt_sync_error) {
+        setLastPromptStatus({ synced: false, reason: data.prompt_sync_error });
+      } else if (data.prompt_skipped_reason) {
+        setLastPromptStatus({ synced: false, reason: data.prompt_skipped_reason });
+      } else {
+        setLastPromptStatus(null);
+      }
     } catch (e) {
       setError((e as Error).message);
     } finally {
@@ -164,6 +187,28 @@ export default function AgentResyncCard() {
           })()
         ) : null}
       </div>
+
+      {lastPromptStatus ? (
+        lastPromptStatus.synced ? (
+          <div className="mt-3 flex items-start gap-2 rounded-md bg-emerald-50 p-2.5 text-xs text-emerald-800">
+            <CheckCircle2 className="h-4 w-4 mt-0.5 shrink-0" />
+            <span>
+              System prompt regenerated and pushed to ElevenLabs
+              {typeof lastPromptStatus.chars === "number"
+                ? ` (${lastPromptStatus.chars.toLocaleString()} chars)`
+                : ""}
+              .
+            </span>
+          </div>
+        ) : (
+          <div className="mt-3 flex items-start gap-2 rounded-md bg-amber-50 p-2.5 text-xs text-amber-800">
+            <AlertTriangle className="h-4 w-4 mt-0.5 shrink-0" />
+            <span>
+              Tools synced, but the system prompt was not pushed: {lastPromptStatus.reason}.
+            </span>
+          </div>
+        )
+      ) : null}
 
       <div className="mt-3 text-[11px] text-neutral-400 flex flex-wrap gap-3">
         {agentId ? <span>agent: <span className="font-mono">{agentId}</span></span> : <span>No agent provisioned yet</span>}

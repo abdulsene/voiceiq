@@ -71,6 +71,9 @@ interface TransferStateResponse {
   transfer_wait_message: string | null;
   transfer_warm_message: string | null;
   twilio_phone_number: string | null;
+  // Phase 5.2 — extended loop-guard + topic-routing conflict signals.
+  business_phone_number?: string | null;
+  configured_topics_count?: number;
   defaults: {
     transfer_conditions: string;
     transfer_wait_message: string;
@@ -87,6 +90,8 @@ interface PutResponse {
   transfer_wait_message: string | null;
   transfer_warm_message: string | null;
   twilio_phone_number: string | null;
+  business_phone_number?: string | null;
+  configured_topics_count?: number;
   sync: { ok: boolean; error: string | null };
 }
 
@@ -249,7 +254,22 @@ export default function TransferTab({
   // Client-side loop-guard preview. The server still authoritatively
   // rejects, but showing it before the click saves a round-trip.
   const phoneLoops = form.enabled && !!parsedPhone && phonesEquivalent(parsedPhone, state?.twilio_phone_number ?? null);
+  // Phase 5.2 — second loop-guard preview: matching the tenant's
+  // registered business line (which typically forwards INTO the Twilio
+  // number) also creates a loop. Server hard-rejects with
+  // code:"loop_via_business_line"; we render an amber warning before
+  // the round-trip.
+  const phoneMatchesBusinessLine =
+    form.enabled &&
+    !!parsedPhone &&
+    phonesEquivalent(parsedPhone, state?.business_phone_number ?? null);
   const saveDisabled = saving || !dirty || phoneInvalid || phoneMissing;
+  // Phase 5.2 — topic-routing conflict banner: renders when transfer is
+  // ON AND the tenant has topics configured. Not a hard block; the two
+  // tools can coexist, but ops needs to see that route_to_topic will
+  // pull ahead of transfer_to_number on any caller-intent overlap.
+  const topicsCount = state?.configured_topics_count ?? 0;
+  const showTopicConflictBanner = form.enabled && topicsCount > 0;
 
   function handleDiscard() {
     if (!state) return;
@@ -293,6 +313,8 @@ export default function TransferTab({
         transfer_wait_message: ok.transfer_wait_message,
         transfer_warm_message: ok.transfer_warm_message,
         twilio_phone_number: ok.twilio_phone_number,
+        business_phone_number: ok.business_phone_number ?? state?.business_phone_number ?? null,
+        configured_topics_count: ok.configured_topics_count ?? state?.configured_topics_count ?? 0,
         defaults: state?.defaults || {
           transfer_conditions: "",
           transfer_wait_message: "",
@@ -402,6 +424,35 @@ export default function TransferTab({
         </div>
       )}
 
+      {/* Phase 5.2 — topic-routing supersession notice. When transfer is
+          ON AND the tenant has topics configured, Alex will prefer
+          route_to_topic on any topical match (the tool descriptions in
+          agents.ts intentionally overlap on "human on the phone"
+          scenarios). Framed as an information banner, not a blocker —
+          the two paths can coexist, but ops needs to understand which
+          fires first. */}
+      {showTopicConflictBanner && (
+        <div
+          className="rounded-xl border border-sky-200 bg-sky-50 px-4 py-3 text-sm text-sky-900 flex items-start gap-2.5"
+          role="note"
+        >
+          <AlertTriangle className="h-4 w-4 shrink-0 mt-0.5 text-sky-500" aria-hidden="true" />
+          <div className="leading-snug">
+            <p className="font-medium">
+              Topic-based routing takes precedence over legacy transfer.
+            </p>
+            <p className="mt-1 text-xs">
+              You have {topicsCount}{" "}
+              {topicsCount === 1 ? "topic" : "topics"} configured. When a
+              caller's request matches a topic, Alex routes to the
+              on-duty specialist via <code>route_to_topic</code>. Legacy
+              transfer below only fires OUTSIDE those topics — enabling
+              both is a conflict, not a belt-and-braces layered fallback.
+            </p>
+          </div>
+        </div>
+      )}
+
       {form.enabled && (
         <div className="space-y-5 motion-safe:animate-in motion-safe:fade-in-0 motion-safe:slide-in-from-top-2 motion-safe:duration-200 motion-safe:ease-out">
           {/* Section 1 — Where to transfer */}
@@ -467,6 +518,25 @@ export default function TransferTab({
                   <AlertTriangle className="h-3.5 w-3.5 shrink-0 mt-0.5" aria-hidden="true" />
                   <span>
                     {t("transfer.loopPillWarning", { twilioNumber: prettyTwilio })}
+                  </span>
+                </div>
+              )}
+
+              {/* Phase 5.2 — second loop pill: transfer destination
+                  equals the tenant's registered business line, which
+                  usually forwards INTO their Twilio number. Renders
+                  reactively only when the entered phone matches, so
+                  it's a "you just entered a looping number" prompt
+                  rather than an ambient reminder. */}
+              {phoneMatchesBusinessLine && state?.business_phone_number && (
+                <div className="mt-2 flex items-start gap-2 rounded-md border border-red-300 bg-red-50 px-3 py-2 text-xs leading-snug text-red-800">
+                  <AlertTriangle className="h-3.5 w-3.5 shrink-0 mt-0.5" aria-hidden="true" />
+                  <span>
+                    This is your registered business line
+                    ({formatPhoneForDisplay(state.business_phone_number)}). If
+                    that line forwards to your Neverr number, transferring here
+                    creates a call loop. Enter a direct extension instead (e.g.
+                    a manager's cell).
                   </span>
                 </div>
               )}

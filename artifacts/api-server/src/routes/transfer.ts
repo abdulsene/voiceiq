@@ -72,12 +72,23 @@ type TransferRow = {
   business_id: string;
   business_name: string | null;
   twilio_phone_number: string | null;
+  // Phase 5.2: the tenant's registered *business* line (the number
+  // published on their website / signs). When a tenant forwards their
+  // business line INTO twilio_phone_number, re-populating
+  // transfer_to_phone with the business line creates a call loop.
+  phone_number: string | null;
   agent_id: string | null;
   transfer_enabled: boolean;
   transfer_to_phone: string | null;
   transfer_conditions: string | null;
   transfer_wait_message: string | null;
   transfer_warm_message: string | null;
+  // Phase 5.2: topic-based routing (route_to_topic) is the newer flow
+  // and its tool description competes with legacy transfer_to_number's
+  // conditions ("reports an emergency or breakdown"). We surface a
+  // conflict notice in the UI when both are enabled + configured so
+  // ops sees the interaction rather than assuming they layer additively.
+  departments: unknown;
 };
 
 async function loadTransferRow(
@@ -87,7 +98,7 @@ async function loadTransferRow(
   const { data, error } = await supabase
     .from("business_configs")
     .select(
-      "business_id, business_name, twilio_phone_number, agent_id, transfer_enabled, transfer_to_phone, transfer_conditions, transfer_wait_message, transfer_warm_message",
+      "business_id, business_name, twilio_phone_number, phone_number, agent_id, transfer_enabled, transfer_to_phone, transfer_conditions, transfer_wait_message, transfer_warm_message, departments",
     )
     .eq("business_id", businessId)
     .maybeSingle();
@@ -96,6 +107,13 @@ async function loadTransferRow(
     return null;
   }
   return (data as TransferRow) || null;
+}
+
+function countConfiguredTopics(row: TransferRow): number {
+  if (!Array.isArray(row.departments)) return 0;
+  return (row.departments as any[]).filter(
+    (t) => t && typeof t === "object" && typeof t.slug === "string" && typeof t.name === "string",
+  ).length;
 }
 
 function digitsOnly(phone: string): string {
@@ -193,10 +211,41 @@ async function handleTransferSave(opts: {
       res.status(400).json({
         error:
           "Transfer destination cannot be the same number Twilio is forwarding to this agent — that would create a call loop.",
+        code: "loop_direct",
         twilio_phone_number: current.twilio_phone_number,
       });
       return;
     }
+  }
+
+  // Phase 5.2 — extended loop guard for the "forwards through us"
+  // case. When a tenant's business_configs.phone_number (their main
+  // published business line) has been forwarded into
+  // twilio_phone_number, re-entering that same business line as the
+  // transfer destination sends every transferred call right back into
+  // Neverr. This happened for EZ Rentals: main line forwards to our
+  // Twilio; if ops re-populated transfer_to_phone with the main line,
+  // Alex → main line → forwards to Twilio → Alex → …
+  //
+  // Reject rather than warn: production impact is a call-cost loop
+  // plus a caller stuck in an AI loop, both of which are trust
+  // catastrophes. If a tenant legitimately wants transfer to a number
+  // that happens to equal their phone_number field, they can update
+  // phone_number first (that's the business record, not a routing
+  // configuration).
+  if (
+    parsed.enabled &&
+    parsed.phone &&
+    current.phone_number &&
+    digitsOnly(parsed.phone) === digitsOnly(current.phone_number)
+  ) {
+    res.status(400).json({
+      error:
+        "Transfer destination matches your registered business phone number. If that line forwards to your Neverr number, this would create a call loop — pick a direct extension (e.g. a manager's cell) instead.",
+      code: "loop_via_business_line",
+      business_phone_number: current.phone_number,
+    });
+    return;
   }
 
   // First-time-enable defaults. Only seed when the customer is turning
@@ -277,6 +326,8 @@ async function handleTransferSave(opts: {
     transfer_wait_message: saved?.transfer_wait_message ?? null,
     transfer_warm_message: saved?.transfer_warm_message ?? null,
     twilio_phone_number: saved?.twilio_phone_number ?? null,
+    business_phone_number: saved?.phone_number ?? null,
+    configured_topics_count: saved ? countConfiguredTopics(saved) : 0,
     sync: {
       ok: sync.success,
       error: sync.error ?? null,
@@ -314,6 +365,9 @@ router.get(
       transfer_wait_message: row.transfer_wait_message,
       transfer_warm_message: row.transfer_warm_message,
       twilio_phone_number: row.twilio_phone_number,
+      // Phase 5.2 — surface loop-guard + conflict signals to the UI.
+      business_phone_number: row.phone_number,
+      configured_topics_count: countConfiguredTopics(row),
       defaults: {
         transfer_conditions: DEFAULT_CONDITIONS,
         transfer_wait_message: DEFAULT_WAIT_MESSAGE,
@@ -377,6 +431,9 @@ router.get(
       transfer_wait_message: row.transfer_wait_message,
       transfer_warm_message: row.transfer_warm_message,
       twilio_phone_number: row.twilio_phone_number,
+      // Phase 5.2 — surface loop-guard + conflict signals to the UI.
+      business_phone_number: row.phone_number,
+      configured_topics_count: countConfiguredTopics(row),
       defaults: {
         transfer_conditions: DEFAULT_CONDITIONS,
         transfer_wait_message: DEFAULT_WAIT_MESSAGE,

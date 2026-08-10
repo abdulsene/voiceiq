@@ -31,6 +31,7 @@ import * as Sentry from "@sentry/node";
 
 import { requireAuth, requirePermission } from "../middlewares/auth";
 import { updateAgentTools } from "../agents";
+import { performRegenerate } from "./prompt";
 
 const router = Router();
 
@@ -127,6 +128,7 @@ router.post(
   requirePermission("settings", "write"),
   async (req: Request, res: Response): Promise<void> => {
     const businessId = req.businessId;
+    const userId = req.userId;
     if (!businessId) {
       res.status(400).json({ error: "No active business" });
       return;
@@ -137,34 +139,112 @@ router.post(
       return;
     }
     const startedAt = new Date();
-    const sync = await updateAgentTools(supabase, businessId);
-    if (!sync.success) {
-      res.status(502).json({
-        error: sync.error || "resync_failed",
-        started_at: startedAt.toISOString(),
-      });
-      return;
+
+    // Phase 5.2 — resync now regenerates the system prompt from the
+    // canonical helpers/config FIRST (updating prompt_last_synced_at
+    // and writing an audit row), THEN falls through to updateAgentTools
+    // for the tool array. Previously we PATCHed only the tools and
+    // echoed the ElevenLabs-side prompt back verbatim — so any renderer
+    // change that shipped after the last owner /regenerate (e.g. the
+    // Phase 3.2b DEPARTMENTS & TOPIC EXPERTISE section) never landed
+    // on the live agent even after the operator hit "Resync now".
+    //
+    // Fallback: if the business is missing helpers required for
+    // rendering (business_name/industry/business_hours) OR has no
+    // ElevenLabs agent yet, performRegenerate returns { status: 4xx }
+    // — we still run updateAgentTools so the tool-only path keeps
+    // working for pre-onboarding businesses.
+    let promptSynced = false;
+    let promptChars: number | null = null;
+    let promptSyncError: string | null = null;
+    let promptSkippedReason: string | null = null;
+
+    const regen = await performRegenerate({
+      supabase,
+      businessId,
+      userId: userId || "system",
+      source: "owner_helpers_regen",
+      ipAddress: req.ip ?? null,
+      userAgent: (req.headers["user-agent"] as string) ?? null,
+    }).catch((err: any): { ok: false; status: 500; error: string } => ({
+      ok: false,
+      status: 500,
+      error: err?.message || "regenerate_threw",
+    }));
+
+    if ("status" in regen && regen.status) {
+      // 404 (no business), 409 (missing helpers OR no agent_id), 500
+      // (DB read threw). Fall through to tools-only sync so pre-onboard
+      // businesses can still register callback/opt-out tools.
+      promptSkippedReason = regen.error;
+    } else if (regen.ok) {
+      promptSynced = true;
+      promptChars = regen.charsWritten;
+      // performSaveAndSync already invokes updateAgentTools on success,
+      // so the tool array is up-to-date. Skip the second call.
+    } else {
+      // ok:false with savedToDb:true — prompt written to DB but the
+      // ElevenLabs PATCH failed. Report the error and still attempt a
+      // tool-only sync (best-effort, may also fail).
+      promptSyncError = regen.syncError;
     }
-    // Re-read to report the ACTUAL registered tool set (not just "we
-    // sent a PATCH"). If ElevenLabs silently rejected any tool we
-    // wanted to register, the returned list will be missing it — the
-    // UI can render a warning.
+
+    // Tools sync: skipped only when performRegenerate already ran it
+    // (regen.ok === true). Otherwise run it so tools land even if the
+    // prompt path fell back.
+    let toolsSyncOk = true;
+    let toolsSyncError: string | null = null;
+    if (!promptSynced) {
+      const sync = await updateAgentTools(supabase, businessId);
+      toolsSyncOk = sync.success;
+      toolsSyncError = sync.error ?? null;
+    }
+
     const readback = await fetchRegisteredToolNames(supabase, businessId);
     const finishedAt = new Date();
+
+    // Choose the top-level resync_ok: prompt synced OR tools synced.
+    // If BOTH failed (prompt sync error + tools sync error) the caller
+    // gets resync_ok:false with the reasons.
+    const resyncOk = promptSynced || toolsSyncOk;
+
     if (!readback.ok) {
       res.status(207).json({
-        resync_ok: true,
+        resync_ok: resyncOk,
         readback_ok: false,
         readback_error: readback.error,
+        prompt_synced: promptSynced,
+        prompt_sync_error: promptSyncError,
+        prompt_skipped_reason: promptSkippedReason,
+        prompt_chars: promptChars,
+        tools_sync_error: toolsSyncError,
         started_at: startedAt.toISOString(),
         finished_at: finishedAt.toISOString(),
       });
       return;
     }
+
+    if (!resyncOk) {
+      Sentry.captureMessage("agent_resync_all_paths_failed", {
+        level: "error",
+        extra: {
+          businessId,
+          agentId: readback.agentId,
+          promptSyncError,
+          toolsSyncError,
+        },
+      });
+    }
+
     res.json({
-      resync_ok: true,
+      resync_ok: resyncOk,
       agent_id: readback.agentId,
       registered_tools: readback.toolNames,
+      prompt_synced: promptSynced,
+      prompt_chars: promptChars,
+      prompt_sync_error: promptSyncError,
+      prompt_skipped_reason: promptSkippedReason,
+      tools_sync_error: toolsSyncError,
       started_at: startedAt.toISOString(),
       finished_at: finishedAt.toISOString(),
     });

@@ -1169,3 +1169,11 @@ export default router;
 
 /** @internal */
 export { performSaveAndSync, validateHelpersBody };
+
+/**
+ * Public export — used by routes/agent-sync.ts so the "Resync now" card
+ * regenerates AND pushes the system prompt (Phase 5.2). Signature is
+ * unchanged from the internal helper; callers must supply their own
+ * ctx.source (`owner_helpers_regen` for owner-triggered resyncs).
+ */
+export { performRegenerate };
