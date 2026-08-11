@@ -2,6 +2,8 @@ import express, { type Express, type Request, type Response, type NextFunction }
 import cors from "cors";
 import helmet from "helmet";
 import rateLimit from "express-rate-limit";
+import { resolveUserIdSoft } from "./middlewares/resolve-user";
+import { createRateLimiters } from "./middlewares/rate-limit";
 import { v4 as uuidv4 } from "uuid";
 import * as Sentry from "@sentry/node";
 import router from "./routes";
@@ -85,13 +87,16 @@ app.use(
   })
 );
 
-const generalLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 100,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { error: "Too many requests, please try again later" },
-});
+// Phase 5.6 commit 2 — replaces the pre-5.6 single 100/15min IP-keyed
+// generalLimiter with a two-limiter split:
+//   userLimiter (900/15min per userId) for authenticated requests
+//   ipLimiter   (100/15min per IP)     for everything else
+// Dispatched per-request by inspecting req.userId (set upstream by
+// resolveUserIdSoft, which does a cached Supabase auth.getUser). This
+// stops multi-user tenants behind one office NAT from sharing a
+// bucket and getting the whole team logged out. See middlewares/
+// rate-limit.ts for the handler that reports every trip.
+const { dispatch: rateLimitDispatch } = createRateLimiters();
 
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
@@ -105,7 +110,11 @@ const authLimiter = rateLimit({
 // per-route handlers in routes/api.ts can apply it directly (e.g. /onboard).
 // Single shared instance — see ../rateLimiter for the definition.
 
-app.use("/api", generalLimiter);
+// resolveUserIdSoft MUST run before rateLimitDispatch so req.userId is
+// populated for the dispatcher's branch. Both are mounted on /api so
+// they cover the same surface as the pre-5.6 generalLimiter.
+app.use("/api", resolveUserIdSoft);
+app.use("/api", rateLimitDispatch);
 app.use("/api/auth/login", authLimiter);
 app.use("/api/auth/signup", authLimiter);
 app.use("/api/auth/refresh", authLimiter);
