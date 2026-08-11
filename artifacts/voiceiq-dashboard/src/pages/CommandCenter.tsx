@@ -311,6 +311,25 @@ export default function CommandCenter() {
 
   useEffect(() => { loadData(); }, [loadData]);
 
+  // Phase 4.4 — filter the recent-calls strip by direction. Stats
+  // below (callsToday etc.) intentionally do NOT filter — headline
+  // numbers should always reflect the full data set regardless of
+  // the user's list-view preference.
+  //
+  // Phase 5.5 — this useMemo MUST run before the `if (loading) return`
+  // early return below, or React sees a hook-count change between
+  // the loading-true and loading-false renders (React error #310,
+  // "rendered more hooks than during the previous render"). That
+  // crash was blanking the dashboard for a staff user whose data
+  // fetch failed on 404s — surfaced as a blank page with no
+  // affordance to recover. Reordering hooks before returns is the
+  // canonical fix; the linter (react-hooks/rules-of-hooks) would
+  // have caught this if it were enabled.
+  const filteredCalls = useMemo(
+    () => calls.filter((c) => matchesDirection(directionFilter, c.direction)),
+    [calls, directionFilter],
+  );
+
   const toggleAction = (id: string) => {
     setCompletedActions((prev) => {
       const next = new Set(prev);
@@ -335,15 +354,6 @@ export default function CommandCenter() {
   const callsToday = calls.filter((c) => new Date(c.created_at) >= todayStart);
   const callsThisMonth = calls.filter((c) => new Date(c.created_at) >= monthStart);
   const callsLast30 = calls.filter((c) => new Date(c.created_at) >= thirtyDaysAgo);
-
-  // Phase 4.4 — filter the recent-calls strip by direction. Stats
-  // above (callsToday etc.) intentionally do NOT filter — headline
-  // numbers should always reflect the full data set regardless of
-  // the user's list-view preference.
-  const filteredCalls = useMemo(
-    () => calls.filter((c) => matchesDirection(directionFilter, c.direction)),
-    [calls, directionFilter],
-  );
 
   const leadsMonth = callsThisMonth.filter((c) => c.caller_name && c.caller_name !== "Unknown" && c.caller_number).length;
   const apptsMonth = callsThisMonth.filter((c) => c.call_outcome?.includes("book") || c.call_outcome?.includes("appoint")).length;

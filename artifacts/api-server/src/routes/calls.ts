@@ -180,7 +180,7 @@ router.get(
 router.get(
   "/calls/:id",
   requireAuth,
-  async (req: Request, res: Response): Promise<void> => {
+  async (req: Request, res: Response, next): Promise<void> => {
     const businessId = req.businessId;
     if (!businessId) {
       res.status(400).json({ error: "No active business" });
@@ -191,9 +191,24 @@ router.get(
       res.status(400).json({ error: "id required" });
       return;
     }
-    // UUID shape check — cheap 404 before hitting DB for obvious junk.
+    // Phase 5.5 — fall through instead of 404ing on non-UUID params.
+    //
+    // /calls/:id used to hard-404 anything that didn't match the UUID
+    // shape. Fine when the only sibling was /calls/resolve (declared
+    // above and matched first by Express), but the CATCH-ALL apiRouter
+    // in routes/api.ts also declares /calls/stats and /calls/recent,
+    // mounted AFTER this router in routes/index.ts. Result: every
+    // request for /api/calls/stats or /api/calls/recent hit this
+    // handler, failed the UUID check, and 404ed before reaching the
+    // real endpoint. Surfaced as a blank dashboard for a staff user
+    // whose CommandCenter fetch cascade rejected — the frontend then
+    // hit a separate hook-count bug and crashed the whole tree.
+    //
+    // Passing `next()` lets Express continue the middleware chain to
+    // the next matching handler, which is the /calls/stats or
+    // /calls/recent implementation in the apiRouter mount.
     if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) {
-      res.status(404).json({ error: "Call not found" });
+      next();
       return;
     }
     const supabase = getSupabase();
