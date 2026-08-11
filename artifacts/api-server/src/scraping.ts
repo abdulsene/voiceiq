@@ -71,6 +71,59 @@ function isJsRenderedShell(html: string): boolean {
   return bodyText.length < 500;
 }
 
+/**
+ * Phase 5.4 — extract body text while preserving DOM structure.
+ *
+ * The bug this fixes: `$("body").text()` walks the DOM depth-first
+ * and concatenates every text node with no inter-element separator.
+ * Then the historical `.replace(/\s+/g, " ")` collapse folded any
+ * HTML-native whitespace (indentation, minified markup, etc) into
+ * single spaces. Result: a nav bar like `<ul><li><a>Home</a></li>
+ * <li><a>About</a></li></ul>` produced "HomeAbout" — a single 8-char
+ * segment with no way to dedup nav repetitions downstream.
+ *
+ * Fix: insert explicit `\n` (block-level) or ` ` (inline like <a>)
+ * boundaries BEFORE `.text()`, then collapse horizontal whitespace
+ * only, leaving newlines intact so lib/scrape-clean.ts has real
+ * segment boundaries to work with.
+ *
+ * `<a>` gets a space instead of newline because `<a>` is also used
+ * for inline prose links ("See our <a>pricing</a> page"). A newline
+ * there would fragment sentences; a space preserves the word
+ * boundary without splitting the sentence.
+ *
+ * Called from scrapeCheerio in both the homepage and secondary-page
+ * loops. isJsRenderedShell keeps its historical single-line collapse
+ * (only used for the length-threshold shell check — structure
+ * doesn't matter for that gate).
+ */
+const BLOCK_SELECTOR =
+  "br, p, div, li, h1, h2, h3, h4, h5, h6, section, article, header, footer, nav, ul, ol, tr, td, dt, dd, blockquote, pre, main, aside, form";
+
+/** @internal exported for scraping.test.ts. */
+export function extractBodyTextStructured($: cheerio.CheerioAPI): string {
+  // <br> is a hard line break in visual rendering; treat as \n.
+  $("br").replaceWith("\n");
+  // Append \n inside every block element so text() concatenation
+  // gets a boundary between sibling blocks.
+  $(BLOCK_SELECTOR).each((_, el) => {
+    $(el).append("\n");
+  });
+  // Append a space inside every <a> so "HomeAbout" (concatenated
+  // nav) becomes "Home About " without splitting inline prose links.
+  $("a").each((_, el) => {
+    $(el).append(" ");
+  });
+  const raw = $("body").text();
+  // Collapse horizontal whitespace but PRESERVE \n so segments have
+  // boundaries. Then collapse runs of newlines to single \n.
+  return raw
+    .replace(/[ \t\f\v\r]+/g, " ")
+    .replace(/\n\s*\n+/g, "\n")
+    .replace(/[ \t]*\n[ \t]*/g, "\n")
+    .trim();
+}
+
 function extractStructured($: cheerio.CheerioAPI, _url: string): Partial<NonNullable<ScrapedData["structured"]>> {
   const structured: Partial<NonNullable<ScrapedData["structured"]>> = {};
 
@@ -162,7 +215,11 @@ async function scrapeCheerio(homepageUrl: string): Promise<ScrapedData> {
   pagesScraped.push(homepageUrl);
 
   $home("script, style, noscript").remove();
-  const homeText = $home("body").text().replace(/\s+/g, " ").trim();
+  // Phase 5.4 — structure-preserving extraction (see comment on
+  // extractBodyTextStructured). The old `.text().replace(/\s+/g, " ")`
+  // collapsed a nav bar to a single "HomeAbout"-style blob with no
+  // segment boundaries, which defeated downstream dedup.
+  const homeText = extractBodyTextStructured($home);
   allText.push(`=== ${homepageUrl} ===\n${homeText.substring(0, 3000)}`);
 
   const navLinks = findRelevantLinks($home, homepageUrl);
@@ -191,7 +248,7 @@ async function scrapeCheerio(homepageUrl: string): Promise<ScrapedData> {
     }
 
     $("script, style, noscript").remove();
-    const pageText = $("body").text().replace(/\s+/g, " ").trim();
+    const pageText = extractBodyTextStructured($);
     allText.push(`=== ${link} ===\n${pageText.substring(0, 1500)}`);
     pagesScraped.push(link);
   }
