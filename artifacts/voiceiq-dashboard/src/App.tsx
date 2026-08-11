@@ -1,5 +1,6 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback, useMemo } from "react";
 import { Switch, Route, Router as WouterRouter, useLocation, Redirect } from "wouter";
+import { AuthContext, useAuth } from "./lib/auth-context";
 import { ArrowRight } from "lucide-react";
 import Sidebar from "./components/Sidebar";
 import CommandCenter from "./pages/CommandCenter";
@@ -121,6 +122,70 @@ export function clearSession() {
   localStorage.removeItem("mfa_locked_until");
 }
 
+// Phase 5.6 — fetch + classify /api/auth/me with retry-on-transient.
+//
+// Response-code contract (verified with the customer report):
+//   200                         → { ok: data }
+//   401                         → { denied }    ← ONLY this clears the session
+//   429 / 5xx / network error   → retry with backoff, then { transient } if
+//                                 all retries fail. Caller keeps the
+//                                 session and stays optimistically signed
+//                                 in — individual downstream API calls will
+//                                 surface their own 401s later if the
+//                                 token really is bad.
+//
+// This is the fix for the "logged out on every 429" defect: a throttle
+// is not a logout, and neither is a network hiccup or a 5xx. The
+// previous code treated ANY non-2xx (and any thrown error) as denied,
+// which turned a rate-limit into a redirect to /signup for a whole
+// tenant sharing an office NAT.
+type AuthMeFetchResult =
+  | { kind: "ok"; data: import("./lib/auth-context").AuthMeData }
+  | { kind: "denied" }
+  | { kind: "transient"; lastStatus: number | "network" };
+
+async function fetchAuthMeWithRetry(
+  token: string,
+  signal: { cancelled: boolean },
+): Promise<AuthMeFetchResult> {
+  // 4 attempts total, 0 + 2s + 4s + 8s cumulative wait = ~14s worst
+  // case. Chosen to survive a brief rate-limit burst (5.6 buckets
+  // reset on 15-minute windows so we cannot outwait a real trip; the
+  // point is to survive a couple of colliding requests in a
+  // multi-user tenant, not to wait out the whole window).
+  const backoffs = [0, 2000, 4000, 8000];
+  let lastStatus: number | "network" = "network";
+  for (let i = 0; i < backoffs.length; i++) {
+    if (signal.cancelled) return { kind: "transient", lastStatus };
+    if (backoffs[i] > 0) {
+      await new Promise((resolve) => setTimeout(resolve, backoffs[i]));
+      if (signal.cancelled) return { kind: "transient", lastStatus };
+    }
+    try {
+      const res = await fetch("/api/auth/me", {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (res.ok) {
+        const data = (await res.json()) as import("./lib/auth-context").AuthMeData;
+        return { kind: "ok", data };
+      }
+      lastStatus = res.status;
+      // 401 = actual auth failure; wipe session and redirect. Every
+      // other non-2xx is treated as transient — 429 is a throttle
+      // shared with our siblings on the same NAT, 5xx is a server
+      // hiccup, 403 on /auth/me shouldn't happen but if it does
+      // we'd rather stay signed in and surface downstream 403s per
+      // resource than log the whole session out.
+      if (res.status === 401) return { kind: "denied" };
+      // Fall through to retry.
+    } catch {
+      lastStatus = "network";
+      // Fall through to retry.
+    }
+  }
+  return { kind: "transient", lastStatus };
+}
+
 function AuthGuard({ children }: { children: React.ReactNode }) {
   const [location] = useLocation();
   // Sprint 1 BUG-40: the previous AuthGuard only checked
@@ -133,9 +198,19 @@ function AuthGuard({ children }: { children: React.ReactNode }) {
   const [authState, setAuthState] = useState<"checking" | "ok" | "denied">(
     () => (localStorage.getItem("neverr_token") ? "checking" : "denied"),
   );
+  // Phase 5.6 — hold the /api/auth/me response body so DemoBanner and
+  // Sidebar can consume it via context instead of firing their own
+  // duplicate fetch. Null when the fetch is still in flight OR when
+  // all retries fell through as transient (in which case consumers
+  // render placeholder / minimal-info variants).
+  const [authMeData, setAuthMeData] = useState<
+    import("./lib/auth-context").AuthMeData | null
+  >(null);
+  // Bumped by refetch() to re-run the validation effect.
+  const [refetchTick, setRefetchTick] = useState(0);
 
   useEffect(() => {
-    let cancelled = false;
+    const signal = { cancelled: false };
     const token = localStorage.getItem("neverr_token");
 
     // No token at mount: skip the server roundtrip and redirect immediately.
@@ -156,35 +231,57 @@ function AuthGuard({ children }: { children: React.ReactNode }) {
       return;
     }
 
-    fetch("/api/auth/me", { headers: { Authorization: `Bearer ${token}` } })
-      .then((r) => {
-        if (cancelled) return;
-        if (r.ok) {
-          updateActivity();
-          setAuthState("ok");
-        } else {
-          // 401 / 403 / any non-2xx: token is invalid, expired, or
-          // tampered. Wipe ALL neverr_* keys so a stale tenant pointer
-          // doesn't leak into the next session, then fall through to the
-          // Redirect below with a ?redirect= param so post-auth lands the
-          // user back where they tried to go.
-          clearSession();
-          setAuthState("denied");
-        }
-      })
-      .catch(() => {
-        if (cancelled) return;
-        // Network error: be conservative and treat as denied. Letting a
-        // flaky network silently expose dashboard chrome would defeat the
-        // entire point of this guard.
+    // Reset to "checking" if we're re-running via refetch(). Prevents
+    // the interim from showing the dashboard chrome during a mid-
+    // session refresh.
+    if (refetchTick > 0) setAuthState("checking");
+
+    fetchAuthMeWithRetry(token, signal).then((result) => {
+      if (signal.cancelled) return;
+      if (result.kind === "ok") {
+        updateActivity();
+        setAuthMeData(result.data);
+        setAuthState("ok");
+        return;
+      }
+      if (result.kind === "denied") {
         clearSession();
         setAuthState("denied");
-      });
+        return;
+      }
+      // Transient (429 / 5xx / network). Do NOT clear session and do
+      // NOT redirect. Stay optimistically signed in; individual API
+      // calls will surface their own 401s later if the token really
+      // is bad. Log so devtools shows why data may be missing.
+      console.warn(
+        `[AuthGuard] /api/auth/me exhausted retries (last=${result.lastStatus}); staying signed in.`,
+      );
+      setAuthState("ok");
+      // Schedule a background re-check in 30s so the shared context
+      // data catches up once the backend recovers. Uses refetch()
+      // via the tick counter so cancellation semantics stay clean.
+      setTimeout(() => {
+        if (!signal.cancelled) setRefetchTick((n) => n + 1);
+      }, 30_000);
+    });
 
     return () => {
-      cancelled = true;
+      signal.cancelled = true;
     };
+  }, [refetchTick]);
+
+  const refetch = useCallback(() => {
+    setRefetchTick((n) => n + 1);
   }, []);
+
+  const authContextValue = useMemo(
+    () => ({
+      data: authMeData,
+      loading: authState === "checking",
+      refetch,
+    }),
+    [authMeData, authState, refetch],
+  );
 
   // Idle-timeout listeners are only relevant once we've confirmed the
   // user is authenticated. Splitting them out of the validation effect
@@ -259,38 +356,35 @@ function AuthGuard({ children }: { children: React.ReactNode }) {
   if (localStorage.getItem("mfa_pending") === "true") {
     return <Redirect to="/mfa-verify" />;
   }
-  return <>{children}</>;
+  return (
+    <AuthContext.Provider value={authContextValue}>
+      {children}
+    </AuthContext.Provider>
+  );
 }
 
 function DemoBanner() {
-  const [demoInfo, setDemoInfo] = useState<{ isDemo: boolean; businessName: string } | null>(null);
-
-  useEffect(() => {
-    const token = localStorage.getItem("neverr_token");
-    if (!token) return;
-    // Pass active business so we surface the membership for the tenant
-    // the user is currently viewing, not d.businesses[0] (their oldest).
+  // Phase 5.6 — read businesses list from the shared AuthContext
+  // instead of firing a second /api/auth/me. Cuts request volume and
+  // avoids sharing the AuthGuard's rate-limit budget.
+  const auth = useAuth();
+  const demoInfo = useMemo<{ isDemo: boolean; businessName: string } | null>(() => {
+    if (!auth.data) return null;
     const activeBiz = localStorage.getItem("neverr_active_business_id");
-    const headers: Record<string, string> = { Authorization: `Bearer ${token}` };
-    if (activeBiz) headers["X-Active-Business"] = activeBiz;
-    fetch("/api/auth/me", { headers })
-      .then((r) => r.ok ? r.json() : null)
-      .then((d) => {
-        const list = (d?.businesses || []) as any[];
-        const biz = (activeBiz && list.find((b) => b.business_id === activeBiz)) || list[0];
-        if (!biz) return;
-        const config = Array.isArray(biz.business_configs) ? biz.business_configs[0] : biz.business_configs;
-        // The banner is a "you're poking at the public demo, sign up for
-        // your own account" prompt — only the explicit `demo` viewer role
-        // should see it. Owners / admins / members of a business that
-        // happens to have a `demo-` id prefix or status="demo" already
-        // own the data; nagging them to "Get your own account" is wrong.
-        if (biz.role === "demo") {
-          setDemoInfo({ isDemo: true, businessName: config?.business_name || "Demo Business" });
-        }
-      })
-      .catch(() => {});
-  }, []);
+    const list = auth.data.businesses || [];
+    const biz = (activeBiz && list.find((b) => b.business_id === activeBiz)) || list[0];
+    if (!biz) return null;
+    const config = Array.isArray(biz.business_configs)
+      ? biz.business_configs[0]
+      : biz.business_configs;
+    // The banner is a "you're poking at the public demo, sign up for
+    // your own account" prompt — only the explicit `demo` viewer role
+    // should see it. Owners / admins / members of a business that
+    // happens to have a `demo-` id prefix or status="demo" already
+    // own the data; nagging them to "Get your own account" is wrong.
+    if (biz.role !== "demo") return null;
+    return { isDemo: true, businessName: (config as any)?.business_name || "Demo Business" };
+  }, [auth.data]);
 
   if (!demoInfo?.isDemo) return null;
 

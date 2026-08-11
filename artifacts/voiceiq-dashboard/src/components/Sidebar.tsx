@@ -1,5 +1,5 @@
 import { useLocation, Link } from "wouter";
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, useMemo } from "react";
 import { useTranslation } from "react-i18next";
 import {
   LayoutDashboard,
@@ -28,7 +28,8 @@ import {
 // menu item which opens AddBusinessModal (Pattern 2 via
 // /api/business/create-additional). FirstTimeOnboarding mounted in App.tsx
 // covers the "no agent yet" state automatically.
-import { getSmsUnreadCount, fetchApi } from "../lib/api";
+import { getSmsUnreadCount } from "../lib/api";
+import { useAuth } from "../lib/auth-context";
 // Sprint 4 TC-59: import the shared clearSession helper so this sign-out
 // path uses the SAME key list as AuthGuard's idle/expired clear. Prevents
 // drift (Sidebar was missing ACTIVITY_KEY and mfa_* keys before).
@@ -107,19 +108,35 @@ const navItems: NavItem[] = [
 
 export default function Sidebar() {
   const [location] = useLocation();
-  const [businessName, setBusinessName] = useState("");
   const [smsUnread, setSmsUnread] = useState(0);
-  // null until /auth/me resolves; null thereafter means "not a staff user"
-  // (no row in user_roles, or row exists but status !== 'active'). Same
-  // value either way — the only meaningful gate is null vs non-null.
-  const [staffRole, setStaffRole] = useState<string | null>(null);
-  // Phase 4.4 — business membership role for the currently-active
-  // business (owner / admin / manager / team_lead / agent_manager /
-  // analyst / user / readonly). Used to hide nav items whose API
-  // endpoints will 403 for this role (e.g. /team requires
-  // users:write which role='user' doesn't have).
-  const [businessRole, setBusinessRole] = useState<string | null>(null);
   const { t } = useTranslation();
+  // Phase 5.6 — read businesses / staff_role from the shared AuthContext
+  // instead of firing a duplicate /api/auth/me. Cuts request volume by
+  // 1 per page load and eliminates the "sidebar also gets rate-limited
+  // out" failure mode. Consumers must handle auth.data === null (initial
+  // load + transient failure fallback) gracefully.
+  const auth = useAuth();
+  const { businessName, staffRole, businessRole } = useMemo(() => {
+    if (!auth.data) {
+      return { businessName: "", staffRole: null as string | null, businessRole: null as string | null };
+    }
+    const activeBiz = localStorage.getItem("neverr_active_business_id");
+    const list = auth.data.businesses || [];
+    const biz = (activeBiz && list.find((b) => b.business_id === activeBiz)) || list[0];
+    const config = biz?.business_configs
+      ? Array.isArray(biz.business_configs)
+        ? biz.business_configs[0]
+        : biz.business_configs
+      : null;
+    return {
+      businessName: (config as any)?.business_name || "",
+      // staff_role is null for customers; a string for active staff.
+      staffRole: (auth.data.staff_role as string | null) ?? null,
+      // business membership role for the active biz (used to hide
+      // nav items whose API endpoints will 403 for this role).
+      businessRole: (biz?.role as string | null) ?? null,
+    };
+  }, [auth.data]);
 
   const pollUnread = useCallback(() => {
     const token = localStorage.getItem("neverr_token");
@@ -130,28 +147,6 @@ export default function Sidebar() {
   }, []);
 
   useEffect(() => {
-    const token = localStorage.getItem("neverr_token");
-    if (!token) return;
-    // fetchApi auto-injects Authorization + X-Active-Business, so the
-    // backend resolves the membership for the tenant the user is
-    // currently viewing instead of d.businesses[0] (their oldest).
-    const activeBiz = localStorage.getItem("neverr_active_business_id");
-    fetchApi("/auth/me")
-      .then((d) => {
-        const list = (d?.businesses || []) as any[];
-        const biz = (activeBiz && list.find((b) => b.business_id === activeBiz)) || list[0];
-        const config = biz?.business_configs && (Array.isArray(biz.business_configs) ? biz.business_configs[0] : biz.business_configs);
-        if (config?.business_name) setBusinessName(config.business_name);
-        // staff_role is null for customers; a string ("super_admin", "admin",
-        // etc.) for active staff. Stored as-is and used only as a null check
-        // when filtering adminOnly nav items below.
-        setStaffRole((d?.staff_role as string | null) ?? null);
-        // Phase 4.4 — business membership role for the active biz.
-        // The filter below uses this to hide /team from role='user'
-        // and 'readonly' so they don't click into a 403.
-        setBusinessRole((biz?.role as string | null) ?? null);
-      })
-      .catch(() => {});
     pollUnread();
     const interval = setInterval(pollUnread, 30000);
     return () => clearInterval(interval);
