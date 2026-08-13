@@ -140,6 +140,207 @@ export function sanitizeValueProp(raw: string): string | null {
   return trimmed;
 }
 
+// ───────────────────────────────────────────────────────────────────────
+// Phase 6.1 — template-vs-tenant coverage detection.
+//
+// The industry template ships with generic pain_points, value_props,
+// call_scripts, appointment_types so a cold-start business sounds
+// competent on day one. Once a tenant has configured real topics /
+// FAQs / services, that generic content becomes noise the model must
+// reconcile against contradicting authored content.
+//
+// These helpers let the renderer skip template blocks that overlap
+// tenant config. They are UNCONDITIONAL on business_id / industry —
+// every suppression is a function of the opts the renderer already
+// receives. Cold-start (no topics, no faqs) is unaffected.
+//
+// Design notes:
+//   * Stopword list is tiny by design — words that appear in nearly
+//     every trigger/description and would cause false-positive overlap
+//     matches ("caller", "customer", "asks", "wants"). Domain nouns
+//     stay in.
+//   * Stemming is light: strip trailing s/es/ing/ed and ies→y. NO
+//     substring/prefix matching — that was tried during Phase 6.1
+//     spec-out and false-positive'd on "rental" ⊂ "rent" (matching
+//     "one-way rental" against a "rent a car" description when the
+//     tenant explicitly doesn't offer one-way).
+//   * Trade-off: we bias toward false-negatives (dropping legit
+//     content) over false-positives (Alex volunteering a service the
+//     tenant doesn't offer). A dropped appointment type just means
+//     Alex says less; a kept-but-wrong appointment type means Alex
+//     confidently misleads a caller.
+const TEMPLATE_OVERLAP_STOPWORDS: ReadonlySet<string> = new Set([
+  // Generic actors / actions saturating every template trigger.
+  "caller", "callers", "customer", "customers", "client", "clients",
+  "call", "calls", "calling", "called",
+  "ask", "asks", "asked", "asking",
+  "want", "wants", "wanted", "wanting",
+  "need", "needs", "needed", "needing",
+  "request", "requests", "requested", "requesting",
+  "help", "helps", "helped", "helping",
+  "people", "person", "someone", "anyone",
+  // Generic descriptors.
+  "service", "services", "general", "standard", "basic", "custom", "typical",
+  "current", "existing", "regular", "normal",
+  // High-frequency function words ≥4 chars (shorter ones dropped by length filter).
+  "about", "with", "into", "onto", "upon", "over", "under", "from",
+  "this", "that", "they", "them", "their", "these", "those",
+  "when", "what", "where", "which", "while", "whose",
+  "have", "been", "were", "being", "will", "would", "could", "should", "shall", "might",
+  "some", "more", "many", "much", "other", "another",
+  "also", "just", "only", "even", "still",
+  "said", "says", "saying", "tell", "tells", "told", "telling",
+  "business", "businesses", "company", "companies",
+  // Domain-tags that mean nothing outside their template.
+  "situation", "scenario", "case", "cases",
+]);
+
+function stemToken(t: string): string {
+  if (t.length < 4) return t;
+  if (t.endsWith("ies") && t.length > 5) return t.slice(0, -3) + "y";
+  if (t.endsWith("es") && t.length > 4) return t.slice(0, -2);
+  if (t.endsWith("ing") && t.length > 5) return t.slice(0, -3);
+  if (t.endsWith("ed") && t.length > 4) return t.slice(0, -2);
+  if (t.endsWith("s") && t.length > 4) return t.slice(0, -1);
+  return t;
+}
+
+function tokenizeForOverlap(text: string): string[] {
+  // Split on whitespace only — NOT hyphens. Compound words like
+  // "one-way", "drop-off", "24-hour" are meaningful differentiators
+  // and dividing them turns each half into a length-filtered noise
+  // token, discarding the exact signal we want to match on.
+  const words = text
+    .toLowerCase()
+    .replace(/[^a-z0-9\s-]/g, " ")
+    .split(/\s+/)
+    .filter((w) => w.length >= 4 && !TEMPLATE_OVERLAP_STOPWORDS.has(w));
+  return words.map(stemToken);
+}
+
+/**
+ * Build the topic-keyword set used by the 6.1 overlap gates. Reads
+ * slug + name + description ONLY — deliberately NOT example_utterances.
+ *
+ * Utterances are how CALLERS phrase requests; they naturally contain
+ * high-frequency industry nouns (e.g. "rental" for a car-rental
+ * business) that would false-positive against generic appointment
+ * types the tenant doesn't actually offer ("one-way rental",
+ * "specialty vehicle rental"). Slug + name + description is what the
+ * TENANT authored to define the topic itself; matching against that
+ * is a much cleaner signal of "the tenant has this covered".
+ *
+ * @internal exported for unit tests.
+ */
+export function buildTopicKeywords(
+  topics: Array<{
+    slug?: string;
+    name?: string;
+    description?: string | null;
+    example_utterances?: string[] | null;
+  }>,
+): Set<string> {
+  const out = new Set<string>();
+  for (const topic of topics) {
+    const parts = [topic.slug || "", topic.name || "", topic.description || ""];
+    for (const part of parts) {
+      for (const tok of tokenizeForOverlap(part)) {
+        if (tok) out.add(tok);
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * Any-token overlap. Used for call_scripts: their `trigger` is a
+ * multi-sentence description of a scenario, so *any* keyword match
+ * against the topic set means the topic covers it and Alex will
+ * route via route_to_topic instead of running the generic script.
+ *
+ * @internal exported for unit tests.
+ */
+export function textOverlapsTopics(text: string, topicKeywords: Set<string>): boolean {
+  if (topicKeywords.size === 0) return false;
+  for (const tok of tokenizeForOverlap(text)) {
+    if (topicKeywords.has(tok)) return true;
+  }
+  return false;
+}
+
+/**
+ * First-meaningful-token match. Used for appointment_types: their
+ * strings are short and the first non-stopword token is the
+ * DIFFERENTIATOR ("one-way", "specialty", "corporate", "standard").
+ * If that word isn't in the tenant's topic space, the type describes
+ * a service outside their scope and should drop.
+ *
+ * Contrasts with textOverlapsTopics deliberately — the same any-token
+ * rule would false-positive here because generic industry nouns
+ * ("rental", "vehicle") appear both in topic descriptions AND in every
+ * appointment type. See buildTopicKeywords docs for the parallel
+ * decision to exclude utterances from the keyword set.
+ *
+ * Empty-token edge case (e.g. an appointment type made entirely of
+ * stopwords + short words) treats as "cover" — conservative keep,
+ * since we have no signal either way.
+ *
+ * @internal exported for unit tests.
+ */
+export function firstMeaningfulTokenMatches(text: string, topicKeywords: Set<string>): boolean {
+  const tokens = tokenizeForOverlap(text);
+  if (tokens.length === 0) return true;
+  return topicKeywords.has(tokens[0]);
+}
+
+// ───────────────────────────────────────────────────────────────────────
+// Phase 6.1 — prompt-block measurement.
+//
+// Splits a rendered prompt into named sections using the fixed
+// headings the renderer emits. Sections without a heading (the
+// preamble before BUSINESS INFORMATION and the trailing YOUR ROLE /
+// CONVERSATION STYLE / BUSINESS HOURS / CAPTURING CALLBACK REQUESTS /
+// CRITICAL RULES block) are grouped into "preamble" and "role_and_rules"
+// respectively. The point is to give ops actionable char-cost numbers
+// per block for prompt-diet work — not to reproduce the render tree.
+//
+// Header list is maintained by hand; if the renderer adds a new
+// section, add its heading here.
+const SECTION_HEADERS: ReadonlyArray<{ label: string; heading: string }> = [
+  { label: "business_information", heading: "BUSINESS INFORMATION:" },
+  { label: "website_context", heading: "BUSINESS WEBSITE CONTEXT" },
+  { label: "industry_description", heading: "ABOUT THIS INDUSTRY:" },
+  { label: "pain_points", heading: "COMMON CALLER CONCERNS" },
+  { label: "value_props", heading: "HOW YOU HELP CALLERS" },
+  { label: "call_playbook", heading: "CALL PLAYBOOK" },
+  { label: "appointment_types", heading: "APPOINTMENT TYPES" },
+  { label: "departments", heading: "DEPARTMENTS & TOPIC EXPERTISE" },
+  { label: "qualification_rules", heading: "QUALIFICATION RULES" },
+  { label: "tone_preference", heading: "TONE AND VOICE PREFERENCE" },
+  { label: "custom_faqs", heading: "BUSINESS-SPECIFIC FAQS" },
+  { label: "objection_handling", heading: "OBJECTION HANDLING" },
+  { label: "never_say_list", heading: "STRICT PROHIBITIONS" },
+  { label: "role_and_rules", heading: "YOUR ROLE:" },
+];
+
+export function measurePromptBlocks(prompt: string): Record<string, number> {
+  const out: Record<string, number> = {};
+  interface Slice { label: string; start: number }
+  const slices: Slice[] = [{ label: "preamble", start: 0 }];
+  for (const s of SECTION_HEADERS) {
+    const idx = prompt.indexOf(s.heading);
+    if (idx >= 0) slices.push({ label: s.label, start: idx });
+  }
+  slices.sort((a, b) => a.start - b.start);
+  for (let i = 0; i < slices.length; i++) {
+    const start = slices[i].start;
+    const end = i + 1 < slices.length ? slices[i + 1].start : prompt.length;
+    out[slices[i].label] = end - start;
+  }
+  out.__total = prompt.length;
+  return out;
+}
+
 // Phase 6.0 — render a per-topic QUALIFICATION REQUIREMENTS block.
 // Returns null when the topic has no qualification, when the block is
 // disabled, or when it lacks the pieces Alex needs to actually run the
@@ -518,6 +719,13 @@ export function renderPromptFromHelpers(opts: {
   const tmpl = opts.industryTemplate;
   const industryLabel = tmpl?.name || opts.industry;
 
+  // Phase 6.1 — tenant-config-driven suppression signals. Computed
+  // once, referenced by each block gate below.
+  const hasConfiguredTopics = Array.isArray(opts.topics) && opts.topics.length > 0;
+  const hasConfiguredFaqs = Array.isArray(opts.customFaqs) && opts.customFaqs.length > 0;
+  const hasConfiguredServices = typeof opts.services === "string" && opts.services.trim().length > 0;
+  const topicKeywords = hasConfiguredTopics ? buildTopicKeywords(opts.topics!) : new Set<string>();
+
   let prompt = `You are Alex, the professional AI receptionist for ${opts.business_name}, a ${industryLabel} business.
 
 BUSINESS INFORMATION:
@@ -529,7 +737,21 @@ BUSINESS INFORMATION:
 - Website: ${opts.website || "available upon request"}
 ${opts.services ? "- Services: " + opts.services : ""}`;
 
-  if (opts.websiteContext && opts.websiteContext.trim().length > 0) {
+  // Phase 6.1 — the scraped website context was designed as a cold-
+  // start crutch: give the model *some* signal about the business
+  // before the tenant has authored FAQs or services text. Once either
+  // of those is populated, the scrape stops adding fidelity — often it
+  // adds nav/hero boilerplate that lands stale as the site is
+  // redesigned. Suppress when either signal is present. If ops needs
+  // the scrape back for a specific tenant, they can clear services +
+  // faqs (or wire an age-days opt in a future phase — deliberately
+  // not adding that plumbing today since neither caller passes it).
+  const suppressWebsiteContext = hasConfiguredFaqs || hasConfiguredServices;
+  if (
+    !suppressWebsiteContext &&
+    opts.websiteContext &&
+    opts.websiteContext.trim().length > 0
+  ) {
     // Phase 5.3 — dedup + boilerplate strip in-place. The scraper
     // (scraping.ts) applies the same cleaner on ingest, but
     // business_configs rows that were populated before that shipped
@@ -552,14 +774,22 @@ ABOUT THIS INDUSTRY:
 ${tmpl.description}`;
   }
 
-  if (tmpl?.pain_points && tmpl.pain_points.length > 0) {
+  // Phase 6.1 — both blocks are generic industry filler that describes
+  // "the kind of caller a $INDUSTRY business tends to hear from". Once
+  // topics are configured, that space is being described by the tenant
+  // themselves via slug/description/example_utterances — the filler
+  // duplicates or contradicts the authored content. Skip both.
+  //
+  // Cold-start (no topics) still gets them so Alex has *some* mental
+  // model of the caller.
+  if (!hasConfiguredTopics && tmpl?.pain_points && tmpl.pain_points.length > 0) {
     prompt += `
 
 COMMON CALLER CONCERNS (what people calling ${opts.business_name} are typically worried about or trying to solve):
 ${tmpl.pain_points.map(p => `- ${p}`).join("\n")}`;
   }
 
-  if (tmpl?.value_props && tmpl.value_props.length > 0) {
+  if (!hasConfiguredTopics && tmpl?.value_props && tmpl.value_props.length > 0) {
     // Phase 5.3 — filter value props for unresolved placeholders and
     // hallucinated-capability claims. See sanitizeValueProp above.
     const cleanValueProps = tmpl.value_props
@@ -574,49 +804,75 @@ ${cleanValueProps.map((v) => `- ${v}`).join("\n")}`;
   }
 
   if (tmpl?.call_scripts && tmpl.call_scripts.length > 0) {
+    // Phase 6.1 — drop scripts that overlap a configured topic. Alex
+    // will route those callers via route_to_topic instead of running
+    // the generic script, and the script text often contradicts the
+    // tenant's authored topic description. When no topics are
+    // configured (cold-start), the full script list survives.
+    const preOverlapScripts = tmpl.call_scripts.filter(
+      (s) => s && s.name && s.trigger && typeof s.script === "string",
+    );
+    const overlapFilteredScripts = hasConfiguredTopics
+      ? preOverlapScripts.filter(
+          (s) => !textOverlapsTopics(`${s.name} ${s.trigger}`, topicKeywords),
+        )
+      : preOverlapScripts;
+
     // Phase 5.3 — sanitize each script's body. Placeholder-carrying or
     // false-capability scripts get their body replaced with a
     // request_callback fallback; the trigger heading stays so Alex
     // still recognizes the situation.
-    const cleanedScripts = tmpl.call_scripts
-      .filter((s) => s && s.name && s.trigger && typeof s.script === "string")
-      .map((s) => ({
-        name: s.name,
-        trigger: s.trigger,
-        ...sanitizeScriptBody(s.script),
-      }));
-    const anyRedacted = cleanedScripts.some((s) => s.redacted);
-
-    prompt += `
+    const cleanedScripts = overlapFilteredScripts.map((s) => ({
+      name: s.name,
+      trigger: s.trigger,
+      ...sanitizeScriptBody(s.script),
+    }));
+    if (cleanedScripts.length > 0) {
+      const anyRedacted = cleanedScripts.some((s) => s.redacted);
+      prompt += `
 
 CALL PLAYBOOK — Use these scripts when the situation matches the trigger.
 These are calibrated specifically for ${industryLabel} businesses. Adapt the
 phrasing to the caller's tone but follow the structure and information gathering
 steps closely.
 `;
-    if (anyRedacted) {
-      prompt += `
+      if (anyRedacted) {
+        prompt += `
 Note: some scripts below have been intentionally redacted to a callback-capture
 fallback because the source material contained unfilled data placeholders or
 claims of capabilities you do not have. When the situation applies, capture the
 caller with request_callback rather than invent specifics — the team will
 follow up with accurate figures.
 `;
-    }
-    for (const s of cleanedScripts) {
-      prompt += `
+      }
+      for (const s of cleanedScripts) {
+        prompt += `
 ### ${s.name}
 When this happens: ${s.trigger}
 How to handle: ${s.script}
 `;
+      }
     }
+    // else: every template script was covered by topics; the whole
+    // CALL PLAYBOOK block is skipped. Alex still has the DEPARTMENTS
+    // block below to route those callers.
   }
 
   if (tmpl?.appointment_types && tmpl.appointment_types.length > 0) {
-    prompt += `
+    // Phase 6.1 — inverse coverage: keep an appointment_type only when
+    // at least one of its stemmed tokens overlaps the topic keyword
+    // set. Types with no overlap describe services the tenant doesn't
+    // offer (e.g. "one-way rental" when topics only cover standard
+    // reservations). Cold-start (no topics) keeps all types.
+    const filtered = hasConfiguredTopics
+      ? tmpl.appointment_types.filter((a) => firstMeaningfulTokenMatches(a, topicKeywords))
+      : tmpl.appointment_types;
+    if (filtered.length > 0) {
+      prompt += `
 
 APPOINTMENT TYPES you can help schedule:
-${tmpl.appointment_types.map(a => `- ${a}`).join("\n")}`;
+${filtered.map((a) => `- ${a}`).join("\n")}`;
+    }
   }
 
   // Phase 3.2b — DEPARTMENTS & TOPIC EXPERTISE. Anchor for Alex to
@@ -639,7 +895,10 @@ DEPARTMENTS & TOPIC EXPERTISE (when a caller's request matches one of these topi
       const utterances = Array.isArray(topic.example_utterances)
         ? topic.example_utterances
             .filter((u) => typeof u === "string" && u.trim().length > 0)
-            .slice(0, 4)
+            // Phase 6.1 — reduced from 4 to 2. Intent matching does not
+            // need four few-shot anchors per topic; two carries enough
+            // signal at ~30 chars/line savings per extra topic per line.
+            .slice(0, 2)
         : [];
       prompt += `
 - topic_slug: "${topic.slug}" — ${topic.name}`;
@@ -791,33 +1050,13 @@ BUSINESS HOURS:
 - After hours: Take a detailed message via the request_callback tool, confirm when the caller can expect a response, and let them know the team will reach back
 
 CAPTURING CALLBACK REQUESTS:
-You have one tool for follow-up: request_callback. Use it whenever you cannot fully resolve the caller's need on this call. Common triggers:
-- The caller asks for a callback, a text, an email, or "have someone get in touch"
-- The business is closed or the team isn't reachable right now
-- The caller wants to schedule something — you cannot check the calendar live, so capture the request as a callback and let the team confirm the time
-- The caller asks a question you don't have an answer for${
-    transferAvailable
-      ? " and warm-transfer isn't appropriate (caller declines, or no operator is available)"
-      : " (you cannot transfer on this line, so callback is the correct handoff)"
-  }
-- A non-urgent follow-up where the caller doesn't need real-time help
-
-Before invoking the tool, confirm these out loud with the caller, one item at a time:
-1. Their full name (contact_name)
-2. The best phone number to reach them at (contact_phone) — read it back digit by digit to confirm
-3. A brief reason in their own words (reason) — what should the team know before calling back
-4. Urgency (urgency) — gauge from their words and tone:
-   - emergency: something happening right now needing immediate human attention
-   - high: same-day, time-sensitive
-   - medium: the default for normal callbacks
-   - low: informational, no rush
-5. Preferred channel (preferred_channel) — ask: "Would you prefer a text, a call, or an email?"
-
-Acknowledge verbally BEFORE invoking the tool so the caller hears you taking action — for example: "Got it — let me get that down so someone from the team can follow up. The best number is the one you just gave me?" Then invoke request_callback with the confirmed details.
-
-After the tool returns success, close the loop verbally — for example: "All set — I've passed this on to the team. They'll reach out by text, call, or email shortly." If urgency is high or emergency, give an explicit timeframe ("within the hour", "today").
-
-If the tool returns an error, do NOT retry silently. Apologize briefly, take the same information verbally so the team can follow up manually, and end the call warmly.
+Use request_callback whenever you cannot fully resolve the caller's need on this call. Acknowledge verbally BEFORE invoking so the caller hears you taking action. Confirm these five fields out loud, one at a time:
+1. contact_name — their full name
+2. contact_phone — read back digit by digit to confirm
+3. reason — brief, in their own words
+4. urgency — emergency (needs immediate human attention), high (same-day), medium (default), low (informational). Pick from their tone, not assumption.
+5. preferred_channel — ask: "Would you prefer a text, a call, or an email?"
+If the tool errors, apologize once, take the same info verbally for the team, and end the call warmly.
 
 CRITICAL RULES:
 - NEVER make up information you don't know — capture a request_callback so the team can follow up
