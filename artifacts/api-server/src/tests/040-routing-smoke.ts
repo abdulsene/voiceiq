@@ -225,6 +225,7 @@ import {
   handleDialStatus,
   mapDialStatus,
   parseRouteBody,
+  pickDialStatusResponseTwiml,
   normalizePhone,
   promoteHandoffReasonOnAnswer,
   parseClientTo,
@@ -4391,6 +4392,94 @@ async function T95_team_endpoint_returns_device_freshness() {
   );
 }
 
+// ── Phase 6.4 — dial-failure capture TwiML ──────────────────────────
+//
+// /dial-status must return capture TwiML for no-answer/busy/failed so
+// the caller doesn't drop silently after ringback. Must return empty
+// for completed/answered/canceled. Canceled is critical: the CALLER
+// hung up during ringback, and playing Say+Record to a dead line
+// would be pointless.
+
+async function T96_dial_status_returns_capture_twiml_on_failure() {
+  const base = "https://voice-i-q.replit.app";
+  const biz = "biz_ez_rentals";
+  const conv = "CV_ABCDEF";
+  const failures: string[] = [];
+
+  const noAnswer = pickDialStatusResponseTwiml(
+    { DialCallStatus: "no-answer", business_id: biz, conversation_id: conv },
+    base,
+  );
+  if (!noAnswer.includes("<Record ")) failures.push("no-answer missing <Record>");
+  if (!noAnswer.includes("dial-fallback-record-done")) {
+    failures.push("no-answer missing record-done action URL");
+  }
+  if (!noAnswer.includes("dial-fallback-transcript")) {
+    failures.push("no-answer missing transcribe URL");
+  }
+  if (!noAnswer.includes(`business_id=${encodeURIComponent(biz)}`)) {
+    failures.push("no-answer missing business_id in callback URL");
+  }
+  if (!noAnswer.includes(`conversation_id=${encodeURIComponent(conv)}`)) {
+    failures.push("no-answer missing conversation_id in callback URL");
+  }
+  // apostrophe in "couldn't" is XML-escaped to &apos; — check for the
+  // stable prefix instead.
+  if (!noAnswer.includes("Sorry, I couldn")) {
+    failures.push("no-answer missing honest Say framing");
+  }
+
+  const busy = pickDialStatusResponseTwiml(
+    { DialCallStatus: "busy", business_id: biz, conversation_id: conv },
+    base,
+  );
+  if (!busy.includes("<Record ")) failures.push("busy missing <Record>");
+
+  const failed = pickDialStatusResponseTwiml(
+    { DialCallStatus: "failed", business_id: biz, conversation_id: conv },
+    base,
+  );
+  if (!failed.includes("<Record ")) failures.push("failed missing <Record>");
+
+  const canceled = pickDialStatusResponseTwiml(
+    { DialCallStatus: "canceled", business_id: biz, conversation_id: conv },
+    base,
+  );
+  if (canceled.includes("<Record ")) {
+    failures.push("canceled MUST NOT emit <Record> — caller already hung up");
+  }
+  if (!canceled.includes("<Response/>")) {
+    failures.push("canceled must return empty <Response/>");
+  }
+
+  const completed = pickDialStatusResponseTwiml(
+    { DialCallStatus: "completed", business_id: biz, conversation_id: conv },
+    base,
+  );
+  if (completed.includes("<Record ")) failures.push("completed MUST NOT emit <Record>");
+  if (!completed.includes("<Response/>")) failures.push("completed must return empty");
+
+  const answered = pickDialStatusResponseTwiml(
+    { DialCallStatus: "answered", business_id: biz, conversation_id: conv },
+    base,
+  );
+  if (answered.includes("<Record ")) failures.push("answered MUST NOT emit <Record>");
+
+  const missingCorrelation = pickDialStatusResponseTwiml(
+    { DialCallStatus: "no-answer", business_id: "", conversation_id: "" },
+    base,
+  );
+  if (missingCorrelation.includes("<Record ")) {
+    failures.push("missing business_id/conversation_id MUST fall through to empty (no correlation for record-done)");
+  }
+
+  record(
+    "T96 /dial-status returns capture TwiML on failure statuses only (canceled/completed/answered return empty)",
+    failures.length === 0,
+    failures.join("; ") || "capture on no-answer/busy/failed; empty on completed/answered/canceled/no-correlation",
+  );
+}
+
 // ── Bonus: whisper composition and TwiML ────────────────────────────
 
 async function whisper_composition() {
@@ -4526,6 +4615,8 @@ async function main() {
   await T93_all_stale_shortens_dial_timeout();
   await T94_never_zero_candidates_when_on_duty_stale();
   await T95_team_endpoint_returns_device_freshness();
+  // Phase 6.4 — dial-failure capture TwiML.
+  await T96_dial_status_returns_capture_twiml_on_failure();
   await whisper_composition();
 
   const fails = results.filter((r) => !r.pass);

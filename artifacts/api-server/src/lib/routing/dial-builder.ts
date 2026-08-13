@@ -52,6 +52,87 @@ function effectiveTimeoutSecs(
   return Math.min(base, ALL_STALE_DIAL_TIMEOUT_SECS);
 }
 
+/**
+ * Phase 6.4 — capture TwiML we return from /dial-status when the
+ * <Dial> failed to reach anyone (no-answer, busy, failed).
+ *
+ * The parent call is still live per Twilio docs: the <Dial action>
+ * response takes full control of the initial call, and sibling verbs
+ * after </Dial> are unreachable — so we cannot just "add a Redirect."
+ * The capture flow has to be returned from the action callback.
+ *
+ * Structure:
+ *   1. <Say> — honest framing. Caller has just heard 30s of ringback
+ *      then silence; we need to explain and set the expectation before
+ *      the beep.
+ *   2. <Record> — capture the voicemail. `action` fires when the
+ *      recording completes (POST from Twilio), and we insert a lead
+ *      there so we don't depend on transcription success. `transcribeCallback`
+ *      fires async when Twilio finishes transcribing; we UPDATE the
+ *      lead's reason then. A lead with audio beats no lead.
+ *   3. Nothing after </Record> — Twilio Record's `action` response
+ *      takes control of the parent call (same rule as Dial), so the
+ *      "Thank you, goodbye" happens in the record-done handler, not
+ *      as a sibling verb here.
+ *
+ * timeout=3 lets a caller start speaking within 3 seconds of the
+ * beep before Twilio ends the recording (Twilio default is 5; 3 is
+ * snappier for a voicemail). maxLength=60 caps the message. playBeep
+ * is true so the caller knows when to start.
+ *
+ * businessId and conversationId are baked into both callback URLs so
+ * the record-done + transcribe handlers can correlate back without
+ * an extra lookup.
+ */
+export interface DialFailureCaptureOptions {
+  publicApiBase: string;
+  businessId: string;
+  conversationId: string;
+}
+export function buildDialFailureCaptureTwiml(opts: DialFailureCaptureOptions): string {
+  const qs =
+    `business_id=${encodeURIComponent(opts.businessId)}` +
+    `&conversation_id=${encodeURIComponent(opts.conversationId)}`;
+  const actionUrl = `${opts.publicApiBase}/api/routing/dial-fallback-record-done?${qs}`;
+  const transcribeUrl = `${opts.publicApiBase}/api/routing/dial-fallback-transcript?${qs}`;
+  const say =
+    "Sorry, I couldn't reach anyone. Let me take a quick message and someone " +
+    "will call you right back. Please leave your message after the beep.";
+  return (
+    `<?xml version="1.0" encoding="UTF-8"?>` +
+    `<Response>` +
+    `<Say voice="Polly.Joanna">${xmlEscape(say)}</Say>` +
+    `<Record ` +
+    `action="${xmlEscape(actionUrl)}" ` +
+    `method="POST" ` +
+    `maxLength="60" ` +
+    `timeout="3" ` +
+    `playBeep="true" ` +
+    `transcribe="true" ` +
+    `transcribeCallback="${xmlEscape(transcribeUrl)}"` +
+    `/>` +
+    `</Response>`
+  );
+}
+
+/**
+ * Phase 6.4 — TwiML returned from /dial-fallback-record-done after the
+ * lead has been inserted. Twilio's Record action follows the same
+ * "response takes control" rule as Dial action, so the "Thank you"
+ * has to live here rather than as a sibling verb in the capture TwiML.
+ */
+export function buildDialFailureThanksTwiml(): string {
+  const say =
+    "Thank you. Someone will call you back shortly. Goodbye.";
+  return (
+    `<?xml version="1.0" encoding="UTF-8"?>` +
+    `<Response>` +
+    `<Say voice="Polly.Joanna">${xmlEscape(say)}</Say>` +
+    `<Hangup/>` +
+    `</Response>`
+  );
+}
+
 export interface DialBuilderOptions {
   /**
    * Twilio caller ID to present on the outbound leg. Should be the

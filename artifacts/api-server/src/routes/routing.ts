@@ -89,6 +89,8 @@ import {
 } from "../lib/routing/fallback-logic";
 import {
   buildDialTwiml,
+  buildDialFailureCaptureTwiml,
+  buildDialFailureThanksTwiml,
   buildWhisperTwiml,
   composeWhisperText,
   type DialBuilderOptions,
@@ -1291,9 +1293,361 @@ router.post(
     // leg answered — the `To` on this callback carries the ORIGINAL
     // inbound number, not the child leg.
     await handleDialStatus(supabase, body, new Date(), { twilioClient: getTwilioClient() });
-    // Return an empty <Response> so Twilio ends the leg cleanly (the
-    // Dial verb has already terminated; nothing left to do).
-    res.status(200).type("text/xml").send('<?xml version="1.0" encoding="UTF-8"?><Response/>');
+
+    const twimlOut = pickDialStatusResponseTwiml(body, getPublicApiBase());
+    res.status(200).type("text/xml").send(twimlOut);
+  },
+);
+
+/**
+ * Phase 6.4 — pure: pick the TwiML to return from /dial-status based
+ * on the DialCallStatus + correlation fields. Extracted from the
+ * route handler so smoke tests can assert on the branching without
+ * spinning up express.
+ *
+ * The <Dial action> callback response takes FULL CONTROL of the
+ * parent call per Twilio docs — sibling verbs after </Dial> in the
+ * source TwiML are unreachable. So this is our only opportunity to
+ * keep the caller on the line after a failed dial.
+ *
+ * Statuses that trigger capture (Sorry-Say + Record):
+ *   no-answer — the dialed party didn't pick up before timeout
+ *   busy      — line was busy
+ *   failed    — network failure prevented the dial
+ *
+ * Statuses that return empty <Response/> (end the leg cleanly):
+ *   completed / answered — someone picked up, no fallback needed
+ *   canceled  — the CALLER hung up during ringback (they're gone).
+ *               Playing Say + Record to a dead line would be pointless
+ *               and Twilio would just log it — worse, if there's a
+ *               non-canceled interpretation edge case we don't want to
+ *               record from the wrong party.
+ *   anything else — unknown status, safe default.
+ *
+ * Guard: require business_id + conversation_id in the URL. Both are
+ * baked in when we build the Dial TwiML (see routing.ts:handleRouteToTopic).
+ * Their absence signals a URL-mangling bug and we fall through to
+ * empty rather than risk a Record with no correlation.
+ */
+export function pickDialStatusResponseTwiml(
+  body: { DialCallStatus?: string; business_id?: string; conversation_id?: string },
+  publicApiBase: string,
+): string {
+  const empty = '<?xml version="1.0" encoding="UTF-8"?><Response/>';
+  const status = body.DialCallStatus || "";
+  const isFailure = status === "no-answer" || status === "busy" || status === "failed";
+  if (!isFailure) return empty;
+  const businessId = body.business_id || "";
+  const conversationId = body.conversation_id || "";
+  if (!businessId || !conversationId) return empty;
+  return buildDialFailureCaptureTwiml({
+    publicApiBase,
+    businessId,
+    conversationId,
+  });
+}
+
+// ── Phase 6.4: dial-failure fallback capture ─────────────────────────
+//
+// Two-webhook pipeline that runs on the parent (caller's) call leg
+// after /dial-status returns the capture TwiML. Both are Twilio-signed
+// and always return 200 with valid TwiML (or 200 empty) — a non-2xx or
+// malformed XML on either would play "an application error has
+// occurred" audibly to the caller (verified live in Phase 3.4).
+//
+//   POST /routing/dial-fallback-record-done
+//     Fires when <Record> completes. Body carries CallSid, RecordingUrl,
+//     RecordingSid, RecordingDuration, From (caller's PSTN), etc.
+//     We CREATE the lead here with reason='Voicemail — transcription
+//     pending' and the audio URL preserved on lead_activities.metadata,
+//     then return the "Thank you, goodbye" TwiML. Creating on record
+//     (not on transcript) means a transcription failure — silent, per
+//     Twilio's docs — still leaves us with a workable lead + audio.
+//
+//   POST /routing/dial-fallback-transcript
+//     Fires async when Twilio finishes transcribing (seconds to
+//     minutes). Best-effort UPDATE of the lead's reason with the
+//     transcription. If the lead can't be found (e.g. the record
+//     handler failed and no lead was ever inserted), we log a Sentry
+//     warning and return 200 — the caller is long gone.
+
+interface DialFallbackRecordBody {
+  CallSid?: string;
+  RecordingUrl?: string;
+  RecordingSid?: string;
+  RecordingDuration?: string;
+  From?: string;
+  To?: string;
+}
+
+interface DialFallbackTranscriptBody {
+  CallSid?: string;
+  RecordingSid?: string;
+  TranscriptionText?: string;
+  TranscriptionStatus?: string;
+  TranscriptionSid?: string;
+}
+
+const DIAL_FALLBACK_VOICEMAIL_PLACEHOLDER = "Voicemail — transcription pending";
+const DIAL_FALLBACK_TRANSCRIPTION_FAILED = "Voicemail — transcription unavailable";
+
+async function insertDialFallbackLead(
+  supabase: SupabaseClient,
+  opts: {
+    businessId: string;
+    conversationId: string;
+    contactPhone: string | null;
+    recordingUrl: string | null;
+    recordingSid: string | null;
+    recordingDurationSecs: number | null;
+    twilioCallSid: string | null;
+  },
+): Promise<{ ok: true; leadId: string } | { ok: false; error: string }> {
+  // Best-effort source_call_id linkage — same pattern as the
+  // request_callback capture path (leads.ts).
+  let sourceCallId: string | null = null;
+  try {
+    const { data: callRow } = await supabase
+      .from("calls")
+      .select("id")
+      .eq("call_sid", opts.conversationId)
+      .maybeSingle();
+    sourceCallId = (callRow as { id?: string } | null)?.id ?? null;
+  } catch {
+    /* best-effort */
+  }
+
+  const { data: inserted, error: insertErr } = await supabase
+    .from("leads")
+    .insert({
+      business_id: opts.businessId,
+      source: "ai_no_answer_callback",
+      source_call_id: sourceCallId,
+      contact_name: null,
+      contact_phone: opts.contactPhone,
+      contact_email: null,
+      preferred_channel: "call",
+      reason: DIAL_FALLBACK_VOICEMAIL_PLACEHOLDER,
+      urgency: "medium",
+      status: "new",
+      qualification_status: null,
+      disqualifier_id: null,
+    })
+    .select("id")
+    .single();
+  if (insertErr || !inserted) {
+    return { ok: false, error: insertErr?.message || "insert returned no row" };
+  }
+  const leadId = (inserted as { id: string }).id;
+
+  // Activity row carries recording_sid so the transcript webhook can
+  // correlate its update back to this lead without a second lookup
+  // strategy. Best-effort — a failed activity insert does NOT roll
+  // back the lead (the lead is the load-bearing artifact; the
+  // timeline is nice-to-have).
+  try {
+    await supabase.from("lead_activities").insert({
+      lead_id: leadId,
+      actor_id: null,
+      actor_type: "system",
+      action: "captured",
+      note: null,
+      metadata: {
+        source: "ai_no_answer_callback",
+        conversation_id: opts.conversationId,
+        recording_sid: opts.recordingSid,
+        recording_url: opts.recordingUrl,
+        recording_duration_secs: opts.recordingDurationSecs,
+        twilio_call_sid: opts.twilioCallSid,
+      },
+    });
+  } catch (err: any) {
+    Sentry.captureException(err, {
+      extra: { where: "dial-fallback record activity insert", leadId },
+    });
+  }
+
+  return { ok: true, leadId };
+}
+
+router.post(
+  "/routing/dial-fallback-record-done",
+  async (req: Request, res: Response): Promise<void> => {
+    // Same posture as /dial-status: ALWAYS 200 with valid TwiML. A
+    // non-2xx here plays "an application error has occurred" to the
+    // caller (Phase 3.4 lesson). The Thank-you TwiML is the terminal
+    // step of the capture flow.
+    if (!verifyTwilioSignature(req)) {
+      Sentry.captureMessage("dial_fallback_record_signature_rejected", {
+        level: "error",
+        extra: { path: req.originalUrl },
+      });
+      res.status(200).type("text/xml").send(buildDialFailureThanksTwiml());
+      return;
+    }
+
+    const business_id =
+      (req.query.business_id as string) ||
+      (req.body?.business_id as string) ||
+      "";
+    const conversation_id =
+      (req.query.conversation_id as string) ||
+      (req.body?.conversation_id as string) ||
+      "";
+    if (!business_id || !conversation_id) {
+      Sentry.captureMessage("dial_fallback_record_missing_correlation", {
+        level: "error",
+        extra: { business_id, conversation_id, callSid: req.body?.CallSid },
+      });
+      res.status(200).type("text/xml").send(buildDialFailureThanksTwiml());
+      return;
+    }
+
+    const supabase = getSupabase();
+    if (!supabase) {
+      // No DB → can't insert the lead. Still play the Thanks so the
+      // caller doesn't hear an error. Sentry captures the miss.
+      Sentry.captureMessage("dial_fallback_record_no_supabase", {
+        level: "error",
+        extra: { business_id, conversation_id },
+      });
+      res.status(200).type("text/xml").send(buildDialFailureThanksTwiml());
+      return;
+    }
+
+    const body = req.body as DialFallbackRecordBody;
+    const recordingDurationSecs = body.RecordingDuration
+      ? Number.parseInt(body.RecordingDuration, 10) || null
+      : null;
+
+    const result = await insertDialFallbackLead(supabase, {
+      businessId: business_id,
+      conversationId: conversation_id,
+      contactPhone: body.From || null,
+      recordingUrl: body.RecordingUrl || null,
+      recordingSid: body.RecordingSid || null,
+      recordingDurationSecs,
+      twilioCallSid: body.CallSid || null,
+    });
+    if (!result.ok) {
+      Sentry.captureMessage("dial_fallback_record_lead_insert_failed", {
+        level: "error",
+        extra: { business_id, conversation_id, error: result.error },
+      });
+    } else {
+      console.log(
+        "[dial-fallback] lead captured:",
+        result.leadId,
+        "biz=", business_id,
+        "phone=", body.From,
+        "dur=", recordingDurationSecs,
+      );
+    }
+
+    res.status(200).type("text/xml").send(buildDialFailureThanksTwiml());
+  },
+);
+
+router.post(
+  "/routing/dial-fallback-transcript",
+  async (req: Request, res: Response): Promise<void> => {
+    // Transcript is async and off the caller's call leg. Twilio doesn't
+    // play our response to anyone — no TwiML concerns here — but keep
+    // the always-200 posture so Twilio doesn't retry.
+    if (!verifyTwilioSignature(req)) {
+      Sentry.captureMessage("dial_fallback_transcript_signature_rejected", {
+        level: "error",
+        extra: { path: req.originalUrl },
+      });
+      res.status(200).end();
+      return;
+    }
+
+    const supabase = getSupabase();
+    if (!supabase) {
+      res.status(200).end();
+      return;
+    }
+
+    const body = req.body as DialFallbackTranscriptBody;
+    const recordingSid = body.RecordingSid || "";
+    if (!recordingSid) {
+      // No correlation key — nothing to do.
+      res.status(200).end();
+      return;
+    }
+
+    const status = body.TranscriptionStatus || "";
+    const rawText = body.TranscriptionText || "";
+    const newReason =
+      status === "completed" && rawText.trim().length > 0
+        ? `Voicemail: ${rawText.trim()}`
+        : DIAL_FALLBACK_TRANSCRIPTION_FAILED;
+
+    // Find the lead via the activity row we wrote in record-done.
+    // Metadata is JSONB so we filter with -> operator.
+    try {
+      const { data: activityRows, error: actErr } = await supabase
+        .from("lead_activities")
+        .select("lead_id")
+        .eq("actor_type", "system")
+        .eq("action", "captured")
+        .filter("metadata->>recording_sid", "eq", recordingSid)
+        .limit(1);
+      if (actErr) {
+        Sentry.captureMessage("dial_fallback_transcript_activity_lookup_failed", {
+          level: "warning",
+          extra: { recordingSid, error: actErr.message },
+        });
+        res.status(200).end();
+        return;
+      }
+      const leadId = (activityRows as Array<{ lead_id: string }> | null)?.[0]?.lead_id;
+      if (!leadId) {
+        Sentry.captureMessage("dial_fallback_transcript_lead_not_found", {
+          level: "warning",
+          extra: { recordingSid, status },
+        });
+        res.status(200).end();
+        return;
+      }
+
+      const { error: updErr } = await supabase
+        .from("leads")
+        .update({ reason: newReason })
+        .eq("id", leadId);
+      if (updErr) {
+        Sentry.captureMessage("dial_fallback_transcript_lead_update_failed", {
+          level: "warning",
+          extra: { leadId, error: updErr.message },
+        });
+      } else {
+        // Timeline entry so ops can see the transcript arrival.
+        try {
+          await supabase.from("lead_activities").insert({
+            lead_id: leadId,
+            actor_id: null,
+            actor_type: "system",
+            action: "note_added",
+            note: null,
+            metadata: {
+              source: "ai_no_answer_callback_transcript",
+              recording_sid: recordingSid,
+              transcription_status: status,
+              transcription_length: rawText.length,
+            },
+          });
+        } catch {
+          /* best-effort */
+        }
+      }
+    } catch (err: any) {
+      Sentry.captureException(err, {
+        extra: { where: "dial-fallback transcript", recordingSid },
+      });
+    }
+
+    res.status(200).end();
   },
 );
 
