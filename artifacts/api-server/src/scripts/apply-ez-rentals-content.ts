@@ -50,19 +50,24 @@ import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 
 const BUSINESS_NAME = "EZ Rentals And Leasing";
 
-// Alex-spoken hours string. Sunday nuance is inline so the BUSINESS
-// INFORMATION block of the rendered prompt gives Alex a coherent story
-// on Sunday calls without her having to reason about the table row.
+// Alex-spoken hours string. Hours are hours — the Sunday operational
+// nuance (no in-person services) lives in the "Are you open on
+// Sunday?" FAQ and the never_say_list, not in this line. Keeping this
+// string clean means BUSINESS INFORMATION doesn't conflict with the
+// FAQ block if the tenant edits one and forgets the other.
 const BUSINESS_HOURS_TEXT =
-  "Mon-Fri 10:00 AM - 6:00 PM. Sat 10:00 AM - 4:00 PM. " +
-  "Sunday: closed for pickups, new contracts, and maintenance — " +
-  "online payments accepted any day.";
+  "Mon-Fri 10:00 AM - 6:00 PM. Sat 10:00 AM - 4:00 PM. Sun 10:00 AM - 6:00 PM.";
 
-// business_hours table rows. 0=Sunday. Sunday is_closed=true so the
-// routing engine's is_open check returns false and route_to_topic
-// falls through to the after_hours_callback path. Payments online
-// are handled outside the phone flow, so Sunday=closed on the routing
-// side is safe.
+// business_hours table rows. 0=Sunday. Sunday is OPEN 10-6 — staff
+// are on the phone handling payments, answering questions, and
+// booking appointments for Monday pickups. If we marked Sunday
+// is_closed=true, the routing engine's is_open check would return
+// false and every Sunday route_to_topic would fall through to
+// after_hours_callback — leaving a caller in message-taking mode
+// while a staff member sits there ready to help. The Sunday
+// operational restrictions (no same-day pickups, no new contracts,
+// no maintenance) are conveyed via the Sunday FAQ + never_say_list
+// bullet, not via the hours table.
 interface HoursRow {
   day_of_week: number;
   opens_at: string | null;
@@ -72,7 +77,7 @@ interface HoursRow {
 }
 const TIMEZONE = "America/New_York";
 const HOURS_ROWS: HoursRow[] = [
-  { day_of_week: 0, opens_at: null,       closes_at: null,       timezone: TIMEZONE, is_closed: true  }, // Sun
+  { day_of_week: 0, opens_at: "10:00:00", closes_at: "18:00:00", timezone: TIMEZONE, is_closed: false }, // Sun
   { day_of_week: 1, opens_at: "10:00:00", closes_at: "18:00:00", timezone: TIMEZONE, is_closed: false }, // Mon
   { day_of_week: 2, opens_at: "10:00:00", closes_at: "18:00:00", timezone: TIMEZONE, is_closed: false }, // Tue
   { day_of_week: 3, opens_at: "10:00:00", closes_at: "18:00:00", timezone: TIMEZONE, is_closed: false }, // Wed
@@ -135,7 +140,7 @@ const CUSTOM_FAQS: Array<{ question: string; answer: string }> = [
   {
     question: "Are you open on Sunday?",
     answer:
-      "Not for pickups, new contracts, or maintenance — those are Mon-Sat only. But you can make a payment online any day. If it's Sunday, I'll take a message and someone will follow up Monday.",
+      "Yes — Sunday 10 AM to 6 PM by phone. We handle payments, answer questions, and can book an appointment for you to pick up a car on Monday. What we don't do on Sundays is same-day pickups, new contracts, or maintenance — those are Monday through Saturday.",
   },
 ];
 
