@@ -47,7 +47,7 @@
  * caller hears the acknowledgement before the stream is torn down.
  *
  *   {
- *     status:          'connecting' | 'taking_message' | 'no_help_available',
+ *     status:          'connecting' | 'taking_message',
  *     topic_name:      string,     // display name of the matched topic
  *     staff_count:     number,     // Phase 3.7: number of CANDIDATES
  *                                  // being rung (each candidate may
@@ -442,8 +442,16 @@ async function loadOnDutyAny(
  * Public status label for the LLM-facing response — smaller alphabet
  * than the internal transferStatus enum. The LLM only cares about the
  * shape of "what do I say next".
+ *
+ * Phase 6.3 — 'no_help_available' was removed. The previous
+ * graceful_hangup path used it, and Alex read it as "we can't help,
+ * apologize and hang up" — losing the caller entirely (no message, no
+ * lead record). Now graceful_hangup maps to 'taking_message' so Alex
+ * always captures name/number/reason via request_callback before
+ * closing. The honest framing ("I don't have someone available right
+ * now") lives in the tool description, not in a distinct status label.
  */
-export type PublicRoutingStatus = "connecting" | "taking_message" | "no_help_available";
+export type PublicRoutingStatus = "connecting" | "taking_message";
 
 export interface RouteToTopicResult {
   status: PublicRoutingStatus;
@@ -474,7 +482,18 @@ function publicStatusFor(
     case "after_hours_callback":
       return "taking_message";
     case "graceful_hangup":
-      return "no_help_available";
+      // Phase 6.3 — was "no_help_available", which Alex interpreted as
+      // "we can't help, close the call." That lost the caller — no
+      // message, no lead record. The path fires when hours are open,
+      // nobody is on-duty, and no legacy transfer number is set — a
+      // scenario EZ Rentals hits often (transfer_to_phone cleared, staff
+      // frequently off-duty). Now maps to "taking_message" so Alex
+      // captures name/number/reason via request_callback before
+      // closing. The handoff_reason column keeps the 'graceful_hangup'
+      // label; the semantic boundary is the deploy timestamp — rows
+      // before Phase 6.3 mean "AI hung up", rows after mean "AI took
+      // a callback".
+      return "taking_message";
   }
 }
 

@@ -19,6 +19,12 @@
  *   4. Business open + legacy transfer_to_phone configured → legacy_transfer.
  *   5. Business closed → after_hours_callback (AI takes a message).
  *   6. Business open but nobody home and no legacy phone → graceful_hangup.
+ *      As of Phase 6.3, this path is NOT terminal for the caller. The
+ *      handoff_reason column still writes 'graceful_hangup' for
+ *      reporting continuity, but publicStatusFor maps it to
+ *      'taking_message' so Alex captures a callback via request_callback
+ *      before closing. Pre-6.3, this path returned status
+ *      'no_help_available' and Alex hung up — losing the lead.
  */
 
 export interface StaffCandidate {

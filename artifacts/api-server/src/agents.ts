@@ -66,7 +66,7 @@ Pick the topic_slug that BEST matches the caller's request from the enum. If not
 
 Before invoking the tool, say ONE sentence telling the caller you're connecting them. Example: "Let me connect you with our roadside team right now." Then invoke the tool. The tool responds quickly with a short acknowledgement; after a brief pause, the caller will hear the team member's phone ring.
 
-If the tool returns status="taking_message", the team is closed or nobody is available — apologize and use request_callback instead. If status="no_help_available", apologize and offer to take a message via request_callback.`;
+If the tool returns status="taking_message", nobody is available to take the call right now (team is closed, everyone off-duty, or no legacy transfer configured). Do NOT end the call. Say something honest and warm — for example: "I don't have someone available right now, but I can take a message and have the team call you back." Then invoke request_callback with the caller's full name, phone number, and reason for calling. Close warmly only AFTER request_callback returns success. A caller with a specific need must NEVER hang up without a callback being captured.`;
 
 // NL description shown to the LLM. Tells it WHEN to invoke and what to
 // confirm with the caller before invoking. Kept as a module constant so

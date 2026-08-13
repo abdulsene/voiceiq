@@ -1136,9 +1136,14 @@ async function T24_no_redirect_on_graceful_hangup() {
 
   const failures: string[] = [];
   if (!result.ok) failures.push(`not ok: ${(result as any).error}`);
-  else if (result.result.status !== "no_help_available") failures.push(`status=${result.result.status}`);
+  // Phase 6.3 — graceful_hangup now maps to 'taking_message' so Alex
+  // captures a callback via request_callback rather than hanging up.
+  // The path is still non-dialing (no REST redirect), which is what
+  // T24 was invented to protect. Only the public status label
+  // changed.
+  else if (result.result.status !== "taking_message") failures.push(`status=${result.result.status}`);
   if (twilioMock.updates.length !== 0) failures.push(`unexpected Twilio update: ${twilioMock.updates.length}`);
-  record("T24 no REST redirect on graceful_hangup", failures.length === 0, failures.join("; ") || "twilio.calls.update NOT invoked, public status=no_help_available");
+  record("T24 no REST redirect on graceful_hangup", failures.length === 0, failures.join("; ") || "twilio.calls.update NOT invoked, public status=taking_message");
 }
 
 async function T25_no_redirect_when_call_sid_missing() {
