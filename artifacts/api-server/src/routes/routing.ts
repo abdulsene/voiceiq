@@ -217,6 +217,16 @@ export interface RouteToTopicBody {
    * dev/simulation path). Absence → skip REST redirect, log Sentry warning.
    */
   call_sid?: string;
+  /**
+   * Phase 6.0 — Alex sets this to true after reciting a topic's
+   * QUALIFICATION REQUIREMENTS and confirming the caller meets every
+   * one. The handler records the mismatch on calls.qualification_bypassed
+   * when a gated topic is routed WITHOUT this flag. Does NOT block
+   * the routing — stranding a caller mid-conversation over a
+   * misclassification would be worse than the eventual audit signal.
+   * Absent/false for topics without a qualification gate.
+   */
+  qualification_confirmed?: boolean;
 }
 
 export function parseRouteBody(body: unknown): RouteToTopicBody | { error: string } {
@@ -245,6 +255,15 @@ export function parseRouteBody(body: unknown): RouteToTopicBody | { error: strin
     }
     parsed.call_sid = raw_sid.trim();
   }
+  // Phase 6.0 — qualification_confirmed is optional boolean. Accept
+  // true only when the LLM explicitly sends the JSON literal `true`;
+  // strings like "true" or "yes" are ignored (do NOT coerce — that
+  // would let stale agent configs accidentally suppress the bypass
+  // signal). Anything not-true is left undefined so the handler can
+  // still distinguish "false" from "not applicable" if we ever need to.
+  if (b["qualification_confirmed"] === true) {
+    parsed.qualification_confirmed = true;
+  }
   return parsed;
 }
 
@@ -261,7 +280,12 @@ interface BusinessContext {
    */
   transferWaitMessage: string | null;
   callerId: string;
-  departments: Array<{ slug: string; name: string }>;
+  // Phase 6.0 — qualificationEnabled surfaced per-topic so
+  // handleRouteToTopic can decide whether an incoming
+  // qualification_confirmed=true is expected. Only true when the topic
+  // has an active gate (see routes/topics.ts:parseQualification for the
+  // full definition of "active").
+  departments: Array<{ slug: string; name: string; qualificationEnabled: boolean }>;
 }
 
 async function loadBusinessContext(
@@ -276,9 +300,22 @@ async function loadBusinessContext(
   if (error || !data) return null;
   const row = data as any;
   const departments = Array.isArray(row.departments)
-    ? (row.departments as any[]).filter(
-        (t) => t && typeof t === "object" && typeof t.slug === "string" && typeof t.name === "string",
-      )
+    ? (row.departments as any[])
+        .filter(
+          (t) => t && typeof t === "object" && typeof t.slug === "string" && typeof t.name === "string",
+        )
+        .map((t) => ({
+          slug: t.slug as string,
+          name: t.name as string,
+          qualificationEnabled:
+            t.qualification &&
+            typeof t.qualification === "object" &&
+            t.qualification.enabled === true &&
+            typeof t.qualification.requirements_text === "string" &&
+            t.qualification.requirements_text.trim().length > 0 &&
+            Array.isArray(t.qualification.disqualifiers) &&
+            t.qualification.disqualifiers.length > 0,
+        }))
     : [];
   return {
     business_name: row.business_name || "our team",
@@ -568,6 +605,24 @@ export async function handleRouteToTopic(
   //   * `conversation_id` column is populated too (as an attribute) so
   //     future readers migrating away from the call_sid alias have
   //     the value on the same row.
+  // Phase 6.0 — was the routed topic qualification-gated, and did Alex
+  // confirm the gate before calling us? If the topic has an active
+  // gate AND the tool did NOT carry qualification_confirmed=true, tag
+  // the call for later audit. This is the SQL-queryable answer to
+  // "how often did Alex transfer callers who shouldn't have been?"
+  // We record it in the upsert (not as a hard block) — dropping the
+  // caller mid-call over a probable-mistake would be strictly worse
+  // than the eventual reporting signal.
+  const matchedTopic = biz.departments.find((t) => t.slug === topic_slug);
+  const qualificationBypassed =
+    matchedTopic?.qualificationEnabled === true && body.qualification_confirmed !== true;
+  if (qualificationBypassed) {
+    Sentry.captureMessage("route_to_topic_qualification_bypassed", {
+      level: "warning",
+      extra: { business_id, conversation_id, topic_slug },
+    });
+  }
+
   try {
     const upsertPayload: Record<string, unknown> = {
       call_sid: conversation_id,
@@ -578,6 +633,13 @@ export async function handleRouteToTopic(
       handoff_reason: decision.handoffReason,
       transfer_status: decision.transferStatus,
       direction: "inbound",
+      // NULL when the topic has no gate. TRUE when the gate was
+      // bypassed. FALSE when the gate was honored — kept explicit so
+      // queries can distinguish "honored gate" from "no gate exists"
+      // without needing to re-join departments.
+      qualification_bypassed: matchedTopic?.qualificationEnabled === true
+        ? qualificationBypassed
+        : null,
     };
     // Phase 3.3 — persist the real Twilio CallSid so failed-redirect
     // forensics don't require Sentry↔Twilio-console correlation. Only

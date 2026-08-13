@@ -140,6 +140,69 @@ export function sanitizeValueProp(raw: string): string | null {
   return trimmed;
 }
 
+// Phase 6.0 — render a per-topic QUALIFICATION REQUIREMENTS block.
+// Returns null when the topic has no qualification, when the block is
+// disabled, or when it lacks the pieces Alex needs to actually run the
+// flow (requirements + at least one disqualifier). Falls silent rather
+// than emitting a half-formed gate — the DEPARTMENTS block still
+// renders and Alex will route without a gate, which matches the tenant
+// having toggled the feature off.
+//
+// The requirements_text is emitted VERBATIM. Ops-authored prose is the
+// source of truth; the renderer does not paraphrase it.
+export function renderQualification(topic: {
+  qualification?: {
+    enabled: boolean;
+    requirements_text: string;
+    disqualifiers: Array<{ id: string; label: string; kind: "permanent" | "temporary" }>;
+    permanent_close: string;
+    temporary_close: string;
+  } | null;
+}): string | null {
+  const q = topic.qualification;
+  if (!q || !q.enabled) return null;
+  const requirements = (q.requirements_text || "").trim();
+  const disqualifiers = Array.isArray(q.disqualifiers) ? q.disqualifiers : [];
+  if (!requirements || disqualifiers.length === 0) return null;
+
+  const permanentList = disqualifiers.filter((d) => d.kind === "permanent");
+  const temporaryList = disqualifiers.filter((d) => d.kind === "temporary");
+
+  let block = `
+  QUALIFICATION REQUIREMENTS — read these to the caller conversationally (do NOT recite as a bullet list) and confirm they meet each one before routing:
+  ${requirements}`;
+
+  if (permanentList.length > 0) {
+    block += `
+  Permanent disqualifiers (caller can NEVER satisfy by calling back — do not tell them to try again):`;
+    for (const d of permanentList) {
+      block += `
+    - disqualifier_id: "${d.id}" — ${d.label}`;
+    }
+    const permanentClose = (q.permanent_close || "").trim();
+    if (permanentClose) {
+      block += `
+  When a caller fails a permanent disqualifier, invoke request_callback with the matching disqualifier_id and then close with: "${permanentClose}"`;
+    }
+  }
+
+  if (temporaryList.length > 0) {
+    block += `
+  Temporary disqualifiers (caller CAN come back once the condition changes — explicitly invite them to call back):`;
+    for (const d of temporaryList) {
+      block += `
+    - disqualifier_id: "${d.id}" — ${d.label}`;
+    }
+    const temporaryClose = (q.temporary_close || "").trim();
+    if (temporaryClose) {
+      block += `
+  When a caller fails a temporary disqualifier, invoke request_callback with the matching disqualifier_id and then close with: "${temporaryClose}"`;
+    }
+  }
+
+  return block;
+}
+
 const LANGUAGE_BLOCKS: Record<string, { header: string; block: (biz: string) => string; greeting: (biz: string) => string }> = {
   es: {
     header: "IDIOMA / SPANISH LANGUAGE DETECTION",
@@ -415,6 +478,20 @@ export function renderPromptFromHelpers(opts: {
     name: string;
     description?: string | null;
     example_utterances?: string[] | null;
+    // Phase 6.0 — per-topic qualification gate. When qualification.enabled
+    // is true AND the block carries requirements + disqualifiers, the
+    // renderer emits a QUALIFICATION REQUIREMENTS sub-section under the
+    // topic that instructs Alex to recite requirements, confirm the
+    // caller meets them, and route unqualified callers through
+    // request_callback with a disqualifier_id. See renderQualification
+    // below for the exact prose.
+    qualification?: {
+      enabled: boolean;
+      requirements_text: string;
+      disqualifiers: Array<{ id: string; label: string; kind: "permanent" | "temporary" }>;
+      permanent_close: string;
+      temporary_close: string;
+    } | null;
   }> | null;
   // Phase 5.3 — the tool set actually registered on this business's
   // ElevenLabs agent (from business_configs.transfer_enabled +
@@ -556,6 +633,7 @@ ${tmpl.appointment_types.map(a => `- ${a}`).join("\n")}`;
 
 DEPARTMENTS & TOPIC EXPERTISE (when a caller's request matches one of these topics AND requires a real human on the phone, invoke the route_to_topic tool with the matching topic_slug — the routing engine will ring the on-duty specialist and connect them to the caller):
 `;
+    let anyQualificationGate = false;
     for (const topic of opts.topics) {
       const desc = (topic.description || "").trim();
       const utterances = Array.isArray(topic.example_utterances)
@@ -571,6 +649,16 @@ DEPARTMENTS & TOPIC EXPERTISE (when a caller's request matches one of these topi
         prompt += `
   Example utterances the caller might say: ${utterances.map((u) => `"${u.trim()}"`).join(", ")}`;
       }
+      // Phase 6.0 — per-topic qualification gate. Emitted inline with
+      // the topic so Alex reads the requirements in the same mental
+      // context as the routing target. The non-negotiation paragraph
+      // is deferred to a single trailing block below so it's stated
+      // once, not per-topic.
+      const qBlock = renderQualification(topic);
+      if (qBlock) {
+        prompt += qBlock;
+        anyQualificationGate = true;
+      }
     }
     // Phase 5.3 — gate the "use record_appointment for scheduling"
     // hint on the tool actually being registered. When it's off, tell
@@ -583,6 +671,17 @@ DEPARTMENTS & TOPIC EXPERTISE (when a caller's request matches one of these topi
     prompt += `
 
 Do NOT invoke route_to_topic for simple questions you can answer yourself (business hours, address, general policies). ${schedulingGuidance} Only invoke when the caller needs a specialist right now.`;
+
+    if (anyQualificationGate) {
+      prompt += `
+
+QUALIFICATION RULES (apply to any topic above that lists QUALIFICATION REQUIREMENTS):
+- These requirements are absolute company policy. You do NOT have authority to grant exceptions, and neither does anyone you could transfer the caller to.
+- Before invoking route_to_topic for a topic with requirements, you MUST first state the requirements conversationally (not as a recited bullet list), then confirm the caller meets each one. When they have confirmed ALL of them, invoke route_to_topic AND set qualification_confirmed=true. If you have not confirmed every requirement, do NOT invoke route_to_topic.
+- If the caller fails any requirement, do NOT invoke route_to_topic. Instead invoke request_callback with disqualifier_id set to the id of the requirement they failed, and reason set to a short summary in their own words. Then read the matching closing line (permanent or temporary — the requirement's kind tells you which).
+- If the caller pushes back, asks for an exception, asks to speak to a manager, or offers to negotiate: DO NOT invoke route_to_topic. DO NOT promise a callback about the exception itself. Invoke request_callback with disqualifier_id set to the requirement they cannot meet and reason set to what they asked for ("caller asked if we can waive the 25-and-over rule"). The owner will decide — you do not.
+- Never invent a disqualifier_id. Only use ids listed on the topic above.`;
+    }
   }
 
   if (opts.tonePreference && opts.tonePreference.trim().length > 0) {

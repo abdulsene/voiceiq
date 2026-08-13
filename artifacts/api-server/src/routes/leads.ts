@@ -64,6 +64,19 @@ const VALID_CHANNEL = ["text", "call", "email", "voice_callback"] as const;
 type Urgency = (typeof VALID_URGENCY)[number];
 type Channel = (typeof VALID_CHANNEL)[number];
 
+// Phase 6.0 — qualification-related types shared with the topics
+// module. Not imported from routes/topics.ts to avoid a route→route
+// dependency; the enums are tiny and the source of truth for the
+// disqualifier catalogue itself is business_configs.departments JSONB.
+const VALID_QUALIFICATION_STATUS = [
+  "qualified",
+  "unqualified_temporary",
+  "unqualified_permanent",
+] as const;
+type QualificationStatus = (typeof VALID_QUALIFICATION_STATUS)[number];
+const DISQUALIFIER_ID_MAX = 100;
+const DISQUALIFIER_ID_RE = /^[a-z][a-z0-9_]*$/;
+
 const E164_RE = /^\+[1-9]\d{6,14}$/;
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
@@ -106,6 +119,12 @@ type CapturePayload = {
   reason: string;
   urgency: Urgency;
   preferred_channel: Channel;
+  // Phase 6.0 — optional. Present when Alex captured this callback
+  // because the caller failed a qualification requirement. The server
+  // resolves kind (permanent/temporary) by looking the id up in
+  // business_configs.departments; that lookup drives
+  // qualification_status on the inserted lead.
+  disqualifier_id?: string;
 };
 
 function parseCapturePayload(body: any): CapturePayload | { error: string } {
@@ -154,6 +173,29 @@ function parseCapturePayload(body: any): CapturePayload | { error: string } {
     return { error: `preferred_channel must be one of: ${VALID_CHANNEL.join(", ")}` };
   }
 
+  // Phase 6.0 — disqualifier_id is optional. Format-check here; the
+  // handler resolves it against business_configs.departments to derive
+  // kind. We do NOT reject unknown ids at the boundary — an id present
+  // in the payload but missing in the config gets captured as
+  // qualification_status='unqualified_temporary' with a warning
+  // breadcrumb (safer than 400ing a live call because ops just deleted
+  // a disqualifier row seconds before Alex tried to use it).
+  const disqualifierRaw = body.disqualifier_id;
+  let disqualifierId: string | undefined;
+  if (disqualifierRaw != null && disqualifierRaw !== "") {
+    if (typeof disqualifierRaw !== "string") {
+      return { error: "disqualifier_id must be a string" };
+    }
+    const trimmed = disqualifierRaw.trim();
+    if (trimmed.length > DISQUALIFIER_ID_MAX) {
+      return { error: `disqualifier_id exceeds ${DISQUALIFIER_ID_MAX} characters` };
+    }
+    if (!DISQUALIFIER_ID_RE.test(trimmed)) {
+      return { error: "disqualifier_id must be snake_case" };
+    }
+    disqualifierId = trimmed;
+  }
+
   return {
     business_id: businessId,
     conversation_id: conversationId,
@@ -163,7 +205,38 @@ function parseCapturePayload(body: any): CapturePayload | { error: string } {
     reason,
     urgency: urgency as Urgency,
     preferred_channel: preferredChannel as Channel,
+    disqualifier_id: disqualifierId,
   };
+}
+
+// Phase 6.0 — resolve a disqualifier_id to its qualification_status
+// by scanning the business's departments JSONB. Unknown ids (deleted
+// or misspelled) fall back to 'unqualified_temporary' — safer default
+// than 'permanent' because a temporary bucket at least keeps the lead
+// in the tenant's workable pile if it turns out to be a real caller.
+function resolveQualificationStatus(
+  disqualifierId: string,
+  departments: unknown,
+): { status: QualificationStatus; found: boolean } {
+  if (!Array.isArray(departments)) {
+    return { status: "unqualified_temporary", found: false };
+  }
+  for (const topic of departments as any[]) {
+    if (!topic || typeof topic !== "object") continue;
+    const q = topic.qualification;
+    if (!q || typeof q !== "object") continue;
+    const list = Array.isArray(q.disqualifiers) ? q.disqualifiers : [];
+    for (const d of list) {
+      if (!d || typeof d !== "object") continue;
+      if (d.id !== disqualifierId) continue;
+      if (d.kind === "permanent") return { status: "unqualified_permanent", found: true };
+      if (d.kind === "temporary") return { status: "unqualified_temporary", found: true };
+      // Kind missing / malformed — treat as temporary so a lookup miss
+      // doesn't accidentally hide a caller in the permanent bucket.
+      return { status: "unqualified_temporary", found: true };
+    }
+  }
+  return { status: "unqualified_temporary", found: false };
 }
 
 // ── POST /api/leads/capture ────────────────────────────────────────────
@@ -202,7 +275,7 @@ router.post("/leads/capture", async (req: Request, res: Response) => {
     // tool_error_handling_mode='summarized' setting.
     const { data: biz, error: bizErr } = await supabase
       .from("business_configs")
-      .select("business_id, business_name, sla_overrides")
+      .select("business_id, business_name, sla_overrides, departments")
       .eq("business_id", parsed.business_id)
       .maybeSingle();
     if (bizErr) {
@@ -221,7 +294,31 @@ router.post("/leads/capture", async (req: Request, res: Response) => {
       business_id: string;
       business_name: string | null;
       sla_overrides: Record<string, unknown> | null;
+      departments: unknown;
     };
+
+    // Phase 6.0 — resolve qualification status from the disqualifier_id
+    // Alex passed. Absent id → NULL columns (treated as 'qualified'
+    // downstream for backwards compat with pre-6.0 rows). Unknown id →
+    // still stored, with a Sentry breadcrumb so ops can spot drift
+    // between the tool schema and the live topics config.
+    let qualificationStatus: QualificationStatus | null = null;
+    let disqualifierIdForInsert: string | null = null;
+    if (parsed.disqualifier_id) {
+      const resolved = resolveQualificationStatus(parsed.disqualifier_id, bizRow.departments);
+      qualificationStatus = resolved.status;
+      disqualifierIdForInsert = parsed.disqualifier_id;
+      if (!resolved.found) {
+        Sentry.captureMessage("leads_capture_unknown_disqualifier_id", {
+          level: "warning",
+          extra: {
+            businessId: parsed.business_id,
+            disqualifierId: parsed.disqualifier_id,
+            conversationId: parsed.conversation_id,
+          },
+        });
+      }
+    }
 
     // Try to link to the source call. Best-effort — if no calls row
     // exists yet for this conversation (the post-call sync hasn't
@@ -253,6 +350,8 @@ router.post("/leads/capture", async (req: Request, res: Response) => {
         reason: parsed.reason,
         urgency: parsed.urgency,
         status: "new",
+        qualification_status: qualificationStatus,
+        disqualifier_id: disqualifierIdForInsert,
       })
       .select("id, created_at")
       .single();
@@ -284,6 +383,12 @@ router.post("/leads/capture", async (req: Request, res: Response) => {
           source_call_id: sourceCallId,
           urgency: parsed.urgency,
           preferred_channel: parsed.preferred_channel,
+          ...(disqualifierIdForInsert
+            ? {
+                disqualifier_id: disqualifierIdForInsert,
+                qualification_status: qualificationStatus,
+              }
+            : {}),
         },
       });
     if (activityErr) {
@@ -333,7 +438,12 @@ router.post("/leads/capture", async (req: Request, res: Response) => {
         return null;
       }
     })();
-    if (trustToken) {
+    // Phase 6.0 — do NOT send the "someone will follow up" SMS for
+    // permanently-unqualified callers. The team will not be following
+    // up; sending the trust-portal link would be a lie. Temporary
+    // unqualifieds still get the SMS — the tenant may work them.
+    const shouldSendSms = qualificationStatus !== "unqualified_permanent";
+    if (trustToken && shouldSendSms) {
       void sendLeadSms({
         supabase,
         businessId: parsed.business_id,
@@ -388,6 +498,11 @@ type LeadRow = {
   dismissed_reason: string | null;
   created_at: string;
   updated_at: string;
+  // Phase 6.0 — nullable pair. NULL = pre-6.0 or non-qualification
+  // capture; the dashboard treats NULL as 'qualified' for filter
+  // purposes (see parseListQuery below).
+  qualification_status: string | null;
+  disqualifier_id: string | null;
 };
 
 type LeadActivityRow = {
@@ -402,7 +517,7 @@ type LeadActivityRow = {
 };
 
 const LEAD_SELECT_COLUMNS =
-  "id, business_id, source, source_call_id, contact_name, contact_phone, contact_email, preferred_channel, reason, urgency, status, assigned_to, claimed_at, first_response_at, resolved_at, resolution_note, dismissed_reason, created_at, updated_at";
+  "id, business_id, source, source_call_id, contact_name, contact_phone, contact_email, preferred_channel, reason, urgency, status, assigned_to, claimed_at, first_response_at, resolved_at, resolution_note, dismissed_reason, created_at, updated_at, qualification_status, disqualifier_id";
 
 async function loadLeadList(opts: {
   supabase: SupabaseClient;
@@ -412,6 +527,12 @@ async function loadLeadList(opts: {
   callerUserId: string | null;
   limit: number;
   offset: number;
+  // Phase 6.0 — 'qualified' | 'unqualified_temporary' |
+  // 'unqualified_permanent' | null. When null, the default filter
+  // excludes both unqualified buckets so they don't pollute My Open /
+  // Unassigned / All. When set, filters to exactly that bucket
+  // (NULL matches 'qualified' by convention).
+  qualificationStatus: QualificationStatus | null;
 }): Promise<{ rows: LeadRow[]; total: number } | { error: string }> {
   const q = opts.supabase
     .from("leads")
@@ -421,6 +542,19 @@ async function loadLeadList(opts: {
     .range(opts.offset, opts.offset + opts.limit - 1);
   if (opts.status) q.eq("status", opts.status);
   if (opts.assignedToMe && opts.callerUserId) q.eq("assigned_to", opts.callerUserId);
+
+  // Phase 6.0 — qualification filter. Default (unspecified) EXCLUDES
+  // both unqualified buckets so the tenant's workable pipeline stays
+  // clean. Explicit values narrow to that bucket; 'qualified' is the
+  // union of NULL and the literal 'qualified' string (pre-6.0 rows
+  // carried NULL and are treated as qualified by convention).
+  if (opts.qualificationStatus === null) {
+    q.or("qualification_status.is.null,qualification_status.eq.qualified");
+  } else if (opts.qualificationStatus === "qualified") {
+    q.or("qualification_status.is.null,qualification_status.eq.qualified");
+  } else {
+    q.eq("qualification_status", opts.qualificationStatus);
+  }
 
   const { data, error, count } = await q;
   if (error) {
@@ -459,6 +593,7 @@ function parseListQuery(req: Request, callerUserId: string | null): {
   callerUserId: string | null;
   limit: number;
   offset: number;
+  qualificationStatus: QualificationStatus | null;
 } {
   const rawStatus = typeof req.query.status === "string" ? req.query.status : null;
   const validStatuses = ["new", "claimed", "in_progress", "resolved", "dismissed"];
@@ -469,7 +604,11 @@ function parseListQuery(req: Request, callerUserId: string | null): {
     Math.max(1, parseInt(typeof req.query.limit === "string" ? req.query.limit : "", 10) || DEFAULT_LIST_LIMIT),
   );
   const offset = Math.max(0, parseInt(typeof req.query.offset === "string" ? req.query.offset : "", 10) || 0);
-  return { status, assignedToMe, callerUserId, limit, offset };
+  const rawQualStatus = typeof req.query.qualification_status === "string" ? req.query.qualification_status : null;
+  const qualificationStatus = rawQualStatus && (VALID_QUALIFICATION_STATUS as readonly string[]).includes(rawQualStatus)
+    ? (rawQualStatus as QualificationStatus)
+    : null;
+  return { status, assignedToMe, callerUserId, limit, offset, qualificationStatus };
 }
 
 // ── GET /api/business/leads ────────────────────────────────────────────

@@ -191,7 +191,64 @@ export function buildRequestCallbackTool(opts: {
   businessId: string;
   captureUrl: string;
   toolSecret: string;
+  // Phase 6.0 — when the business has at least one qualification-gated
+  // topic, we surface a disqualifier_id enum on the tool so Alex can
+  // tag an unqualified callback with the exact requirement that failed.
+  // Union of all disqualifier ids across every gated topic (small set;
+  // typically 5-10 total). Empty/undefined → the field is omitted from
+  // the schema entirely so unrelated businesses don't see a dead param.
+  disqualifierIds?: string[];
 }): unknown {
+  const properties: Record<string, unknown> = {
+    business_id: {
+      type: 'string',
+      constant_value: opts.businessId,
+    },
+    conversation_id: {
+      type: 'string',
+      description: 'The current ElevenLabs conversation ID. Use the value provided to you in this conversation; do not invent one.',
+    },
+    contact_name: {
+      type: 'string',
+      description: "The caller's full name as they stated it during the call. Do not guess; if the caller hasn't given a name yet, ask them first.",
+    },
+    contact_phone: {
+      type: 'string',
+      description: "The caller's callback phone number in E.164 format (e.g. +14105551234). If the caller said a 10-digit US number, prepend +1. Confirm the number back to the caller before submitting.",
+    },
+    contact_email: {
+      type: 'string',
+      description: "Optional. The caller's email address if they provided one for follow-up. Leave blank if not provided.",
+    },
+    reason: {
+      type: 'string',
+      description: "A concise summary of what the caller needs, in their own words. Two or three sentences. Do not embellish; capture only what they said they needed.",
+    },
+    urgency: {
+      type: 'string',
+      enum: ['low', 'medium', 'high', 'emergency'],
+      description: "How urgent the follow-up is. 'emergency' = something happening RIGHT NOW that requires immediate human attention (safety issue, urgent business problem, customer in distress). 'high' = same-day, time-sensitive. 'medium' = default for normal callbacks. 'low' = non-urgent informational follow-up. Pick based on the caller's tone and explicit words, not on assumption.",
+    },
+    preferred_channel: {
+      type: 'string',
+      enum: ['text', 'call', 'email', 'voice_callback'],
+      description: "How the caller wants to be reached. 'text' = SMS. 'call' = phone call from the team. 'email' = email. 'voice_callback' = an AI-initiated automated callback. Ask the caller explicitly: \"Would you prefer a text, a call, or an email?\"",
+    },
+  };
+
+  // Phase 6.0 — optional disqualifier tagging. Only surfaced when the
+  // business has qualification-gated topics; the server derives kind
+  // (permanent/temporary) and populates leads.qualification_status
+  // from this id at insert time. Free-text 'note' is not exposed —
+  // the caller's own words already land in `reason`.
+  if (opts.disqualifierIds && opts.disqualifierIds.length > 0) {
+    properties.disqualifier_id = {
+      type: 'string',
+      enum: opts.disqualifierIds,
+      description: "Optional. If this callback is being captured because the caller failed a QUALIFICATION REQUIREMENT on one of the DEPARTMENTS above, set this to the disqualifier_id from that topic's requirement list (e.g. \"under_25\", \"leaving_md\"). Omit this field for normal callbacks that are not qualification-related. Only use ids that appear in the QUALIFICATION REQUIREMENTS section of the system prompt — do not invent ids.",
+    };
+  }
+
   return {
     type: 'webhook',
     name: REQUEST_CALLBACK_TOOL_NAME,
@@ -225,42 +282,7 @@ export function buildRequestCallbackTool(opts: {
           'urgency',
           'preferred_channel',
         ],
-        properties: {
-          business_id: {
-            type: 'string',
-            constant_value: opts.businessId,
-          },
-          conversation_id: {
-            type: 'string',
-            description: 'The current ElevenLabs conversation ID. Use the value provided to you in this conversation; do not invent one.',
-          },
-          contact_name: {
-            type: 'string',
-            description: "The caller's full name as they stated it during the call. Do not guess; if the caller hasn't given a name yet, ask them first.",
-          },
-          contact_phone: {
-            type: 'string',
-            description: "The caller's callback phone number in E.164 format (e.g. +14105551234). If the caller said a 10-digit US number, prepend +1. Confirm the number back to the caller before submitting.",
-          },
-          contact_email: {
-            type: 'string',
-            description: "Optional. The caller's email address if they provided one for follow-up. Leave blank if not provided.",
-          },
-          reason: {
-            type: 'string',
-            description: "A concise summary of what the caller needs, in their own words. Two or three sentences. Do not embellish; capture only what they said they needed.",
-          },
-          urgency: {
-            type: 'string',
-            enum: ['low', 'medium', 'high', 'emergency'],
-            description: "How urgent the follow-up is. 'emergency' = something happening RIGHT NOW that requires immediate human attention (safety issue, urgent business problem, customer in distress). 'high' = same-day, time-sensitive. 'medium' = default for normal callbacks. 'low' = non-urgent informational follow-up. Pick based on the caller's tone and explicit words, not on assumption.",
-          },
-          preferred_channel: {
-            type: 'string',
-            enum: ['text', 'call', 'email', 'voice_callback'],
-            description: "How the caller wants to be reached. 'text' = SMS. 'call' = phone call from the team. 'email' = email. 'voice_callback' = an AI-initiated automated callback. Ask the caller explicitly: \"Would you prefer a text, a call, or an email?\"",
-          },
-        },
+        properties,
       },
     },
   };
@@ -383,6 +405,16 @@ export function buildRouteToTopicTool(opts: {
   routeToTopicUrl: string;
   toolSecret: string;
   topics: Array<{ slug: string; name: string; description?: string | null }>;
+  // Phase 6.0 — when true, the tool schema includes an optional
+  // qualification_confirmed boolean. Alex sets it to true after
+  // confirming a caller meets a gated topic's QUALIFICATION
+  // REQUIREMENTS. The server records the discrepancy on
+  // calls.qualification_bypassed when a gated topic is routed
+  // WITHOUT this flag. Passed as a flag (not derived from opts.topics)
+  // so the caller in updateAgentTools controls whether we ask
+  // ElevenLabs to include the param at all — avoids surfacing a
+  // permanently-unused field to businesses without any gate.
+  qualificationGateActive?: boolean;
 }): unknown {
   if (opts.topics.length === 0) {
     // Defensive — callers MUST guard on this, but throwing here catches
@@ -443,6 +475,14 @@ export function buildRouteToTopicTool(opts: {
             type: 'string',
             description: 'A short (1 sentence) natural-language reason for the handoff — what the caller needs and why a human should take it. Used for reporting and for the handoff whisper to the answering staff member.',
           },
+          ...(opts.qualificationGateActive
+            ? {
+                qualification_confirmed: {
+                  type: 'boolean',
+                  description: 'Set to true ONLY when routing to a topic that has QUALIFICATION REQUIREMENTS in the system prompt AND you have already recited them AND the caller has confirmed they meet EVERY requirement. Set to false or omit for topics without a qualification gate. Do not set true optimistically — the tenant relies on this signal to audit unqualified transfers.',
+                },
+              }
+            : {}),
         },
       },
     },
@@ -527,6 +567,34 @@ export function buildRecordOptOutTool(opts: {
       },
     },
   };
+}
+
+/**
+ * Phase 6.0 — flatten disqualifier ids from all qualification-gated
+ * topics into a unique-preserving-order list. Reads the same
+ * business_configs.departments JSONB used elsewhere in this module;
+ * defensive against partial/malformed rows. Empty list → no gated
+ * topic exists, and the caller should NOT surface the disqualifier_id
+ * enum or the qualification_confirmed boolean on the tool schemas.
+ */
+function collectDisqualifierIds(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return [];
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const topic of raw as any[]) {
+    if (!topic || typeof topic !== 'object') continue;
+    const q = topic.qualification;
+    if (!q || typeof q !== 'object' || q.enabled !== true) continue;
+    const list = Array.isArray(q.disqualifiers) ? q.disqualifiers : [];
+    for (const d of list) {
+      if (!d || typeof d !== 'object') continue;
+      const id = typeof d.id === 'string' ? d.id.trim() : '';
+      if (!id || seen.has(id)) continue;
+      seen.add(id);
+      out.push(id);
+    }
+  }
+  return out;
 }
 
 export async function createAgentForBusiness(opts: {
@@ -803,11 +871,19 @@ export async function updateAgentTools(
       console.error('[Agents]', msg, businessId);
       return { success: false, error: 'tool_secret_missing' };
     }
+    // Phase 6.0 — collect disqualifier ids across every qualification-
+    // gated topic. Surfaced as an enum on request_callback so Alex can
+    // tag an unqualified callback with the specific requirement that
+    // failed. Empty list → the field is omitted from the schema.
+    const disqualifierIds = collectDisqualifierIds(row.departments);
+    const hasActiveQualificationGate = disqualifierIds.length > 0;
+
     nextTools.push(
       buildRequestCallbackTool({
         businessId,
         captureUrl,
         toolSecret,
+        disqualifierIds,
       }),
     );
 
@@ -849,6 +925,7 @@ export async function updateAgentTools(
           routeToTopicUrl,
           toolSecret,
           topics,
+          qualificationGateActive: hasActiveQualificationGate,
         }),
       );
     } else {

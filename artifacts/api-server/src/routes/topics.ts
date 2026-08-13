@@ -36,6 +36,14 @@ const DESCRIPTION_MAX = 500;
 const UTTERANCE_MAX = 200;
 const MAX_UTTERANCES = 10;
 
+// Phase 6.0 — qualification gate limits.
+const REQUIREMENTS_TEXT_MAX = 2000;
+const CLOSE_MESSAGE_MAX = 500;
+const DISQUALIFIER_LABEL_MAX = 120;
+const MAX_DISQUALIFIERS = 20;
+const VALID_DISQUALIFIER_KINDS = ["permanent", "temporary"] as const;
+type DisqualifierKind = (typeof VALID_DISQUALIFIER_KINDS)[number];
+
 function getSupabase(): SupabaseClient | null {
   const url = process.env.SUPABASE_URL;
   const key = process.env.SUPABASE_SERVICE_KEY;
@@ -45,11 +53,29 @@ function getSupabase(): SupabaseClient | null {
 
 // ── Types ────────────────────────────────────────────────────────────
 
+export interface Disqualifier {
+  id: string;
+  label: string;
+  kind: DisqualifierKind;
+}
+
+export interface QualificationBlock {
+  enabled: boolean;
+  requirements_text: string;
+  disqualifiers: Disqualifier[];
+  permanent_close: string;
+  temporary_close: string;
+}
+
 export interface Topic {
   slug: string;
   name: string;
   description: string;
   example_utterances: string[];
+  // Phase 6.0 — optional. When present with enabled=true, Alex speaks
+  // requirements_text before invoking route_to_topic, and routes
+  // unqualified callers to request_callback with a disqualifier_id.
+  qualification?: QualificationBlock;
 }
 
 // ── Validation ───────────────────────────────────────────────────────
@@ -96,9 +122,121 @@ export function parseTopicsBody(body: unknown): { topics: Topic[] } | { error: s
       }
     }
 
-    out.push({ slug, name, description, example_utterances });
+    const topicOut: Topic = { slug, name, description, example_utterances };
+
+    if (t.qualification != null) {
+      const parsedQ = parseQualification(slug, t.qualification);
+      if ("error" in parsedQ) return { error: parsedQ.error };
+      // Only attach when there is meaningful content. Explicitly-empty
+      // qualification blocks (enabled:false + no requirements + no
+      // disqualifiers) are dropped so the JSONB doesn't accumulate
+      // dead structure when a tenant toggles the feature off then on.
+      if (
+        parsedQ.enabled ||
+        parsedQ.requirements_text.length > 0 ||
+        parsedQ.disqualifiers.length > 0
+      ) {
+        topicOut.qualification = parsedQ;
+      }
+    }
+
+    out.push(topicOut);
   }
   return { topics: out };
+}
+
+// Phase 6.0 — validate the per-topic qualification sub-object.
+// Server-side enforcement of the "id is readonly" contract: ids must
+// match SLUG_RE and be unique within the topic. Since PATCH is a bulk
+// replace, we can't detect a "rename" vs a "delete + add" — both
+// present identically. The dashboard's fallback-to-raw-id renderer
+// handles orphaned lead references either way, so we don't need to
+// try to distinguish; we just make sure incoming ids are well-formed.
+function parseQualification(
+  slug: string,
+  raw: unknown,
+): QualificationBlock | { error: string } {
+  if (!raw || typeof raw !== "object") {
+    return { error: `topic "${slug}" qualification must be an object` };
+  }
+  const q = raw as Record<string, unknown>;
+
+  const enabled = q.enabled === true;
+
+  const requirementsRaw = typeof q.requirements_text === "string" ? q.requirements_text.trim() : "";
+  if (requirementsRaw.length > REQUIREMENTS_TEXT_MAX) {
+    return { error: `topic "${slug}" requirements_text exceeds ${REQUIREMENTS_TEXT_MAX} chars` };
+  }
+
+  const permanentClose = typeof q.permanent_close === "string" ? q.permanent_close.trim() : "";
+  if (permanentClose.length > CLOSE_MESSAGE_MAX) {
+    return { error: `topic "${slug}" permanent_close exceeds ${CLOSE_MESSAGE_MAX} chars` };
+  }
+  const temporaryClose = typeof q.temporary_close === "string" ? q.temporary_close.trim() : "";
+  if (temporaryClose.length > CLOSE_MESSAGE_MAX) {
+    return { error: `topic "${slug}" temporary_close exceeds ${CLOSE_MESSAGE_MAX} chars` };
+  }
+
+  const disqualifiers: Disqualifier[] = [];
+  const seenIds = new Set<string>();
+  const rawList = Array.isArray(q.disqualifiers) ? q.disqualifiers : [];
+  if (rawList.length > MAX_DISQUALIFIERS) {
+    return { error: `topic "${slug}" has too many disqualifiers (max ${MAX_DISQUALIFIERS})` };
+  }
+  for (const rawD of rawList as unknown[]) {
+    if (!rawD || typeof rawD !== "object") {
+      return { error: `topic "${slug}" each disqualifier must be an object` };
+    }
+    const d = rawD as Record<string, unknown>;
+    const id = typeof d.id === "string" ? d.id.trim() : "";
+    if (!SLUG_RE.test(id)) {
+      return { error: `topic "${slug}" disqualifier id "${id}" must be snake_case` };
+    }
+    if (seenIds.has(id)) {
+      return { error: `topic "${slug}" duplicate disqualifier id "${id}"` };
+    }
+    seenIds.add(id);
+    const label = typeof d.label === "string" ? d.label.trim() : "";
+    if (!label) {
+      return { error: `topic "${slug}" disqualifier "${id}" is missing label` };
+    }
+    if (label.length > DISQUALIFIER_LABEL_MAX) {
+      return { error: `topic "${slug}" disqualifier "${id}" label exceeds ${DISQUALIFIER_LABEL_MAX} chars` };
+    }
+    const kind = typeof d.kind === "string" ? d.kind : "";
+    if (!(VALID_DISQUALIFIER_KINDS as readonly string[]).includes(kind)) {
+      return { error: `topic "${slug}" disqualifier "${id}" kind must be one of ${VALID_DISQUALIFIER_KINDS.join(", ")}` };
+    }
+    disqualifiers.push({ id, label, kind: kind as DisqualifierKind });
+  }
+
+  // When the block is enabled it MUST carry the pieces Alex needs to
+  // actually run the flow. Turning it off relaxes these — the tenant
+  // can leave partially-filled content in place while iterating.
+  if (enabled) {
+    if (!requirementsRaw) {
+      return { error: `topic "${slug}" requirements_text is required when qualification.enabled` };
+    }
+    if (disqualifiers.length === 0) {
+      return { error: `topic "${slug}" must define at least one disqualifier when qualification.enabled` };
+    }
+    const hasPermanent = disqualifiers.some((d) => d.kind === "permanent");
+    const hasTemporary = disqualifiers.some((d) => d.kind === "temporary");
+    if (hasPermanent && !permanentClose) {
+      return { error: `topic "${slug}" permanent_close is required when a permanent disqualifier exists` };
+    }
+    if (hasTemporary && !temporaryClose) {
+      return { error: `topic "${slug}" temporary_close is required when a temporary disqualifier exists` };
+    }
+  }
+
+  return {
+    enabled,
+    requirements_text: requirementsRaw,
+    disqualifiers,
+    permanent_close: permanentClose,
+    temporary_close: temporaryClose,
+  };
 }
 
 // ── Handlers ─────────────────────────────────────────────────────────
@@ -228,16 +366,50 @@ function normalizeTopicsJsonb(raw: unknown): Topic[] {
     const slug = typeof t.slug === "string" ? t.slug : "";
     const name = typeof t.name === "string" ? t.name : "";
     if (!slug || !name) continue;
-    out.push({
+    const topic: Topic = {
       slug,
       name,
       description: typeof t.description === "string" ? t.description : "",
       example_utterances: Array.isArray(t.example_utterances)
         ? (t.example_utterances as unknown[]).filter((u): u is string => typeof u === "string")
         : [],
-    });
+    };
+    const q = normalizeQualificationJsonb(t.qualification);
+    if (q) topic.qualification = q;
+    out.push(topic);
   }
   return out;
+}
+
+// Lenient sibling to parseQualification. Read-path: don't reject rows
+// that predate the qualification field or carry partial content; drop
+// individual disqualifiers with malformed shape and return whatever
+// survives. Producers of this JSONB (parseTopicsBody above) already
+// enforce strict validation on write, so degraded data here is a signal
+// that the JSONB was hand-edited or came from an older schema — the
+// UI can still render what remains.
+function normalizeQualificationJsonb(raw: unknown): QualificationBlock | null {
+  if (!raw || typeof raw !== "object") return null;
+  const q = raw as Record<string, unknown>;
+  const disqualifiers: Disqualifier[] = [];
+  const rawList = Array.isArray(q.disqualifiers) ? q.disqualifiers : [];
+  for (const rawD of rawList as unknown[]) {
+    if (!rawD || typeof rawD !== "object") continue;
+    const d = rawD as Record<string, unknown>;
+    const id = typeof d.id === "string" ? d.id.trim() : "";
+    const label = typeof d.label === "string" ? d.label.trim() : "";
+    const kind = typeof d.kind === "string" ? d.kind : "";
+    if (!id || !label) continue;
+    if (!(VALID_DISQUALIFIER_KINDS as readonly string[]).includes(kind)) continue;
+    disqualifiers.push({ id, label, kind: kind as DisqualifierKind });
+  }
+  return {
+    enabled: q.enabled === true,
+    requirements_text: typeof q.requirements_text === "string" ? q.requirements_text : "",
+    disqualifiers,
+    permanent_close: typeof q.permanent_close === "string" ? q.permanent_close : "",
+    temporary_close: typeof q.temporary_close === "string" ? q.temporary_close : "",
+  };
 }
 
 // ── Route registrations ─────────────────────────────────────────────

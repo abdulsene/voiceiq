@@ -50,7 +50,44 @@ type Lead = {
   status: "new" | "claimed" | "in_progress" | "resolved" | "dismissed" | string;
   assigned_to: string | null;
   created_at: string;
+  // Phase 6.0 — nullable for pre-6.0 rows and non-qualification captures.
+  qualification_status?: "qualified" | "unqualified_temporary" | "unqualified_permanent" | null;
+  disqualifier_id?: string | null;
 };
+
+// Phase 6.0 — disqualifier catalog fetched once from Settings→Topics.
+// Used to render human labels next to the raw disqualifier_id on
+// unqualified leads. Missing/orphaned ids fall back to the raw id
+// display so a row never shows a blank reason.
+type DisqualifierEntry = { id: string; label: string; kind: "permanent" | "temporary" };
+type DisqualifierIndex = Map<string, DisqualifierEntry>;
+
+async function fetchDisqualifierIndex(apiBase: string): Promise<DisqualifierIndex> {
+  const index = new Map<string, DisqualifierEntry>();
+  if (apiBase !== "business") return index;
+  try {
+    const data = (await fetchApi(`/business/topics`)) as {
+      topics?: Array<{ qualification?: { disqualifiers?: DisqualifierEntry[] } | null }>;
+    };
+    for (const t of data?.topics ?? []) {
+      const list = t?.qualification?.disqualifiers ?? [];
+      for (const d of list) {
+        if (d?.id && d?.label) index.set(d.id, d);
+      }
+    }
+  } catch {
+    // Non-fatal — dashboard still renders with raw-id fallback.
+  }
+  return index;
+}
+
+function disqualifierLabel(index: DisqualifierIndex, id: string | null | undefined): string | null {
+  if (!id) return null;
+  const entry = index.get(id);
+  // Fallback: show the raw id so a stale reference is legible ("under_25"
+  // rather than an empty pill).
+  return entry?.label ?? id;
+}
 
 type LeadsListResponse = {
   leads: Lead[];
@@ -59,7 +96,7 @@ type LeadsListResponse = {
   offset: number;
 };
 
-type TabKey = "myOpen" | "unassigned" | "all";
+type TabKey = "myOpen" | "unassigned" | "all" | "waitingToQualify" | "notEligible";
 
 const REASON_PREVIEW_CHARS = 80;
 
@@ -146,10 +183,26 @@ export default function LeadsListPage() {
   const explicitTab = useMemo<TabKey | null>(() => {
     const params = new URLSearchParams(window.location.search);
     const ti = params.get("tab");
-    return ti === "myOpen" || ti === "unassigned" || ti === "all" ? ti : null;
+    if (
+      ti === "myOpen" ||
+      ti === "unassigned" ||
+      ti === "all" ||
+      ti === "waitingToQualify" ||
+      ti === "notEligible"
+    ) {
+      return ti;
+    }
+    return null;
   }, []);
   const [tab, setTab] = useState<TabKey | null>(explicitTab);
-  const [counts, setCounts] = useState<{ myOpen: number; unassigned: number; all: number } | null>(null);
+  const [counts, setCounts] = useState<{
+    myOpen: number;
+    unassigned: number;
+    all: number;
+    waitingToQualify: number;
+    notEligible: number;
+  } | null>(null);
+  const [disqualifierIndex, setDisqualifierIndex] = useState<DisqualifierIndex>(() => new Map());
   const [leads, setLeads] = useState<Lead[]>([]);
   const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(true);
@@ -166,6 +219,8 @@ export default function LeadsListPage() {
     p.set("limit", "200");
     if (tab === "myOpen") p.set("assigned_to_me", "true");
     if (tab === "unassigned") p.set("status", "new");
+    if (tab === "waitingToQualify") p.set("qualification_status", "unqualified_temporary");
+    if (tab === "notEligible") p.set("qualification_status", "unqualified_permanent");
     return p.toString();
   }, [tab]);
 
@@ -177,10 +232,13 @@ export default function LeadsListPage() {
     let cancelled = false;
     (async () => {
       try {
-        const [myOpenResp, unassignedResp, allResp] = await Promise.all([
+        const [myOpenResp, unassignedResp, allResp, waitingResp, notEligibleResp, idx] = await Promise.all([
           fetchApi(`/${apiBase}/leads?assigned_to_me=true&limit=200`) as Promise<LeadsListResponse>,
           fetchApi(`/${apiBase}/leads?status=new&limit=1`) as Promise<LeadsListResponse>,
           fetchApi(`/${apiBase}/leads?limit=1`) as Promise<LeadsListResponse>,
+          fetchApi(`/${apiBase}/leads?qualification_status=unqualified_temporary&limit=1`) as Promise<LeadsListResponse>,
+          fetchApi(`/${apiBase}/leads?qualification_status=unqualified_permanent&limit=1`) as Promise<LeadsListResponse>,
+          fetchDisqualifierIndex(apiBase),
         ]);
         if (cancelled) return;
         const myOpenCount = (myOpenResp.leads || []).filter(
@@ -190,8 +248,11 @@ export default function LeadsListPage() {
           myOpen: myOpenCount,
           unassigned: unassignedResp.total ?? 0,
           all: allResp.total ?? 0,
+          waitingToQualify: waitingResp.total ?? 0,
+          notEligible: notEligibleResp.total ?? 0,
         };
         setCounts(next);
+        setDisqualifierIndex(idx);
         if (!explicitTab) {
           if (next.myOpen > 0) setTab("myOpen");
           else if (next.unassigned > 0) setTab("unassigned");
@@ -241,21 +302,31 @@ export default function LeadsListPage() {
   // badges stay consistent. For the active tab we prefer the live
   // visibleLeads.length / total because it reflects in-session mutations
   // once the per-tab fetch resolves; falls back to counts otherwise.
-  const tabs: { key: TabKey; labelKey: string; count: number }[] = [
+  const tabs: { key: TabKey; label: string; count: number }[] = [
     {
       key: "myOpen",
-      labelKey: "leads.tabs.myOpen",
+      label: t("leads.tabs.myOpen"),
       count: tab === "myOpen" && !loading ? visibleLeads.length : counts?.myOpen ?? 0,
     },
     {
       key: "unassigned",
-      labelKey: "leads.tabs.unassigned",
+      label: t("leads.tabs.unassigned"),
       count: tab === "unassigned" && !loading ? visibleLeads.length : counts?.unassigned ?? 0,
     },
     {
       key: "all",
-      labelKey: "leads.tabs.all",
+      label: t("leads.tabs.all"),
       count: tab === "all" && !loading ? total : counts?.all ?? 0,
+    },
+    {
+      key: "waitingToQualify",
+      label: "Waiting to qualify",
+      count: tab === "waitingToQualify" && !loading ? total : counts?.waitingToQualify ?? 0,
+    },
+    {
+      key: "notEligible",
+      label: "Not eligible",
+      count: tab === "notEligible" && !loading ? total : counts?.notEligible ?? 0,
     },
   ];
 
@@ -284,7 +355,7 @@ export default function LeadsListPage() {
                   : "border-transparent text-gray-500 hover:text-gray-700 hover:border-gray-300"
               }`}
             >
-              {t(tabDef.labelKey)}
+              {tabDef.label}
               {tabDef.count > 0 && (
                 <span className="ml-1.5 inline-flex items-center px-1.5 py-0.5 rounded-full text-[10px] font-semibold bg-gray-100 text-gray-600 tabular-nums">
                   {tabDef.count}
@@ -414,6 +485,23 @@ export default function LeadsListPage() {
                       <p className="text-xs text-gray-600 mt-1 leading-relaxed">
                         {truncate(lead.reason, REASON_PREVIEW_CHARS)}
                       </p>
+                      {/* Phase 6.0 — surface the disqualifier label on
+                          unqualified rows. Falls back to raw id when the
+                          topic config no longer resolves it, so a stale
+                          reference is legible instead of blank. */}
+                      {lead.qualification_status && lead.qualification_status !== "qualified" && (() => {
+                        const label = disqualifierLabel(disqualifierIndex, lead.disqualifier_id);
+                        if (!label) return null;
+                        const pill =
+                          lead.qualification_status === "unqualified_permanent"
+                            ? "bg-gray-100 text-gray-600 border-gray-200"
+                            : "bg-amber-50 text-amber-800 border-amber-200";
+                        return (
+                          <span className={`mt-1.5 inline-flex items-center px-2 py-0.5 text-[11px] font-medium rounded-full border ${pill}`}>
+                            {label}
+                          </span>
+                        );
+                      })()}
                       <p className="text-[11px] text-gray-400 mt-1.5">
                         {relativeTime(lead.created_at, t)}
                       </p>
