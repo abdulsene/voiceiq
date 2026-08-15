@@ -96,7 +96,7 @@ import {
   type DialBuilderOptions,
 } from "../lib/routing/dial-builder";
 import { handleHoursNow } from "./hours";
-import { verifyTwilioSignature } from "../lib/twilio-signature";
+import { verifyTwilioSignature, reconstructTwilioUrl } from "../lib/twilio-signature";
 // Phase 3.3a — moved to lib/ so both this router and routes/voice.ts
 // can import the same value (was previously duplicated locally as
 // DEVICE_FRESHNESS_SECS_ROUTING).
@@ -1258,20 +1258,52 @@ router.post(
     // attempt list (twilio-signature.ts:twilio_signature_verify_failed_all_candidates)
     // so ops can chase config drift without a customer-audible signal.
     if (!verifyTwilioSignature(req)) {
+      // Phase 6.7 — enrich the breadcrumb with the reconstructed URL
+      // and the received signature header so a signature audit can be
+      // done externally without needing to re-produce the live call.
+      // The signature header is an HMAC output, not a secret; safe to
+      // log. The auth token itself is NEVER logged.
+      const receivedSignature = req.header("x-twilio-signature") || null;
+      let reconstructedUrl: string | null = null;
+      try {
+        reconstructedUrl = reconstructTwilioUrl(req);
+      } catch {
+        /* best-effort — the underlying getPublicApiBase never throws today */
+      }
       Sentry.captureMessage("dial_status_signature_rejected", {
         level: "error",
         extra: {
           path: req.originalUrl,
-          note: "Returning 200 anyway — a non-2xx here plays an error to the caller. See twilio_signature_verify_failed_all_candidates for URL attempt details.",
+          reconstructed_url: reconstructedUrl,
+          received_signature: receivedSignature,
+          x_forwarded_proto: req.headers["x-forwarded-proto"] ?? null,
+          x_forwarded_host: req.headers["x-forwarded-host"] ?? null,
+          host: req.headers["host"] ?? null,
+          note: "Returning 200 anyway — a non-2xx here plays an error to the caller. See twilio_signature_verify_failed_all_candidates for the URL attempt list.",
         },
       });
-      res.status(200).type("text/xml").send('<?xml version="1.0" encoding="UTF-8"?><Response/>');
+      console.warn(
+        "[dial-status] branch=sig-fail path=%s reconstructed=%s",
+        req.originalUrl,
+        reconstructedUrl,
+      );
+      res
+        .status(200)
+        .type("text/xml")
+        .send(
+          '<?xml version="1.0" encoding="UTF-8"?><Response><!-- neverr:dial-status:sig-fail --></Response>',
+        );
       return;
     }
     const supabase = getSupabase();
     if (!supabase) {
-      // Nothing to log against — just 200 to end Twilio's retry loop.
-      res.status(200).type("text/xml").send('<?xml version="1.0" encoding="UTF-8"?><Response/>');
+      console.warn("[dial-status] branch=no-supabase path=%s", req.originalUrl);
+      res
+        .status(200)
+        .type("text/xml")
+        .send(
+          '<?xml version="1.0" encoding="UTF-8"?><Response><!-- neverr:dial-status:no-supabase --></Response>',
+        );
       return;
     }
     const business_id =
@@ -1295,6 +1327,22 @@ router.post(
     await handleDialStatus(supabase, body, new Date(), { twilioClient: getTwilioClient() });
 
     const twimlOut = pickDialStatusResponseTwiml(body, getPublicApiBase());
+    // Phase 6.7 — log which branch the picker took so future incidents
+    // are diagnosable from container logs even if Sentry retention
+    // hides it. The XML comment in the response body already reveals
+    // this to the Twilio inspector; the console line is the server-
+    // side mirror. We derive the branch label by extracting the
+    // `neverr:dial-status:...` token from the emitted TwiML — one
+    // source of truth, no duplication of the switch logic.
+    const branchMatch = /neverr:dial-status:([a-z0-9_-]+)/.exec(twimlOut);
+    const branch = branchMatch ? branchMatch[1] : "unknown";
+    console.log(
+      "[dial-status] branch=%s DialCallStatus=%s business_id=%s conversation_id=%s",
+      branch,
+      body.DialCallStatus || "(none)",
+      body.business_id || "(none)",
+      body.conversation_id || "(none)",
+    );
     res.status(200).type("text/xml").send(twimlOut);
   },
 );
@@ -1333,13 +1381,31 @@ export function pickDialStatusResponseTwiml(
   body: { DialCallStatus?: string; business_id?: string; conversation_id?: string },
   publicApiBase: string,
 ): string {
-  const empty = '<?xml version="1.0" encoding="UTF-8"?><Response/>';
+  // Phase 6.7 — each terminal branch embeds a distinct XML comment so
+  // the Twilio Request Inspector can distinguish "we chose no-capture
+  // because status was completed" from "signature failed" from
+  // "capture fired but Record didn't." Twilio ignores XML comments;
+  // caller experience is unchanged. Comment tokens use the
+  // `neverr:dial-status:` prefix so they're greppable in the console.
+  const empty = (reason: string) =>
+    `<?xml version="1.0" encoding="UTF-8"?><Response><!-- neverr:dial-status:${reason} --></Response>`;
+
   const status = body.DialCallStatus || "";
   const isFailure = status === "no-answer" || status === "busy" || status === "failed";
-  if (!isFailure) return empty;
+  if (!isFailure) {
+    // Non-failure statuses (completed / answered / canceled) legitimately
+    // return empty. Encode the specific status so ops can tell why.
+    const safe = status.replace(/[^a-z0-9_-]/gi, "") || "unknown";
+    return empty(`no-capture-status-${safe}`);
+  }
   const businessId = body.business_id || "";
   const conversationId = body.conversation_id || "";
-  if (!businessId || !conversationId) return empty;
+  if (!businessId || !conversationId) {
+    // Missing correlation → we can't wire the Record callbacks back
+    // to a lead. Guard exists because the URL Twilio hit should have
+    // both params; absence signals a URL-mangling bug.
+    return empty("no-capture-missing-correlation");
+  }
   return buildDialFailureCaptureTwiml({
     publicApiBase,
     businessId,

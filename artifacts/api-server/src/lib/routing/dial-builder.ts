@@ -101,6 +101,10 @@ export function buildDialFailureCaptureTwiml(opts: DialFailureCaptureOptions): s
   return (
     `<?xml version="1.0" encoding="UTF-8"?>` +
     `<Response>` +
+    // Phase 6.7 — inspector-visible marker for which branch of
+    // /dial-status generated this TwiML. See pickDialStatusResponseTwiml
+    // for the sibling markers.
+    `<!-- neverr:dial-status:capture -->` +
     `<Say voice="Polly.Joanna">${xmlEscape(say)}</Say>` +
     `<Record ` +
     `action="${xmlEscape(actionUrl)}" ` +

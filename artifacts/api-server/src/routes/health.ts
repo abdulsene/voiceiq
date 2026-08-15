@@ -43,6 +43,8 @@
 import { Router, type IRouter, type Request, type Response } from "express";
 import { Pool, type Pool as PgPool, type PoolClient } from "pg";
 
+import { BUILD_COMMIT, BUILD_TIME } from "../lib/build-info";
+
 const router: IRouter = Router();
 
 const BOOT_TIME_MS = Date.now();
@@ -166,6 +168,11 @@ router.get("/livez", (_req: Request, res: Response) => {
   res.json({
     status: "ok",
     uptime_secs: Math.floor((Date.now() - BOOT_TIME_MS) / 1000),
+    // Phase 6.7 — fingerprint on livez too so a monitor that only
+    // hits /livez can still verify WHICH bundle is running without
+    // paying for the healthz dependency probe.
+    build_commit: BUILD_COMMIT,
+    build_time: BUILD_TIME,
   });
 });
 
@@ -198,6 +205,12 @@ router.get("/healthz", async (_req: Request, res: Response) => {
     status: overall,
     version: VERSION,
     uptime_secs: Math.floor((Date.now() - BOOT_TIME_MS) / 1000),
+    // Phase 6.7 — deploy fingerprint. build_commit is the git SHA
+    // baked at bundle time; build_time is when the bundle was built.
+    // uptime_secs proves the process is fresh; these prove WHICH
+    // bundle it's running. Dev-mode (tsx) reports "dev" for both.
+    build_commit: BUILD_COMMIT,
+    build_time: BUILD_TIME,
     services: {
       database,
       supabase,

@@ -4428,18 +4428,29 @@ async function T96_dial_status_returns_capture_twiml_on_failure() {
   if (!noAnswer.includes("Sorry, I couldn")) {
     failures.push("no-answer missing honest Say framing");
   }
+  // Phase 6.7 — each branch must embed a distinguishing XML comment
+  // so the Twilio inspector can tell which path ran.
+  if (!noAnswer.includes("neverr:dial-status:capture")) {
+    failures.push("no-answer missing capture branch marker");
+  }
 
   const busy = pickDialStatusResponseTwiml(
     { DialCallStatus: "busy", business_id: biz, conversation_id: conv },
     base,
   );
   if (!busy.includes("<Record ")) failures.push("busy missing <Record>");
+  if (!busy.includes("neverr:dial-status:capture")) {
+    failures.push("busy missing capture branch marker");
+  }
 
   const failed = pickDialStatusResponseTwiml(
     { DialCallStatus: "failed", business_id: biz, conversation_id: conv },
     base,
   );
   if (!failed.includes("<Record ")) failures.push("failed missing <Record>");
+  if (!failed.includes("neverr:dial-status:capture")) {
+    failures.push("failed missing capture branch marker");
+  }
 
   const canceled = pickDialStatusResponseTwiml(
     { DialCallStatus: "canceled", business_id: biz, conversation_id: conv },
@@ -4448,8 +4459,8 @@ async function T96_dial_status_returns_capture_twiml_on_failure() {
   if (canceled.includes("<Record ")) {
     failures.push("canceled MUST NOT emit <Record> — caller already hung up");
   }
-  if (!canceled.includes("<Response/>")) {
-    failures.push("canceled must return empty <Response/>");
+  if (!canceled.includes("neverr:dial-status:no-capture-status-canceled")) {
+    failures.push("canceled must embed the specific status in the branch marker");
   }
 
   const completed = pickDialStatusResponseTwiml(
@@ -4457,13 +4468,18 @@ async function T96_dial_status_returns_capture_twiml_on_failure() {
     base,
   );
   if (completed.includes("<Record ")) failures.push("completed MUST NOT emit <Record>");
-  if (!completed.includes("<Response/>")) failures.push("completed must return empty");
+  if (!completed.includes("neverr:dial-status:no-capture-status-completed")) {
+    failures.push("completed missing branch marker with status");
+  }
 
   const answered = pickDialStatusResponseTwiml(
     { DialCallStatus: "answered", business_id: biz, conversation_id: conv },
     base,
   );
   if (answered.includes("<Record ")) failures.push("answered MUST NOT emit <Record>");
+  if (!answered.includes("neverr:dial-status:no-capture-status-answered")) {
+    failures.push("answered missing branch marker with status");
+  }
 
   const missingCorrelation = pickDialStatusResponseTwiml(
     { DialCallStatus: "no-answer", business_id: "", conversation_id: "" },
@@ -4472,11 +4488,14 @@ async function T96_dial_status_returns_capture_twiml_on_failure() {
   if (missingCorrelation.includes("<Record ")) {
     failures.push("missing business_id/conversation_id MUST fall through to empty (no correlation for record-done)");
   }
+  if (!missingCorrelation.includes("neverr:dial-status:no-capture-missing-correlation")) {
+    failures.push("missing-correlation branch missing its marker");
+  }
 
   record(
-    "T96 /dial-status returns capture TwiML on failure statuses only (canceled/completed/answered return empty)",
+    "T96 /dial-status returns capture TwiML on failure statuses only (canceled/completed/answered return empty), each branch embeds its marker",
     failures.length === 0,
-    failures.join("; ") || "capture on no-answer/busy/failed; empty on completed/answered/canceled/no-correlation",
+    failures.join("; ") || "capture on no-answer/busy/failed; distinct empty markers on completed/answered/canceled/no-correlation",
   );
 }
 
