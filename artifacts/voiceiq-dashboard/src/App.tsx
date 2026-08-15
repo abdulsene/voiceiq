@@ -88,12 +88,28 @@ import CookieConsentManager from "./components/CookieConsentManager";
 
 const SESSION_TIMEOUT_MS = 30 * 60 * 1000;
 const ACTIVITY_KEY = "neverr_last_activity";
+// Phase 6.6 — mirror for user_businesses.is_on_duty. Written by the
+// Softphone provider whenever it learns / flips is_on_duty; read here
+// during the pre-mount idle check (where React context isn't
+// available yet). "1" = on duty; "0" or absent = off duty. When on
+// duty, isSessionExpired returns false — a staff member sitting idle
+// between calls IS working and must not be logged out mid-shift.
+export const ON_DUTY_KEY = "neverr_on_duty";
 
 function updateActivity() {
   localStorage.setItem(ACTIVITY_KEY, Date.now().toString());
 }
 
 function isSessionExpired(): boolean {
+  // Phase 6.6 — on-duty staff are exempt from the idle timeout. An
+  // 8-hour shift with a call every few hours would otherwise be
+  // signed out during any quiet stretch. Simply lengthening the
+  // timeout doesn't fix it (a busy shift could still hit the ceiling).
+  // Once they clock off, normal idle behavior resumes; the toggle
+  // click naturally bumps ACTIVITY_KEY via the click listener, and
+  // Softphone.tsx also bumps it defensively on the true → false
+  // transition in case off-duty flips without a click.
+  if (localStorage.getItem(ON_DUTY_KEY) === "1") return false;
   const last = localStorage.getItem(ACTIVITY_KEY);
   if (!last) return false;
   return Date.now() - parseInt(last, 10) > SESSION_TIMEOUT_MS;
@@ -113,6 +129,11 @@ export function clearSession() {
   // previous user's tenant selection.
   localStorage.removeItem("neverr_active_business_id");
   localStorage.removeItem(ACTIVITY_KEY);
+  // Phase 6.6 — wipe the on-duty mirror on any real logout. Leaving
+  // a stale "1" here would let a subsequent user on the same device
+  // inherit idle immunity until Softphone re-hydrates the flag from
+  // the server on their behalf.
+  localStorage.removeItem(ON_DUTY_KEY);
   // Sprint 4 TC-59: also wipe MFA scratch keys so a partial-MFA state
   // from a previous user doesn't leak into the next user's signin on a
   // shared device.

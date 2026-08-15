@@ -463,6 +463,35 @@ export function SoftphoneProvider({ children }: { children: ReactNode }) {
   // banner reflects reality without a page reload.
   const [isOnDuty, setIsOnDuty] = useState<boolean | null>(null);
 
+  // Phase 6.6 — mirror is_on_duty to localStorage so the pre-mount
+  // idle-timeout check in App.tsx can read it before React context
+  // hydrates. Also bumps the activity timestamp on any true → false
+  // transition, so a shift that ended after 8 hours of idle-immune
+  // work doesn't immediately trip isSessionExpired the moment the
+  // user clocks off (their ACTIVITY_KEY would still carry an 8-hour-
+  // old timestamp otherwise). The clock-off click itself normally
+  // bumps activity via the mouse listener; the explicit write here
+  // covers the case where isOnDuty flips programmatically (server
+  // push, another tab, forced off-duty by admin).
+  const prevIsOnDutyRef = useRef<boolean | null>(null);
+  useEffect(() => {
+    try {
+      if (isOnDuty === true) {
+        localStorage.setItem("neverr_on_duty", "1");
+      } else if (isOnDuty === false) {
+        localStorage.setItem("neverr_on_duty", "0");
+        if (prevIsOnDutyRef.current === true) {
+          localStorage.setItem("neverr_last_activity", Date.now().toString());
+        }
+      }
+    } catch {
+      // localStorage can throw in private mode / disabled storage; the
+      // mirror is best-effort. Without it, on-duty users may hit the
+      // idle timeout — the safer failure mode than the reverse.
+    }
+    prevIsOnDutyRef.current = isOnDuty;
+  }, [isOnDuty]);
+
   const setRingtoneMuted = useCallback((v: boolean) => {
     setRingtoneMutedRaw(v);
     try {
