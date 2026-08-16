@@ -1456,6 +1456,30 @@ interface DialFallbackTranscriptBody {
 
 const DIAL_FALLBACK_VOICEMAIL_PLACEHOLDER = "Voicemail — transcription pending";
 const DIAL_FALLBACK_TRANSCRIPTION_FAILED = "Voicemail — transcription unavailable";
+// Twilio's transcription service supports recordings 2-120 seconds.
+// Outside that range, transcription silently fails (Twilio error 13617
+// "Recording length is out of range for transcription") and the
+// transcribeCallback may never fire. When we know upfront that
+// transcription won't arrive, set an accurate initial reason so
+// staff doesn't wait for text that will never come. The transcript
+// endpoint still overwrites if it DOES fire despite the out-of-range
+// check — belt-and-suspenders.
+const TWILIO_TRANSCRIBE_MIN_SECS = 2;
+const TWILIO_TRANSCRIBE_MAX_SECS = 120;
+export function chooseDialFallbackInitialReason(
+  durationSecs: number | null,
+): string {
+  if (durationSecs === null) {
+    // Unknown duration — assume transcription is plausible; the
+    // transcript endpoint will overwrite once it fires (or the
+    // "unavailable" fallback via TranscriptionStatus='failed').
+    return DIAL_FALLBACK_VOICEMAIL_PLACEHOLDER;
+  }
+  if (durationSecs >= TWILIO_TRANSCRIBE_MIN_SECS && durationSecs <= TWILIO_TRANSCRIBE_MAX_SECS) {
+    return DIAL_FALLBACK_VOICEMAIL_PLACEHOLDER;
+  }
+  return `Voicemail — recording ${durationSecs}s, no transcription available. Play audio to hear message.`;
+}
 
 async function insertDialFallbackLead(
   supabase: SupabaseClient,
@@ -1493,7 +1517,7 @@ async function insertDialFallbackLead(
       contact_phone: opts.contactPhone,
       contact_email: null,
       preferred_channel: "call",
-      reason: DIAL_FALLBACK_VOICEMAIL_PLACEHOLDER,
+      reason: chooseDialFallbackInitialReason(opts.recordingDurationSecs),
       urgency: "medium",
       status: "new",
       qualification_status: null,
@@ -1544,10 +1568,34 @@ router.post(
     // caller (Phase 3.4 lesson). The Thank-you TwiML is the terminal
     // step of the capture flow.
     if (!verifyTwilioSignature(req)) {
+      // Phase 6.8 — enriched breadcrumb (parity with /dial-status per
+      // 6.7). Reconstructed URL + received signature let ops audit
+      // the sig mismatch externally without re-producing the call.
+      // The signature header is HMAC output — safe to log; the auth
+      // token itself is never logged.
+      const receivedSignature = req.header("x-twilio-signature") || null;
+      let reconstructedUrl: string | null = null;
+      try {
+        reconstructedUrl = reconstructTwilioUrl(req);
+      } catch {
+        /* best-effort — getPublicApiBase never throws today */
+      }
       Sentry.captureMessage("dial_fallback_record_signature_rejected", {
         level: "error",
-        extra: { path: req.originalUrl },
+        extra: {
+          path: req.originalUrl,
+          reconstructed_url: reconstructedUrl,
+          received_signature: receivedSignature,
+          x_forwarded_proto: req.headers["x-forwarded-proto"] ?? null,
+          x_forwarded_host: req.headers["x-forwarded-host"] ?? null,
+          host: req.headers["host"] ?? null,
+        },
       });
+      console.warn(
+        "[dial-fallback-record] branch=sig-fail path=%s reconstructed=%s",
+        req.originalUrl,
+        reconstructedUrl,
+      );
       res.status(200).type("text/xml").send(buildDialFailureThanksTwiml());
       return;
     }
@@ -1621,10 +1669,32 @@ router.post(
     // play our response to anyone — no TwiML concerns here — but keep
     // the always-200 posture so Twilio doesn't retry.
     if (!verifyTwilioSignature(req)) {
+      // Phase 6.8 — same enrichment as record-done. This endpoint is
+      // off-call (transcript is async) so no TwiML concerns, but the
+      // audit data helps ops resolve sig mismatches.
+      const receivedSignature = req.header("x-twilio-signature") || null;
+      let reconstructedUrl: string | null = null;
+      try {
+        reconstructedUrl = reconstructTwilioUrl(req);
+      } catch {
+        /* best-effort */
+      }
       Sentry.captureMessage("dial_fallback_transcript_signature_rejected", {
         level: "error",
-        extra: { path: req.originalUrl },
+        extra: {
+          path: req.originalUrl,
+          reconstructed_url: reconstructedUrl,
+          received_signature: receivedSignature,
+          x_forwarded_proto: req.headers["x-forwarded-proto"] ?? null,
+          x_forwarded_host: req.headers["x-forwarded-host"] ?? null,
+          host: req.headers["host"] ?? null,
+        },
       });
+      console.warn(
+        "[dial-fallback-transcript] branch=sig-fail path=%s reconstructed=%s",
+        req.originalUrl,
+        reconstructedUrl,
+      );
       res.status(200).end();
       return;
     }
